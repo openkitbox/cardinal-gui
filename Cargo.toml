@@ -1,0 +1,53 @@
+[package]
+name = "cardinal-gui"
+version = "0.1.0"
+edition = "2024"
+description = "Gateway management and monitoring GUI"
+license = "GPL-3.0-only"
+
+[lib]
+name = "cardinal_gui"
+
+[[bin]]
+name = "cardinal-gui"
+path = "src/main.rs"
+
+[dependencies]
+gateway = { path = "../cardinal", package = "cardinal" }
+gpui = { package = "gpui-pre", version = "=0.3.9" }
+gpui-kit = "0.7.3"
+dirs = "7"
+anyhow = "1"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["fmt", "env-filter", "time", "local-time"] }
+tokio = { version = "1", features = ["macros", "sync", "rt-multi-thread"] }
+clap = { version = "4", features = ["derive"] }
+serde_json = "1"
+chrono = { version = "0.4", default-features = false, features = ["clock", "std"] }
+futures = "0.3"
+# GUI config access: `serde`/`toml` for the `[gui]` section, `toml_edit` for the
+# comment-preserving write-back the settings page does (load.rs / ui_tz.rs).
+serde = { version = "1", features = ["derive"] }
+toml = "1.1"
+toml_edit = "0.25"
+
+[dev-dependencies]
+reqwest = { version = "0.13", default-features = false, features = ["rustls", "json", "stream"] }
+gateway = { path = "../cardinal", package = "cardinal", features = ["test-support"] }
+
+[target.'cfg(target_os = "macos")'.dependencies]
+objc2 = "0.6"
+objc2-app-kit = { version = "0.3.2", default-features = false, features = ["NSApplication", "NSImage"] }
+objc2-foundation = { version = "=0.3.2", default-features = false, features = ["NSData"] }
+
+[patch.crates-io]
+# GPUI Fast (longbridge/gpui-fast): a performance fork of the GPUI core we
+# already use via the gpui-pre snapshots (gpui-kit's upstream). The compat/
+# shadow crates in that repo carry the gpui-pre names and versions, so this
+# patch redirects the whole family to gpui-fast. Drop this section to fall
+# back to the crates.io snapshots.
+gpui-pre = { git = "https://github.com/longbridge/gpui-fast" }
+gpui-pre-macros = { git = "https://github.com/longbridge/gpui-fast" }
+gpui-pre-platform = { git = "https://github.com/longbridge/gpui-fast" }
+gpui-pre-sum-tree = { git = "https://github.com/longbridge/gpui-fast" }
+gpui-pre-web = { git = "https://github.com/longbridge/gpui-fast" }

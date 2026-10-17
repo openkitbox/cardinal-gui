@@ -1,0 +1,27 @@
+# cardinal-gui 示例配置
+#
+# 默认加载路径 ~/.ox/config.toml；`cardinal-gui --config /path/to/config.toml`
+# 可改用任意路径。本文件只是示例——拷贝为 config.toml 并按需修改。
+#
+# GUI 只读 [gateway] 段里的两个字段：listen（找到 gateway 的地址）和
+# gateway_key（admin API 的 Authorization bearer）。其余 gateway 字段
+# 属于 gateway 进程本身，见 cardinal 目录的 config.example.toml。
+# 文件缺失时 GUI 以 127.0.0.1:8787 + "cardinal" 默认值启动。
+
+[gateway]
+# gateway 进程的监听地址（不含 scheme 时 GUI 按 http:// 处理）。默认 "127.0.0.1:8787"。
+listen = "127.0.0.1:8787"
+
+# 与 gateway 进程配置的 gateway_key 一致。默认 "cardinal"。
+# gateway_key = "cardinal"
+
+# 连接远端 gateway 时：把这里指向远端地址，例如：
+# listen = "gateway.internal.example.com:8787"
+# gateway_key = "<远端配置里的 gateway_key>"
+# 注意：远端 gateway 需设 admin_remote = true 才会应答非 loopback 的 /api/*。
+
+[gui]
+# GUI 自身的设置（与 gateway 进程无关）。显示时区为固定 UTC 偏移 ±HH:MM，
+# 所有页面的时间都用它格式化；留空/不写 = 跟随系统时区。
+# 设置页「显示」卡片可在线修改并写回本文件。
+# timezone = "+08:00"
