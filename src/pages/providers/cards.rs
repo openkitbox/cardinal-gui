@@ -527,8 +527,12 @@ impl ProvidersPage {
         }
         this
       })
-      // Model rows: one line per whitelisted model (see `model_rows`), placed
-      // between the quota meters and the footer.
+      // Model rows: one line per whitelisted model (see `model_rows`), pinned
+      // to the card's bottom. Cards in a grid row share the tallest card's
+      // height while the quota meters above vary in row count, so a flex-1
+      // spacer here absorbs the slack — the model block and footer align
+      // across sibling cards (same idiom as the footer's clear-button spacer).
+      .child(gpui::div().flex_1())
       .child(model_rows(key, cx))
       // Footer: status tags + row actions.
       .child(

@@ -256,6 +256,12 @@ pub(crate) struct StatusTip {
 impl Render for StatusTip {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         gpui::div()
+            .bg(cx.theme().popover)
+            .border_1()
+            .border_color(cx.theme().border)
+            .rounded(cx.theme().radius)
+            .px_2()
+            .py_1()
             .text_size(gpui::px(12.))
             .text_color(cx.theme().foreground)
             .child(self.text.clone())

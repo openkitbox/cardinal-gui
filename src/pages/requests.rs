@@ -6,8 +6,8 @@
 use std::collections::{HashMap, HashSet};
 
 use gpui::{
-    App, Context, Div, ElementId, InteractiveElement, IntoElement, ParentElement, Render,
-    StatefulInteractiveElement, Styled, Window, px,
+    App, AppContext, Context, Div, ElementId, InteractiveElement, IntoElement, ParentElement,
+    Render, StatefulInteractiveElement, Styled, Window, px,
 };
 use gpui_kit::assets::IconName;
 use gpui_kit::component::button::{Button, ButtonVariants};
@@ -36,16 +36,45 @@ fn short_protocol(id: &str) -> &str {
     }
 }
 
-/// The request's protocol mode: `chat` when the client spoke the upstream's
-/// protocol, `chat → anthropic` (client → upstream) when the relay translated.
-/// `client_protocol` is None on rows predating migration 0018 — those show
-/// the upstream protocol alone.
+/// Single-letter code for a stored protocol id (C=chat, A=anthropic,
+/// R=responses, G=gemini); unknown ids keep their full name in the cell.
+fn protocol_letter(id: &str) -> &str {
+    match id {
+        "openai_chat" => "C",
+        "openai_responses" => "R",
+        "anthropic_messages" => "A",
+        "gemini" => "G",
+        other => other,
+    }
+}
+
+/// The request's protocol mode as letter codes: `C→A` when the relay
+/// translated (client → upstream), the single upstream letter for passthrough
+/// rows and for rows predating migration 0018 (no stored client protocol).
+/// The full protocol names live on the cell's hover tip.
 fn protocol_label(client_protocol: Option<&str>, upstream: &str) -> String {
     match client_protocol {
         Some(client) if client != upstream => {
-            format!("{} → {}", short_protocol(client), short_protocol(upstream))
+            format!("{}→{}", protocol_letter(client), protocol_letter(upstream))
         }
-        _ => short_protocol(upstream).to_string(),
+        _ => protocol_letter(upstream).to_string(),
+    }
+}
+
+/// The hover tip's full text behind the letter codes: the two protocol names
+/// plus the relationship (translated / passthrough / legacy row).
+fn protocol_tip(client_protocol: Option<&str>, upstream: &str) -> String {
+    let upstream_short = short_protocol(upstream);
+    match client_protocol {
+        Some(client) if client != upstream => {
+            format!(
+                "客户端 {} → 上游 {}（协议翻译）",
+                short_protocol(client),
+                upstream_short
+            )
+        }
+        Some(_) => format!("{}（直连）", upstream_short),
+        None => format!("{}（上游协议；该行早于客户端协议记录）", upstream_short),
     }
 }
 
@@ -447,23 +476,35 @@ fn supplier_header(cx: &App) -> Div {
         .child("供应商")
 }
 
-/// The fixed-width 模式 column, data cell (muted — secondary routing info).
-fn protocol_cell(client_protocol: Option<&str>, upstream: &str, cx: &App) -> Div {
+/// The fixed-width 模式 column, data cell (letter codes, muted — secondary
+/// routing info; the full protocols show on hover).
+fn protocol_cell(
+    client_protocol: Option<&str>,
+    upstream: &str,
+    row_id: u64,
+    cx: &App,
+) -> gpui::Stateful<Div> {
+    let tip = protocol_tip(client_protocol, upstream);
     gpui::div()
+        .id(("protocol-tip", row_id))
         .flex_none()
-        .w(px(140.))
+        .w(px(72.))
         .px_2()
         .py_1()
         .truncate()
         .text_color(cx.theme().muted_foreground)
         .child(protocol_label(client_protocol, upstream))
+        .tooltip(move |_, cx| {
+            cx.new(|_| crate::app::StatusTip { text: tip.clone() })
+                .into()
+        })
 }
 
 /// The 模式 column's header cell (fixed width, matching the data cells).
 fn protocol_header(cx: &App) -> Div {
     gpui::div()
         .flex_none()
-        .w(px(140.))
+        .w(px(72.))
         .px_2()
         .py_1()
         .text_size(px(12.))
@@ -494,6 +535,33 @@ fn fixed_header(text: &str, cx: &App) -> Div {
         .text_size(px(12.))
         .text_color(cx.theme().muted_foreground)
         .child(text.to_string())
+}
+
+/// The 推理 column's data cell: the client-asked reasoning effort as a
+/// single uppercase level (L/M/H/X, `MAX` — max has no free single letter),
+/// color-stepped so the expensive levels stand out first, exact word on
+/// hover. `None` renders the plain dash (no effort named).
+fn effort_cell(effort: Option<&str>, row_id: u64, cx: &App) -> gpui::Stateful<Div> {
+    let Some(effort) = effort else {
+        return fixed_col("—".into(), cx).id(("effort-none", row_id));
+    };
+    let (badge, color, full) = match effort {
+        "max" => ("MAX", cx.theme().danger, "max"),
+        "xhigh" => ("X", cx.theme().warning, "xhigh"),
+        "high" => ("H", cx.theme().foreground, "high"),
+        "medium" => ("M", cx.theme().accent, "medium"),
+        "low" => ("L", cx.theme().muted_foreground, "low"),
+        // Unknown future level: verbatim text, neutral color.
+        other => (other, cx.theme().muted_foreground, other),
+    };
+    let tip = format!("推理强度：{full}");
+    fixed_col(badge.to_string(), cx)
+        .id(("effort-tip", row_id))
+        .text_color(color)
+        .tooltip(move |_, cx| {
+            cx.new(|_| crate::app::StatusTip { text: tip.clone() })
+                .into()
+        })
 }
 
 /// Header row over the expandable rows (mirrors the data row widths).
@@ -563,12 +631,10 @@ fn request_row(page: &RequestsPage, row: &RequestRow, cx: &mut Context<RequestsP
         .child(protocol_cell(
             row.client_protocol.as_deref(),
             &row.protocol,
+            row_id as u64,
             cx,
         ))
-        .child(fixed_col(
-            row.effort.clone().unwrap_or_else(|| "—".into()),
-            cx,
-        ))
+        .child(effort_cell(row.effort.as_deref(), row_id as u64, cx))
         .child(route_cell(
             row.alias.clone().unwrap_or_else(|| "（直连）".to_string()),
         ))
