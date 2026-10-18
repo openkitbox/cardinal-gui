@@ -253,7 +253,10 @@ impl ActivityFeed {
                 self.key_inflight = document
                     .keys
                     .iter()
-                    .filter_map(|key| key.inflight.map(|inflight| (key.id, inflight.max(0) as u32)))
+                    .filter_map(|key| {
+                        key.inflight
+                            .map(|inflight| (key.id, inflight.max(0) as u32))
+                    })
                     .collect();
                 self.bootstrap = Some(*document);
                 self.bootstrap_rev += 1;

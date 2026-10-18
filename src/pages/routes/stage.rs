@@ -741,6 +741,17 @@ impl RoutesPage {
                 this.child(Tag::secondary().child(label))
             })
             .child(gpui::div().flex_1())
+            // Route note (备注): dim, right-aligned, truncated — display only.
+            .when_some(route.note.as_deref(), |this, note| {
+                this.child(
+                    gpui::div()
+                        .text_size(px(12.))
+                        .text_color(theme.muted_foreground)
+                        .max_w(px(360.))
+                        .text_ellipsis()
+                        .child(note.to_string()),
+                )
+            })
             .when(manage, |this| {
                 let busy = self.manage_write_in_flight;
                 this.child(

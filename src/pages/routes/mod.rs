@@ -171,6 +171,9 @@ struct RouteEditor {
     /// Dispatch strategy: ordered (list order) or smart (quota-aware). Set by
     /// the strategy picker; a new route defaults to `ordered`.
     strategy: RouteStrategy,
+    /// Route-level display note (备注), shown right-aligned on the route's
+    /// stage header; empty input = unset.
+    note: Entity<InputState>,
     /// The route itself: a flat model list, in append order.
     items: Vec<ItemDraft>,
     /// On-demand picker rows (＋添加模型 appends one) — the account list is
@@ -530,6 +533,7 @@ impl RoutesPage {
             return;
         };
         let alias = cx.new(|cx| InputState::new(window, cx).placeholder("对外模型 ID（如 smart）"));
+        let note = cx.new(|cx| InputState::new(window, cx).placeholder("备注（可选）"));
         let items: Vec<ItemDraft> = existing
             .as_ref()
             .map(|route| {
@@ -576,6 +580,9 @@ impl RoutesPage {
             alias.update(cx, |input, cx| {
                 input.set_value(route.alias.clone(), window, cx)
             });
+            if let Some(text) = &route.note {
+                note.update(cx, |input, cx| input.set_value(text.clone(), window, cx));
+            }
         }
         let focus = alias.read(cx).focus_handle(cx);
         window.focus(&focus, cx);
@@ -584,6 +591,7 @@ impl RoutesPage {
             alias,
             context_window,
             strategy,
+            note,
             items,
             rows: Vec::new(),
             error: None,
@@ -745,6 +753,11 @@ impl RoutesPage {
         let alias = editor.alias.read(cx).value().trim().to_string();
         let context_window = editor.context_window;
         let strategy = editor.strategy;
+        // Empty input normalizes to None — the server stores unset, not "".
+        let note = {
+            let text = editor.note.read(cx).value().trim().to_string();
+            (!text.is_empty()).then_some(text)
+        };
         let drafts: Vec<SelectionDraft> = editor
             .items
             .iter()
@@ -786,7 +799,7 @@ impl RoutesPage {
             .global::<GatewayRuntime>()
             .admin_call(move |admin| async move {
                 admin
-                    .put_route(&alias, &entries, context_window, strategy)
+                    .put_route(&alias, &entries, context_window, strategy, note.as_deref())
                     .await
             });
         self.manage_write_in_flight = true;
@@ -866,9 +879,10 @@ impl RoutesPage {
         entries.swap(index, target);
         let context_window = route.context_window;
         let strategy = route.strategy;
+        let note = route.note.clone();
         self.manage_write(cx, move |admin| async move {
             admin
-                .put_route(&alias, &entries, context_window, strategy)
+                .put_route(&alias, &entries, context_window, strategy, note.as_deref())
                 .await
         });
     }
@@ -900,11 +914,13 @@ impl RoutesPage {
         entries.remove(index);
         let context_window = route.context_window;
         let strategy = route.strategy;
+        let note = route.note.clone();
         let page = cx.entity();
         window.open_alert_dialog(cx, move |dialog, _, _| {
             let on_ok_page = page.clone();
             let on_ok_alias = alias.clone();
             let on_ok_entries = entries.clone();
+            let on_ok_note = note.clone();
             dialog
                 .confirm()
                 .title("移除模型?")
@@ -914,10 +930,17 @@ impl RoutesPage {
                 .on_ok(move |_, _, cx| {
                     let alias = on_ok_alias.clone();
                     let entries = on_ok_entries.clone();
+                    let note = on_ok_note.clone();
                     on_ok_page.update(cx, |page, cx| {
                         page.manage_write(cx, move |admin| async move {
                             admin
-                                .put_route(&alias, &entries, context_window, strategy)
+                                .put_route(
+                                    &alias,
+                                    &entries,
+                                    context_window,
+                                    strategy,
+                                    note.as_deref(),
+                                )
                                 .await
                         })
                     });
@@ -986,6 +1009,14 @@ impl RoutesPage {
           .gap_2()
           .child(gpui::div().w(px(72.)).flex_shrink_0().text_color(cx.theme().muted_foreground).child("别名"))
           .child(gpui::div().flex_1().child(Input::new(&editor.alias).w_full().disabled(editing))),
+      )
+      .child(
+        gpui::div()
+          .flex()
+          .items_center()
+          .gap_2()
+          .child(gpui::div().w(px(72.)).flex_shrink_0().text_color(cx.theme().muted_foreground).child("备注"))
+          .child(gpui::div().flex_1().child(Input::new(&editor.note).w_full())),
       )
       .child(
         gpui::div()

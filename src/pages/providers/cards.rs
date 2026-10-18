@@ -17,8 +17,8 @@ use gpui_kit::component::menu::{DropdownMenu, PopupMenuItem};
 use gpui_kit::component::tag::Tag;
 use gpui_kit::component::{ActiveTheme, Disableable, Icon, Sizable};
 
-use gateway::store::ProviderKeyView;
 use gateway::probe::ProbeModel;
+use gateway::store::ProviderKeyView;
 use gateway::store::{ProviderRow, RestRow};
 
 use super::catalog::{
