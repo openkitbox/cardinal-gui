@@ -136,6 +136,11 @@ pub fn run(configs: Configs) {
     }
     application()
         .with_assets(GuiAssets)
+        // Single-window management GUI: closing the window exits the process.
+        // GPUI's `QuitMode::Default` on macOS follows the HIG and keeps the app
+        // in the Dock after the last window closes — correct for document apps,
+        // wrong for a tool like this where there is no "reopen" entry point.
+        .with_quit_mode(gpui::QuitMode::LastWindowClosed)
         .run(|cx: &mut gpui::App| {
             // Initialize the component library (themes, icons, assets) before any
             // component is used, then restyle it as GitHub-light.

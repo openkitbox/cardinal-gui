@@ -5,6 +5,20 @@ edition = "2024"
 description = "Gateway management and monitoring GUI"
 license = "GPL-3.0-only"
 
+# cargo-bundle metadata for the local .app build (`task prod`). Icons/SVGs are
+# already embedded via `include_bytes!` in src/assets.rs, so no Resources need
+# to be shipped; config is read from ~/.ox/config.toml at runtime.
+[package.metadata.bundle]
+name = "Cardinal"
+identifier = "com.openkitbox.cardinal-gui"
+icon = ["assets/AppIcon.icns"]
+version = "0.1.0"
+category = "public.app-category.developer-tools"
+copyright = "GPL-3.0-only"
+
+[package.metadata.bundle.osx]
+minimum_system_version = "12.0"
+
 [lib]
 name = "cardinal_gui"
 
@@ -17,14 +31,11 @@ gateway = { path = "../cardinal", package = "cardinal" }
 gpui = { package = "gpui-pre", version = "=0.3.9" }
 gpui-kit = "0.7.3"
 dirs = "7"
-anyhow = "1"
 tracing = "0.1"
-tracing-subscriber = { version = "0.3", features = ["fmt", "env-filter", "time", "local-time"] }
 tokio = { version = "1", features = ["macros", "sync", "rt-multi-thread"] }
 clap = { version = "4", features = ["derive"] }
 serde_json = "1"
 chrono = { version = "0.4", default-features = false, features = ["clock", "std"] }
-futures = "0.3"
 # GUI config access: `serde`/`toml` for the `[gui]` section, `toml_edit` for the
 # comment-preserving write-back the settings page does (load.rs / ui_tz.rs).
 serde = { version = "1", features = ["derive"] }
@@ -32,7 +43,6 @@ toml = "1.1"
 toml_edit = "0.25"
 
 [dev-dependencies]
-reqwest = { version = "0.13", default-features = false, features = ["rustls", "json", "stream"] }
 gateway = { path = "../cardinal", package = "cardinal", features = ["test-support"] }
 
 [target.'cfg(target_os = "macos")'.dependencies]
