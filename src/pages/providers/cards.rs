@@ -520,7 +520,7 @@ impl ProvidersPage {
       .when_some(card_data.quota.as_ref(), |this, quota| {
         let mut this = this;
         if !quota.windows.is_empty() {
-          this = this.child(quota_row(&quota.windows, cx));
+          this = this.child(quota_row(&quota.windows, quota.probed_at, cx));
         }
         if let Some(balance) = &quota.balance {
           this = this.child(gpui::div().text_size(px(12.)).text_color(cx.theme().muted_foreground).child(format!("余额 {balance}")));

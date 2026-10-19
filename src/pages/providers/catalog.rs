@@ -106,6 +106,43 @@ pub(super) const PROVIDER_SPECS: &[ProviderSpec] = &[
         auth_scheme: "bearer",
         icon: ProviderIcon::Svg(provider_logos::COMMANDCODE),
     },
+    // ---- Retrieval (embeddings) providers ----
+    // A retrieval row is passthrough-only: the client calls /v1/embeddings and
+    // the capability table appends `embeddings` to the version root below.
+    ProviderSpec {
+        name: "openai-embed",
+        display: "OpenAI 向量",
+        // A separate row from chat's: a provider row carries ONE protocol, and
+        // the relay selects the capability by the client's protocol.
+        base_url: "https://api.openai.com/v1",
+        protocol: "openai_embeddings",
+        auth_scheme: "bearer",
+        icon: ProviderIcon::Svg(provider_logos::OPENAI),
+    },
+    ProviderSpec {
+        name: "siliconflow",
+        display: "SiliconFlow 硅基流动",
+        base_url: "https://api.siliconflow.cn/v1",
+        protocol: "openai_embeddings",
+        auth_scheme: "bearer",
+        icon: ProviderIcon::Svg(provider_logos::OPENAI),
+    },
+    ProviderSpec {
+        name: "jina",
+        display: "Jina AI",
+        base_url: "https://api.jina.ai/v1",
+        protocol: "openai_embeddings",
+        auth_scheme: "bearer",
+        icon: ProviderIcon::Svg(provider_logos::OPENAI),
+    },
+    ProviderSpec {
+        name: "voyage",
+        display: "Voyage AI",
+        base_url: "https://api.voyageai.com/v1",
+        protocol: "openai_embeddings",
+        auth_scheme: "bearer",
+        icon: ProviderIcon::Svg(provider_logos::OPENAI),
+    },
 ];
 
 /// Look up the catalog entry for a stored provider name: an exact match

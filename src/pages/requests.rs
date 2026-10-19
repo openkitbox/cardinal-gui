@@ -37,13 +37,15 @@ fn short_protocol(id: &str) -> &str {
 }
 
 /// Single-letter code for a stored protocol id (C=chat, A=anthropic,
-/// R=responses, G=gemini); unknown ids keep their full name in the cell.
+/// R=responses, G=gemini, E=embeddings); unknown ids keep their full name in
+/// the cell.
 fn protocol_letter(id: &str) -> &str {
     match id {
         "openai_chat" => "C",
         "openai_responses" => "R",
         "anthropic_messages" => "A",
         "gemini" => "G",
+        "openai_embeddings" => "E",
         other => other,
     }
 }

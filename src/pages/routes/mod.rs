@@ -799,7 +799,14 @@ impl RoutesPage {
             .global::<GatewayRuntime>()
             .admin_call(move |admin| async move {
                 admin
-                    .put_route(&alias, &entries, context_window, strategy, note.as_deref())
+                    .put_route(
+                        &alias,
+                        &entries,
+                        context_window,
+                        strategy,
+                        note.as_deref(),
+                        None,
+                    )
                     .await
             });
         self.manage_write_in_flight = true;
@@ -882,7 +889,14 @@ impl RoutesPage {
         let note = route.note.clone();
         self.manage_write(cx, move |admin| async move {
             admin
-                .put_route(&alias, &entries, context_window, strategy, note.as_deref())
+                .put_route(
+                    &alias,
+                    &entries,
+                    context_window,
+                    strategy,
+                    note.as_deref(),
+                    None,
+                )
                 .await
         });
     }
@@ -940,6 +954,7 @@ impl RoutesPage {
                                     context_window,
                                     strategy,
                                     note.as_deref(),
+                                    None,
                                 )
                                 .await
                         })

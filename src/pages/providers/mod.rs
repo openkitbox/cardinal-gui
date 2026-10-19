@@ -91,6 +91,15 @@ impl ProvidersData {
             .iter()
             .map(|row| (row.key_id, (row.quota.clone(), row.fetched_at)))
             .collect();
+        // Daily probe samples per key, for the cards' trend charts (absent on an
+        // older gateway — the charts then show the current point alone).
+        let mut histories: HashMap<i64, Vec<gateway::store::QuotaHistoryPoint>> = HashMap::new();
+        for point in &document.quota_history {
+            histories
+                .entry(point.key_id)
+                .or_default()
+                .push(point.clone());
+        }
         // A key always has its provider (same document, same transaction-free
         // read; the row carries a FK) — a key without one is skipped rather
         // than rendered without its provider.
@@ -102,9 +111,13 @@ impl ProvidersData {
                 Some(KeyCardData {
                     provider: (*provider).clone(),
                     key: key.clone(),
-                    quota: snapshots
-                        .remove(&key.id)
-                        .map(|(quota, probed_at)| KeyQuotaView::new(quota, probed_at)),
+                    quota: snapshots.remove(&key.id).map(|(quota, probed_at)| {
+                        KeyQuotaView::new(
+                            quota,
+                            probed_at,
+                            histories.get(&key.id).map(Vec::as_slice).unwrap_or(&[]),
+                        )
+                    }),
                 })
             })
             .collect();
@@ -338,7 +351,10 @@ impl ProvidersPage {
                 let now = chrono::Utc::now();
                 for card in &mut data.keys {
                     if let Some(quota) = quotas.remove(&card.key.id) {
-                        card.quota = Some(KeyQuotaView::new(quota, now));
+                        card.quota = Some(match card.quota.take() {
+                            Some(previous) => previous.live(quota, now),
+                            None => KeyQuotaView::new(quota, now, &[]),
+                        });
                     }
                 }
                 cx.notify();
