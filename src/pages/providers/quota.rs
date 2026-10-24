@@ -304,7 +304,30 @@ impl Trend {
         if period < TREND_MIN_PERIOD_MINUTES {
             return None;
         }
-        let start = end - Duration::minutes(period);
+        // `period` is an approximation (a vendor month is 28–31 days), so the
+        // arithmetic start can miss the window's birth by a day in either
+        // direction — fatal for a fresh account, whose derived start can land
+        // in the future, past every recorded sample. Observed evidence
+        // supersedes the arithmetic: a sample-to-sample drop is a renewal
+        // (usage only climbs within a window) and pins the birth; a series
+        // with no drop that begins before the derived start belongs to this
+        // window's birth.
+        let mut start = end - Duration::minutes(period);
+        let mut last_drop: Option<DateTime<Utc>> = None;
+        let mut previous_pct: Option<f64> = None;
+        for (at, pct) in &window.history {
+            if previous_pct.is_some_and(|previous| *pct < previous) {
+                last_drop = Some(*at);
+            }
+            previous_pct = Some(*pct);
+        }
+        start = match last_drop {
+            Some(renewed_at) => renewed_at,
+            None => match window.history.first() {
+                Some((first_at, _)) if *first_at < start => *first_at,
+                _ => start,
+            },
+        };
         if end <= start {
             return None;
         }
