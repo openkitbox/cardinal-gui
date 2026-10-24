@@ -6,8 +6,9 @@
 use std::rc::Rc;
 
 use gpui::{
-    App, Bounds, Context, Div, ElementId, Hsla, ParentElement, PathBuilder, Styled, Window, canvas,
-    point, prelude::FluentBuilder as _, px,
+    App, AppContext as _, Bounds, Context, Div, ElementId, Hsla, InteractiveElement, ParentElement,
+    PathBuilder, StatefulInteractiveElement, Styled, Window, canvas, point,
+    prelude::FluentBuilder as _, px,
 };
 use gpui_kit::assets::IconName;
 use gpui_kit::component::button::{Button, ButtonVariants};
@@ -307,6 +308,16 @@ struct StageAccount {
     /// Latest successful request time for this (key, model) — shown in the
     /// serving-caption slot once the entry goes idle.
     last_success: Option<chrono::DateTime<chrono::Utc>>,
+}
+
+/// Drag payload of one stage entry row: source route alias + index plus a
+/// ghost label. Dropping onto another route's section is ignored —
+/// reordering stays within one route (single atomic put_route).
+#[derive(Clone)]
+pub(super) struct StageEntryDrag {
+    pub(super) alias: String,
+    pub(super) from: usize,
+    pub(super) label: String,
 }
 
 /// One route section of the stage: alias header over its entries.
@@ -683,18 +694,31 @@ impl RoutesPage {
 
         Some(
             card(cx).child(
-                gpui::div().relative().h(px(stage_h)).child(overlay).child(
-                    gpui::div()
-                        .h_full()
-                        .py(px(STAGE_PAD_Y))
-                        .px(px(2.))
-                        .flex()
-                        .child(sources_col)
-                        .child(gpui::div().w(px(COL_GAP)).flex_shrink_0())
-                        .child(hub_col)
-                        .child(gpui::div().w(px(COL_GAP)).flex_shrink_0())
-                        .child(accounts_col),
-                ),
+                gpui::div()
+                    .relative()
+                    .h(px(stage_h))
+                    // Capture order is outer→inner: clear first, then the row
+                    // under the cursor sets its section's drop site again.
+                    .on_drag_move(cx.listener(
+                        |this, _: &gpui::DragMoveEvent<StageEntryDrag>, _, cx| {
+                            if this.stage_drop.take().is_some() {
+                                cx.notify();
+                            }
+                        },
+                    ))
+                    .child(overlay)
+                    .child(
+                        gpui::div()
+                            .h_full()
+                            .py(px(STAGE_PAD_Y))
+                            .px(px(2.))
+                            .flex()
+                            .child(sources_col)
+                            .child(gpui::div().w(px(COL_GAP)).flex_shrink_0())
+                            .child(hub_col)
+                            .child(gpui::div().w(px(COL_GAP)).flex_shrink_0())
+                            .child(accounts_col),
+                    ),
             ),
         )
     }
@@ -710,6 +734,10 @@ impl RoutesPage {
         cx: &mut Context<Self>,
     ) -> Div {
         let theme = cx.theme();
+        // Copied out of `theme` (Hsla is Copy): the drag insertion line below
+        // reads it after the `&mut cx` stage_entry loop, which must not
+        // overlap `theme`'s borrow.
+        let accent = theme.accent;
         let alias = route.alias.clone();
         let edit_route = route.clone();
         let header = gpui::div()
@@ -805,12 +833,36 @@ impl RoutesPage {
                 cx,
             ));
         }
-        gpui::div()
+        let entries_col =
+            entries_col.on_drop(cx.listener(move |this, drag: &StageEntryDrag, _, cx| {
+                this.finish_stage_drag(drag, cx)
+            }));
+        let mut section = gpui::div()
+            .relative()
             .flex()
             .flex_col()
             .gap(px(SEC_INNER_GAP))
             .child(header)
-            .child(entries_col)
+            .child(entries_col);
+        if let Some((drop_alias, slot)) = &self.stage_drop
+            && drop_alias == &route.alias
+        {
+            // Overlay line, no layout shift: rows (and the wire endpoints
+            // computed from them) stay exactly where they are.
+            let line_y =
+                SEC_HEAD_H + SEC_INNER_GAP + *slot as f32 * (ACCT_H + ACCT_GAP) - ACCT_GAP / 2.;
+            section = section.child(
+                gpui::div()
+                    .absolute()
+                    .left(px(0.))
+                    .right(px(0.))
+                    .top(px(line_y - 1.))
+                    .h(px(2.))
+                    .rounded_full()
+                    .bg(accent),
+            );
+        }
+        section
     }
 
     /// One entry row of a route section: serving dot, account head, model chip,
@@ -873,6 +925,58 @@ impl RoutesPage {
         let row = if manage {
             let alias_up = route.alias.clone();
             let alias_down = route.alias.clone();
+            let drag_alias = route.alias.clone();
+            let move_alias = route.alias.clone();
+            let drag_label = format!("{} · {}", account.head, account.model);
+            let row = row
+                .on_drag_move(cx.listener(
+                    move |this, event: &gpui::DragMoveEvent<StageEntryDrag>, _, cx| {
+                        // Drag-move listeners fire window-wide while a matching
+                        // drag is active (no hit-testing) — only this row's own
+                        // bounds may claim the drop site.
+                        if !event.bounds.contains(&event.event.position) {
+                            return;
+                        }
+                        // Cross-route dragging is out of scope.
+                        if event.drag(cx).alias != move_alias {
+                            return;
+                        }
+                        let after = event.event.position.y > event.bounds.center().y;
+                        // Cloned per qualifying move: the listener is Fn (it
+                        // fires on every mouse move of the drag).
+                        let next = Some((move_alias.clone(), index + usize::from(after)));
+                        if this.stage_drop != next {
+                            this.stage_drop = next;
+                            cx.notify();
+                        }
+                    },
+                ))
+                .when(!busy, |row| {
+                    row.child(
+                        gpui::div()
+                            .id(ElementId::from(gpui::SharedString::from(format!(
+                                "entry-grip-{}-{index}",
+                                route.alias
+                            ))))
+                            .cursor_grab()
+                            .flex_shrink_0()
+                            .text_color(theme.muted_foreground)
+                            .hover(|this| this.text_color(theme.foreground))
+                            .child(Icon::new(IconName::GripVertical).small())
+                            .on_drag(
+                                StageEntryDrag {
+                                    alias: drag_alias,
+                                    from: index,
+                                    label: drag_label,
+                                },
+                                |drag, _, _, cx| {
+                                    cx.new(|_| super::DragGhost {
+                                        text: drag.label.clone(),
+                                    })
+                                },
+                            ),
+                    )
+                });
             row.child(
                 Button::new(ElementId::from(gpui::SharedString::from(format!(
                     "entry-up-{}-{index}",

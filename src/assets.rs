@@ -12,7 +12,7 @@ use gpui::{AssetSource, Result, SharedString};
 use gpui_kit::assets::Assets;
 use std::borrow::Cow;
 
-const VENDORED: [(&str, &[u8]); 7] = [
+const VENDORED: [(&str, &[u8]); 8] = [
     (
         "icons/activity.svg",
         include_bytes!("../assets/icons/activity.svg"),
@@ -20,6 +20,10 @@ const VENDORED: [(&str, &[u8]); 7] = [
     (
         "icons/bitcoin.svg",
         include_bytes!("../assets/icons/bitcoin.svg"),
+    ),
+    (
+        "icons/grip-vertical.svg",
+        include_bytes!("../assets/icons/grip-vertical.svg"),
     ),
     (
         "icons/message-square.svg",

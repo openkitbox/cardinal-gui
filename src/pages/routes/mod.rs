@@ -32,7 +32,7 @@ use crate::pages::{
 };
 use crate::runtime::{GatewayRuntime, RelayMode};
 
-use stage::StageClient;
+use stage::{StageClient, StageEntryDrag};
 
 /// How many recent requests the page keeps (the stage's resting source node
 /// shows the latest one).
@@ -47,6 +47,35 @@ const CONTEXT_PRESETS: [(i64, &str); 4] = [
     (262_144, "256k"),
     (1_048_576, "1M"),
 ];
+
+/// Drag payload of one route-editor item row: source index plus a ghost
+/// label (账号 · 模型). The distinct type keeps stage drags out of here.
+#[derive(Clone)]
+struct EditorItemDrag {
+    from: usize,
+    label: String,
+}
+
+/// The floating card rendered under the cursor during a row drag.
+struct DragGhost {
+    text: String,
+}
+
+impl Render for DragGhost {
+    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        gpui::div()
+            .px_2()
+            .py_1()
+            .rounded_md()
+            .border_1()
+            .border_color(cx.theme().border)
+            .bg(cx.theme().popover)
+            .shadow_sm()
+            .text_size(px(12.))
+            .text_color(cx.theme().foreground)
+            .child(self.text.clone())
+    }
+}
 
 /// One key as the route editor sees it: identity plus display labels.
 struct RouteKey {
@@ -176,6 +205,9 @@ struct RouteEditor {
     note: Entity<InputState>,
     /// The route itself: a flat model list, in append order.
     items: Vec<ItemDraft>,
+    /// Active drag drop site: (item index, insert-after? false = before).
+    /// Set by per-row drag moves; cleared by the card root or on drop.
+    drop_at: Option<(usize, bool)>,
     /// On-demand picker rows (＋添加模型 appends one) — the account list is
     /// never rendered flat, so dozens of accounts don't blow up the card.
     rows: Vec<PickerRow>,
@@ -290,6 +322,19 @@ fn route_entries(drafts: &[SelectionDraft]) -> Result<Vec<RouteEntry>, String> {
     Ok(entries)
 }
 
+/// Move one element to the "insert before slot `slot`" boundary (0..=len):
+/// remove `from`, then insert with the removal compensated (`from < slot`
+/// shifts the boundary back one). Out-of-range indices are a no-op.
+fn apply_move<T>(mut items: Vec<T>, from: usize, slot: usize) -> Vec<T> {
+    if from >= items.len() || slot > items.len() {
+        return items;
+    }
+    let item = items.remove(from);
+    let target = if from < slot { slot - 1 } else { slot };
+    items.insert(target, item);
+    items
+}
+
 /// Fresh inputs for one availability rule (default = allow, whole day).
 fn rule_draft(window: &mut Window, cx: &mut App) -> RuleDraft {
     let window_start = cx.new(|cx| InputState::new(window, cx).placeholder("起 08:00"));
@@ -335,6 +380,9 @@ pub struct RoutesPage {
     /// full-entry PUTs off the same stale snapshot (last-write-wins would
     /// silently reorder).
     manage_write_in_flight: bool,
+    /// Active stage-drag drop site: (route alias, insert-before slot).
+    /// Per-row drag moves set it, the stage root clears it, on_drop consumes.
+    stage_drop: Option<(String, usize)>,
     /// The shared live-activity feed driving the stage (observed).
     feed: Entity<ActivityFeed>,
     /// Persisted counter already handled (debounced reload on change).
@@ -371,6 +419,7 @@ impl RoutesPage {
             action_error: None,
             manage: false,
             manage_write_in_flight: false,
+            stage_drop: None,
             feed,
             seen_persisted: 0,
             refresh_pending: false,
@@ -469,6 +518,7 @@ impl RoutesPage {
                     .compact()
                     .on_click(cx.listener(|this, _, _, cx| {
                         this.manage = !this.manage;
+                        this.stage_drop = None; // leaving manage abandons a pending drop line
                         cx.notify();
                     }))
                     .into_any_element(),
@@ -593,6 +643,7 @@ impl RoutesPage {
             strategy,
             note,
             items,
+            drop_at: None,
             rows: Vec::new(),
             error: None,
         });
@@ -859,6 +910,53 @@ impl RoutesPage {
         });
     }
 
+    /// Drop of a stage entry drag: apply the pending insertion slot (set by
+    /// the per-row drag moves) against the freshest snapshot and PUT the
+    /// reordered route. Non-optimistic — same contract as ▲▼ move_entry.
+    fn finish_stage_drag(&mut self, drag: &StageEntryDrag, cx: &mut Context<Self>) {
+        let slot = self
+            .stage_drop
+            .take()
+            .filter(|(alias, _)| alias == &drag.alias)
+            .map(|(_, slot)| slot);
+        let Some(slot) = slot else { return };
+        if self.manage_write_in_flight {
+            return;
+        }
+        let LoadState::Loaded(data) = &self.state else {
+            return;
+        };
+        let Some(route) = data.routes.iter().find(|route| route.alias == drag.alias) else {
+            return;
+        };
+        // The payload index comes from a rendered frame; the debounced reload
+        // may have shrunk the route since — same defense as move_entry.
+        if drag.from >= route.entries.len() {
+            return;
+        }
+        // Dropped back into the source slot — nothing to write.
+        if slot == drag.from || slot == drag.from + 1 {
+            return;
+        }
+        let entries = apply_move(route.entries.clone(), drag.from, slot);
+        let context_window = route.context_window;
+        let strategy = route.strategy;
+        let note = route.note.clone();
+        let alias = drag.alias.clone();
+        self.manage_write(cx, move |admin| async move {
+            admin
+                .put_route(
+                    &alias,
+                    &entries,
+                    context_window,
+                    strategy,
+                    note.as_deref(),
+                    None,
+                )
+                .await
+        });
+    }
+
     /// Move one entry within its route (manage-mode ▲▼): the stored order IS
     /// the dispatch order, so this re-PUTs the route with two entries swapped.
     fn move_entry(&mut self, alias: String, index: usize, up: bool, cx: &mut Context<Self>) {
@@ -899,6 +997,29 @@ impl RoutesPage {
                 )
                 .await
         });
+    }
+
+    /// Drop of an editor item drag: apply the pending insertion from
+    /// `drop_at` to the local items — no network, 保存 still commits.
+    fn finish_editor_drag(&mut self, drag: &EditorItemDrag, cx: &mut Context<Self>) {
+        let Some(editor) = &mut self.editor else {
+            return;
+        };
+        let Some((index, after)) = editor.drop_at.take() else {
+            return;
+        };
+        let count = editor.items.len();
+        if drag.from >= count || index >= count {
+            cx.notify();
+            return;
+        }
+        let slot = index + usize::from(after);
+        if slot == drag.from || slot == drag.from + 1 {
+            cx.notify(); // dropped back where it was; just clear the line
+            return;
+        }
+        editor.items = apply_move(std::mem::take(&mut editor.items), drag.from, slot);
+        cx.notify();
     }
 
     /// Delete-confirm dialog for one entry (manage-mode ✕): re-PUTs the route
@@ -1015,7 +1136,22 @@ impl RoutesPage {
         };
         let editing = editor.original_alias.is_some();
         let item_count = editor.items.len();
-        card(cx)
+        let card = card(cx)
+            // Capture order is outer→inner: the card clears a stale drop
+            // site first, then a row under the cursor sets its own.
+            .on_drag_move(
+                cx.listener(|this, _: &gpui::DragMoveEvent<EditorItemDrag>, _, cx| {
+                    if let Some(editor) = &mut this.editor
+                        && editor.drop_at.take().is_some()
+                    {
+                        cx.notify();
+                    }
+                }),
+            )
+            .on_drop(cx.listener(|this, drag: &EditorItemDrag, _, cx| {
+                this.finish_editor_drag(drag, cx);
+            }));
+        card
       .child(gpui::div().font_weight(gpui::FontWeight::MEDIUM).text_color(cx.theme().foreground).child(title))
       .child(
         gpui::div()
@@ -1124,19 +1260,59 @@ impl RoutesPage {
           .find(|key| key.id == item.key_id)
           .map(|key| key.label.clone())
           .unwrap_or_else(|| format!("账号 #{}", item.key_id));
+        let ghost_label = format!("{key_label} · {}", item.model);
         let field_label = |text: &str, cx: &App| {
           gpui::div().w(px(40.)).flex_shrink_0().text_size(px(12.)).text_color(cx.theme().muted_foreground).child(text.to_string())
         };
         gpui::div()
+          .relative()
           .flex()
           .flex_col()
           .gap_1()
+          // Upper half = insert before this row, lower half = after.
+          .on_drag_move(cx.listener(move |this, event: &gpui::DragMoveEvent<EditorItemDrag>, _, cx| {
+            // Drag-move listeners fire window-wide while a matching drag is
+            // active — only this row's own bounds may claim the drop site.
+            if !event.bounds.contains(&event.event.position) {
+              return;
+            }
+            let Some(editor) = &mut this.editor else { return };
+            let after = event.event.position.y > event.bounds.center().y;
+            let next = Some((index, after));
+            if editor.drop_at != next {
+              editor.drop_at = next;
+              cx.notify();
+            }
+          }))
+          .when(editor.drop_at == Some((index, false)), |row| {
+            row.child(
+              gpui::div().absolute().left(px(0.)).right(px(0.)).top(px(-1.)).h(px(2.)).rounded_full().bg(cx.theme().accent),
+            )
+          })
+          .when(editor.drop_at == Some((index, true)), |row| {
+            row.child(
+              gpui::div().absolute().left(px(0.)).right(px(0.)).bottom(px(-1.)).h(px(2.)).rounded_full().bg(cx.theme().accent),
+            )
+          })
           .child(
             gpui::div()
               .flex()
               .items_center()
               .gap_1()
               // The item list IS the dispatch order — move buttons edit it.
+              .child(
+                gpui::div()
+                  .id(ElementId::from(gpui::SharedString::from(format!("route-item-grip-{index}"))))
+                  .cursor_grab()
+                  .flex_shrink_0()
+                  .text_color(cx.theme().muted_foreground)
+                  .hover(|this| this.text_color(cx.theme().foreground))
+                  .child(Icon::new(IconName::GripVertical).small())
+                  .on_drag(
+                    EditorItemDrag { from: index, label: ghost_label.clone() },
+                    |drag, _, _, cx| cx.new(|_| DragGhost { text: drag.label.clone() }),
+                  ),
+              )
               .child(
                 Button::new(("route-item-up", index as u64))
                   .icon(Icon::new(IconName::ArrowUp).small())
