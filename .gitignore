@@ -2,3 +2,6 @@ target
 Cargo.lock
 Taskfile.yml
 config.toml
+
+# design/plan docs (local-only, family convention)
+docs/superpowers/
