@@ -22,7 +22,8 @@ use gateway::store::ProviderKeyView;
 use gateway::store::{ProviderRow, RestRow};
 
 use super::catalog::{
-    PROVIDER_SPECS, ProviderIcon, ProviderSpec, Region, spec_for, variant_of_row, variants_of,
+    PROVIDER_SPECS, ProviderIcon, ProviderSpec, Region, imported_logo, spec_for, variant_of_row,
+    variants_of,
 };
 use super::quota::quota_row;
 use super::{KeyCardData, KeyDrag, KeyEditor, KeyForm, ProvidersPage, reordered};
@@ -929,24 +930,33 @@ fn model_rows(key: &ProviderKeyView, cx: &App) -> Div {
 /// Provider icon at a given render size: the embedded SVG logo, rasterized
 /// full-color (gpui's `svg()` element renders monochrome alpha-masks, so
 /// brand logos go through `img()` instead).
-fn provider_icon(spec: &'static ProviderSpec, height: f32, _cx: &App) -> Div {
+fn provider_icon(spec: &'static ProviderSpec, height: f32, cx: &App) -> Div {
     let ProviderIcon::Svg(bytes) = &spec.icon;
+    logo(bytes, height, cx)
+}
+
+/// A brand SVG rendered at `height` (see [`provider_icon`] for why `img()`).
+fn logo(bytes: &'static [u8], height: f32, _cx: &App) -> Div {
     let image = Arc::new(Image::from_bytes(ImageFormat::Svg, bytes.to_vec()));
     gpui::div()
         .flex_shrink_0()
         .child(img(image).w(px(height)).h(px(height)))
 }
 
-/// Icon for an arbitrary provider row: catalog logo when known, else a letter
-/// tile from the provider's stored name.
+/// Icon for an arbitrary provider row: catalog logo when known, the imported
+/// vendor's logo when it is not in the catalog (Kiro), else a letter tile from
+/// the provider's stored name.
 fn provider_icon_for(
     provider: &ProviderRow,
     spec: Option<&'static ProviderSpec>,
     height: f32,
     cx: &App,
 ) -> Div {
-    match spec {
-        Some(spec) => provider_icon(spec, height, cx),
+    if let Some(spec) = spec {
+        return provider_icon(spec, height, cx);
+    }
+    match imported_logo(&provider.name) {
+        Some(bytes) => logo(bytes, height, cx),
         None => letter_tile(&provider.name[..1].to_uppercase(), height, cx),
     }
 }

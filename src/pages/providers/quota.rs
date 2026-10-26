@@ -77,7 +77,7 @@ pub(super) struct QuotaWindowView {
     /// x-axis span). `None` in snapshots written before the field existed.
     period_minutes: Option<i64>,
     /// The window's full allowance ("$70.00") for a money-window, so the meter
-    /// renders "used / total" instead of a bare percent.
+    /// renders "remaining/total" instead of a bare percent.
     total: Option<String>,
     /// Probe samples recorded for this window name, oldest first — all of the
     /// gateway's 35-day series, including a previous window's points; the
@@ -226,7 +226,7 @@ fn quota_meter(
                         .child(match &window.total {
                             Some(total) => {
                                 let remaining_amount = remaining_amount(total, remaining);
-                                format!("剩余 {remaining_amount} / {total}")
+                                format!("{remaining_amount}/{total}")
                             }
                             None => format!("剩余 {}", pct_label(remaining)),
                         }),
@@ -709,8 +709,9 @@ fn pct_label(pct: f64) -> String {
 }
 
 /// The remaining amount of a money-window, from its total and the remaining
-/// share: "剩余 $69.99 / $70.00". Falls back to the total itself when the
-/// total string is not a plain number (keeps the unit prefix/suffix as-is).
+/// share, rendered as "remaining/total" ("$69.99/$70.00"). Falls back to the
+/// total itself when the total string is not a plain number (keeps the unit
+/// prefix/suffix as-is).
 fn remaining_amount(total: &str, remaining_pct: f64) -> String {
     let (prefix, digits) = total.split_at(total.find(|c: char| c.is_ascii_digit()).unwrap_or(0));
     let (num, suffix) = digits.split_at(

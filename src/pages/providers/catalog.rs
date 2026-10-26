@@ -159,6 +159,16 @@ pub(super) fn spec_for(provider_name: &str) -> Option<&'static ProviderSpec> {
         })
 }
 
+/// Brand logo for an imported provider that is deliberately absent from the
+/// creation catalog: Kiro's credentials only arrive through the one-off import
+/// script, so offering it in the picker would dead-end at a rejected key.
+pub(super) fn imported_logo(provider_name: &str) -> Option<&'static [u8]> {
+    match provider_name.split('-').next().unwrap_or(provider_name) {
+        "kiro" => Some(provider_logos::KIRO),
+        _ => None,
+    }
+}
+
 /// Provider region: picks the base_url host for vendors with regional
 /// endpoints (kimi/glm). Vendors without a variant table ignore it.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]

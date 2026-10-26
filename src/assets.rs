@@ -65,6 +65,10 @@ pub(crate) mod provider_logos {
     pub(crate) const OPENCODE: &[u8] = include_bytes!("../assets/providers/opencode.svg");
     /// Command Code (the knot mark).
     pub(crate) const COMMANDCODE: &[u8] = include_bytes!("../assets/providers/commandcode.svg");
+    /// Kiro (the purple mark, from magpie's lobe-icon set). Kiro is imported
+    /// rather than created from the picker, so it has no catalog entry — the
+    /// cards resolve this logo by provider name.
+    pub(crate) const KIRO: &[u8] = include_bytes!("../assets/providers/kiro.svg");
 }
 
 pub(crate) struct GuiAssets;

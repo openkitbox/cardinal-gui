@@ -28,8 +28,8 @@ path = "src/main.rs"
 
 [dependencies]
 gateway = { path = "../cardinal", package = "cardinal" }
-gpui = { package = "gpui-pre", version = "=0.3.9" }
-gpui-kit = "0.7.3"
+gpui = { package = "gpui-pre", version = "0.3" }
+gpui-kit = "0.8"
 dirs = "7"
 tracing = "0.1"
 tokio = { version = "1", features = ["macros", "sync", "rt-multi-thread"] }
