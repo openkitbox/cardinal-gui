@@ -1,5 +1,5 @@
 //! Usage trend card: a segmented metric switch (Token /
-//! 费用 / 请求) and a split-dimension switch (路由 / 模型 / 供应商 / 客户端) over a
+//! 费用 / 请求) and a split-dimension switch (路由 / 模型 / 供应商 / 客户端 / 用户) over a
 //! stacked-column chart with a hover tooltip, flanked by a per-category
 //! ranking. The top 7 categories take the palette colours; the rest fold
 //! into 其他. Geometry and paint happen in a `canvas` element; the tooltip
@@ -110,7 +110,7 @@ fn category_fallback(split: TrendSplit) -> &'static str {
         TrendSplit::Route => "（直连）",
         TrendSplit::Model | TrendSplit::Provider => "（未知）",
         // No agent and no caller key: a local unidentified caller.
-        TrendSplit::Client => "（本机）",
+        TrendSplit::Client | TrendSplit::User => "（本机）",
     }
 }
 
@@ -453,6 +453,7 @@ impl UsagePage {
                             (TrendSplit::Model, "模型"),
                             (TrendSplit::Provider, "供应商"),
                             (TrendSplit::Client, "客户端"),
+                            (TrendSplit::User, "用户"),
                         ]
                         .into_iter(),
                         split,
