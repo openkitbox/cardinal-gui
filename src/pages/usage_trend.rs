@@ -120,7 +120,9 @@ pub(crate) struct TrendCategory {
     color: Hsla,
     requests: i64,
     failed: i64,
+    input_tokens: i64,
     tokens: i64,
+    cached_input_tokens: i64,
     cost: Option<f64>,
     /// Successful-row timing (speed line under the rank bar): output tokens
     /// over decode windows (total_ms - ttft_ms).
@@ -161,7 +163,9 @@ fn prepare(
     struct Agg {
         requests: i64,
         failed: i64,
+        input_tokens: i64,
         tokens: i64,
+        cached_input_tokens: i64,
         cost: f64,
         priced: bool,
         timed_output: i64,
@@ -200,7 +204,9 @@ fn prepare(
         let agg = aggs.entry(category.clone()).or_default();
         agg.requests += row.requests;
         agg.failed += row.failed;
+        agg.input_tokens += row.input_tokens;
         agg.tokens += row.input_tokens + row.output_tokens;
+        agg.cached_input_tokens += row.cached_input_tokens;
         if let Some(cost) = row.cost_usd {
             agg.cost += cost;
             agg.priced = true;
@@ -225,7 +231,9 @@ fn prepare(
         color,
         requests: agg.requests,
         failed: agg.failed,
+        input_tokens: agg.input_tokens,
         tokens: agg.tokens,
+        cached_input_tokens: agg.cached_input_tokens,
         cost: agg.priced.then_some(agg.cost),
         timed_output: agg.timed_output,
         decode_ms: agg.decode_ms,
@@ -242,7 +250,9 @@ fn prepare(
         let folded = rest.iter().fold(Agg::default(), |mut acc, (_, agg)| {
             acc.requests += agg.requests;
             acc.failed += agg.failed;
+            acc.input_tokens += agg.input_tokens;
             acc.tokens += agg.tokens;
+            acc.cached_input_tokens += agg.cached_input_tokens;
             acc.cost += agg.cost;
             acc.priced |= agg.priced;
             acc.timed_output += agg.timed_output;
@@ -650,6 +660,12 @@ impl UsagePage {
                     ),
             );
 
+        let cache_stat = cache_rate(category.input_tokens, category.cached_input_tokens)
+            .map_or_else(
+                || "缓存 —".to_string(),
+                |rate| format!("缓存 {:.0}%", rate * 100.),
+            );
+
         // The rank row: every figure but the ranked metric, then the share.
         let mut stats: Vec<String> = Vec::new();
         if metric != TrendMetric::Requests {
@@ -672,12 +688,12 @@ impl UsagePage {
         if total > 0. {
             stats.push(format!("{:.0}%", 100. * category.metric_value / total));
         }
+        stats.push(cache_stat);
         let mut line = div()
             .flex()
             .ml(px(15.))
             .mt_0p5()
             .text_size(px(10.5))
-            .whitespace_nowrap()
             .text_color(theme.muted_foreground)
             .child(stats.join(" · "));
         if category.failed > 0 {
@@ -1049,4 +1065,8 @@ fn tooltip_x(geometry: TrendGeometry, bucket: usize) -> Pixels {
     } else {
         px(center + 14.)
     }
+}
+
+fn cache_rate(input_tokens: i64, cached_input_tokens: i64) -> Option<f64> {
+    (input_tokens > 0).then(|| (cached_input_tokens as f64 / input_tokens as f64).clamp(0., 1.))
 }
