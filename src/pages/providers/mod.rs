@@ -1160,41 +1160,9 @@ async fn import_kiro(
     label: &str,
     oauth: &KiroOAuth,
 ) -> Result<(), gateway::http_client::ClientError> {
-    let input = ProviderInput {
-        name: provider_name,
-        protocol: "kiro",
-        base_url: endpoint,
-        auth_scheme: Some("bearer"),
-        enabled: true,
-    };
-    let (provider_id, provider_created) = match admin
-        .providers()
-        .await?
-        .into_iter()
-        .find(|provider| provider.name.trim() == provider_name)
-    {
-        Some(provider)
-            if provider.protocol == "kiro"
-                && provider.base_url.trim().trim_end_matches('/')
-                    == endpoint.trim().trim_end_matches('/') =>
-        {
-            (provider.id, false)
-        }
-        Some(provider) => {
-            return Err(gateway::http_client::ClientError::Decode(format!(
-                "provider {provider_name} has incompatible protocol or endpoint {}",
-                provider.base_url
-            )));
-        }
-        None => match admin.create_provider(&input).await {
-            Ok(provider_id) => (provider_id, true),
-            Err(_) => {
-                return Err(gateway::http_client::ClientError::Decode(
-                    "provider creation outcome is unknown; verify before retrying".to_owned(),
-                ));
-            }
-        },
-    };
+    let (provider_id, provider_created) = admin
+        .find_or_create_kiro_provider(provider_name, endpoint)
+        .await?;
     match admin.upsert_kiro_key(provider_id, label, oauth).await {
         Ok(_) => Ok(()),
         Err(error) => {
