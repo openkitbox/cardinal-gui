@@ -19,6 +19,7 @@
 
 mod cards;
 mod catalog;
+pub mod kiro_import;
 mod quota;
 
 use std::collections::HashMap;
@@ -29,11 +30,12 @@ use gpui::{
 };
 use gpui_kit::assets::IconName;
 use gpui_kit::component::button::{Button, ButtonVariant};
-use gpui_kit::component::input::InputState;
+use gpui_kit::component::input::{InputState, TextareaState};
 use gpui_kit::component::{Icon, Sizable, WindowExt};
 
 use gateway::admin_ops::Bootstrap;
 use gateway::http_client::GatewayHttpClient;
+use gateway::kiro::KiroOAuth;
 
 use gateway::probe::ProbeModel;
 use gateway::quota::KeyQuota;
@@ -146,6 +148,8 @@ struct KeyForm {
     coding_plan: bool,
     label: Entity<InputState>,
     api_key: Entity<InputState>,
+    /// Kiro uses a JSON import instead of the ordinary API-key field.
+    kiro_import: Option<KiroImportForm>,
     /// Optional per-key concurrency cap (empty = 不限).
     max_concurrency: Entity<InputState>,
     /// Models the last 获取模型 probe returned (None until probed).
@@ -157,6 +161,20 @@ struct KeyForm {
     /// A save is in flight (validating the key upstream, then persisting).
     saving: bool,
     error: Option<String>,
+}
+
+/// State for the Kiro JSON import boundary. The raw document and parsed
+/// credentials are cleared before the async write begins, so secrets never
+/// remain in the form after either a successful or failed import.
+struct KiroImportForm {
+    raw_json: Entity<TextareaState>,
+    provider_name: Entity<InputState>,
+    key_label: Entity<InputState>,
+    parsed: Option<kiro_import::ParsedKiroExport>,
+    parsed_raw_json: Option<String>,
+    selected_account: usize,
+    default_provider_name: String,
+    generation: u64,
 }
 
 /// Inline edit form for one existing key. The credential itself is NOT
@@ -191,6 +209,7 @@ pub struct ProvidersPage {
     state: LoadState<ProvidersData>,
     /// Stale-overwrite guard: a reload started later always wins over one still in flight.
     generation: u64,
+    form_generation: u64,
     key_form: Option<KeyForm>,
     key_editor: Option<KeyEditor>,
     /// Failure of a row-level write (toggle/delete/reorder); shown above the list.
@@ -211,6 +230,7 @@ impl ProvidersPage {
         let mut this = Self {
             state: LoadState::Loading,
             generation: 0,
+            form_generation: 0,
             key_form: None,
             key_editor: None,
             action_error: None,
@@ -391,6 +411,7 @@ impl ProvidersPage {
 
     /// Open the add-key form, defaulting to the first catalog provider.
     fn open_key_form(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.form_generation = self.form_generation.wrapping_add(1);
         let label = cx.new(|cx| InputState::new(window, cx).placeholder("label（如 主用）"));
         let api_key = cx.new(|cx| InputState::new(window, cx).placeholder("sk-…"));
         let max_concurrency =
@@ -406,6 +427,7 @@ impl ProvidersPage {
             coding_plan: false,
             label,
             api_key,
+            kiro_import: None,
             max_concurrency,
             probed_models: None,
             selected_models: Vec::new(),
@@ -416,10 +438,101 @@ impl ProvidersPage {
         cx.notify();
     }
 
+    /// Switch the add form between catalog entries. Kiro gets its own import
+    /// state and never enters the ordinary API-key validation path.
+    fn select_form_provider(&mut self, index: usize, window: &mut Window, cx: &mut Context<Self>) {
+        let same_provider = self
+            .key_form
+            .as_ref()
+            .is_some_and(|form| form.spec_index == index);
+        if same_provider {
+            return;
+        }
+        self.form_generation = self.form_generation.wrapping_add(1);
+        let Some(form) = &mut self.key_form else {
+            return;
+        };
+        form.spec_index = index;
+        form.probed_models = None;
+        form.selected_models.clear();
+        form.probing = false;
+        form.kiro_import = if PROVIDER_SPECS[index].name == "kiro" {
+            let raw_json = cx.new(|cx| {
+                TextareaState::new(window, cx)
+                    .placeholder("粘贴 Kiro 导出的 JSON（不会发送网络请求）")
+            });
+            let provider_name = cx.new(|cx| InputState::new(window, cx).default_value("kiro"));
+            let key_label =
+                cx.new(|cx| InputState::new(window, cx).placeholder("label（如 主用）"));
+            Some(KiroImportForm {
+                raw_json,
+                provider_name,
+                key_label,
+                parsed: None,
+                parsed_raw_json: None,
+                selected_account: 0,
+                default_provider_name: "kiro".to_string(),
+                generation: self.form_generation,
+            })
+        } else {
+            None
+        };
+        cx.notify();
+    }
+
+    /// Parse the Kiro export locally. This is intentionally synchronous and
+    /// pure: malformed input must not create an HTTP request or expose values.
+    fn parse_kiro_import(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(form) = &mut self.key_form else {
+            return;
+        };
+        let Some(import) = &mut form.kiro_import else {
+            return;
+        };
+        let raw_json = import.raw_json.read(cx).value();
+        match kiro_import::parse(&raw_json) {
+            Ok(parsed) => {
+                let region = parsed
+                    .summaries()
+                    .next()
+                    .map(|summary| summary.region)
+                    .unwrap_or_else(|| "us-east-1".to_string());
+                let default_name = format!("kiro-{region}");
+                let current_name = import.provider_name.read(cx).value();
+                if current_name.contains('/') {
+                    import.parsed = None;
+                    form.error = Some("Provider 名称不能包含 /".to_string());
+                    cx.notify();
+                    return;
+                }
+                if current_name.trim().is_empty() || current_name == import.default_provider_name {
+                    import
+                        .provider_name
+                        .update(cx, |input, cx| input.set_value(&default_name, window, cx));
+                }
+                import.default_provider_name = default_name;
+                import.parsed = Some(parsed);
+                import.parsed_raw_json = Some(raw_json.to_string());
+                import.selected_account = 0;
+                form.error = None;
+            }
+            Err(error) => {
+                import.parsed = None;
+                import.parsed_raw_json = None;
+                form.error = Some(error.to_string());
+            }
+        }
+        cx.notify();
+    }
+
     /// Save the add-key form: find-or-create the provider row from the catalog
     /// spec, then create the key. Errors stay in the form.
-    fn save_key(&mut self, cx: &mut Context<Self>) {
+    fn save_key(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let Some(form) = &self.key_form else { return };
+        if PROVIDER_SPECS[form.spec_index].name == "kiro" {
+            self.save_kiro_import(window, cx);
+            return;
+        }
         if form.saving {
             return; // one save in flight at a time
         }
@@ -450,6 +563,7 @@ impl ProvidersPage {
         } else {
             Some(form.selected_models.clone())
         };
+        let form_generation = self.form_generation;
         // Validate the key upstream before anything is persisted (the provider's
         // model list doubles as the liveness/auth proof); the provider row is
         // find-or-created only after the key checks out.
@@ -491,9 +605,13 @@ impl ProvidersPage {
         cx.spawn(async move |this, cx| {
             let result = call.await;
             this.update(cx, |page, cx| {
-                if let Some(form) = &mut page.key_form {
-                    form.saving = false;
+                let Some(form) = &mut page.key_form else {
+                    return;
+                };
+                if page.form_generation != form_generation {
+                    return;
                 }
+                form.saving = false;
                 match result {
                     Ok(()) => {
                         page.key_form = None;
@@ -518,6 +636,114 @@ impl ProvidersPage {
         .detach();
     }
 
+    fn save_kiro_import(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(form) = &self.key_form else { return };
+        let Some(import) = &form.kiro_import else {
+            return;
+        };
+        if form.saving {
+            return;
+        }
+        let Some(parsed_raw_json) = import.parsed_raw_json.as_deref() else {
+            if let Some(form) = &mut self.key_form {
+                form.error = Some("请先解析 JSON".to_string());
+            }
+            cx.notify();
+            return;
+        };
+        let current_raw_json = import.raw_json.read(cx).value();
+        if current_raw_json != parsed_raw_json {
+            if let Some(form) = &mut self.key_form {
+                form.error = Some("JSON 内容已变化或无效，请重新解析后再保存".to_string());
+            }
+            cx.notify();
+            return;
+        }
+        let parsed = match kiro_import::parse_for_save(&current_raw_json) {
+            Ok(parsed) => parsed,
+            Err(_) => {
+                if let Some(form) = &mut self.key_form {
+                    form.error = Some("JSON 内容已变化或无效，请重新解析后再保存".to_string());
+                }
+                cx.notify();
+                return;
+            }
+        };
+        let provider_name = import.provider_name.read(cx).value().to_string();
+        let label = import.key_label.read(cx).value().to_string();
+        let (provider_name, label) =
+            match kiro_import::validate_import_fields(&provider_name, &label) {
+                Ok(values) => values,
+                Err(message) => {
+                    if let Some(form) = &mut self.key_form {
+                        form.error = Some(message.to_string());
+                    }
+                    cx.notify();
+                    return;
+                }
+            };
+        let selected_account = import.selected_account;
+        let Some(oauth) = parsed.oauth(selected_account) else {
+            if let Some(form) = &mut self.key_form {
+                form.error = Some("所选 Kiro 账号不存在".to_string());
+            }
+            cx.notify();
+            return;
+        };
+        let form_generation = import.generation;
+        let endpoint = catalog::kiro_endpoint(&oauth.region);
+        if let Some(import) = self
+            .key_form
+            .as_mut()
+            .and_then(|form| form.kiro_import.as_mut())
+        {
+            import
+                .raw_json
+                .update(cx, |input, cx| input.set_value("", window, cx));
+            import.parsed = None;
+            import.parsed_raw_json = None;
+        }
+        if let Some(form) = &mut self.key_form {
+            form.saving = true;
+            form.error = None;
+        }
+        cx.notify();
+        let call = cx
+            .global::<GatewayRuntime>()
+            .admin_call(move |admin| async move {
+                import_kiro(&admin, &provider_name, &endpoint, &label, &oauth).await
+            });
+        cx.spawn(async move |this, cx| {
+            let result = call.await;
+            this.update(cx, |page, cx| {
+                let Some(form) = &mut page.key_form else {
+                    return;
+                };
+                let Some(import) = &form.kiro_import else {
+                    return;
+                };
+                if import.generation != form_generation {
+                    return;
+                }
+                match result {
+                    Ok(()) => {
+                        page.key_form = None;
+                        page.action_error = None;
+                        page.reload(cx);
+                        page.refresh_quotas(cx);
+                    }
+                    Err(error) => {
+                        form.saving = false;
+                        form.error = Some(error);
+                        cx.notify();
+                    }
+                }
+            })
+            .ok();
+        })
+        .detach();
+    }
+
     /// 获取模型 (add form): probe the typed credential against the chosen
     /// provider's model list — validation only, nothing is persisted — and
     /// offer the returned ids as selectable whitelist chips.
@@ -527,7 +753,10 @@ impl ProvidersPage {
             return;
         }
         let spec: &'static catalog::ProviderSpec = &PROVIDER_SPECS[form.spec_index];
-        let (name, base_url) = resolve(spec, form.region, form.coding_plan);
+        let spec_index = form.spec_index;
+        let region = form.region;
+        let coding_plan = form.coding_plan;
+        let (name, base_url) = resolve(spec, region, coding_plan);
         let api_key = form.api_key.read(cx).value().trim().to_string();
         if api_key.is_empty() {
             if let Some(form) = &mut self.key_form {
@@ -544,6 +773,7 @@ impl ProvidersPage {
         // Identity guard inputs, captured before the await: the landing only
         // applies while the form still probes the same provider/variant and the
         // same api_key — a switched or reopened form does not receive it.
+        let form_generation = self.form_generation;
         let guard_key = api_key.clone();
         let call = cx
             .global::<GatewayRuntime>()
@@ -557,16 +787,28 @@ impl ProvidersPage {
                 };
                 admin.validate_key(&input, &api_key).await
             });
-        // Identity guard: the landing only applies while the form still probes the
-        // same provider/variant and the same api_key — the probe is captured before
-        // the await, so a switched form (or a reopened one) does not receive it.
         cx.spawn(async move |this, cx| {
             let result = call.await;
             this.update(cx, |page, cx| {
                 let Some(form) = &mut page.key_form else {
                     return;
                 };
-                if !form.probing || form.api_key.read(cx).value().trim() != guard_key {
+                if page.form_generation != form_generation
+                    || form.spec_index != spec_index
+                    || form.region != region
+                    || form.coding_plan != coding_plan
+                {
+                    return;
+                }
+                if !form.probing {
+                    return;
+                }
+                if form.api_key.read(cx).value().trim() != guard_key {
+                    form.probing = false;
+                    form.probed_models = None;
+                    form.selected_models.clear();
+                    form.error = None;
+                    cx.notify();
                     return;
                 }
                 form.probing = false;
@@ -588,7 +830,7 @@ impl ProvidersPage {
 
     /// Toggle one model chip in the add form's whitelist selection.
     fn toggle_form_model(&mut self, model: String, cx: &mut Context<Self>) {
-        if let Some(form) = &mut self.key_form {
+        if let Some(form) = self.key_form.as_mut().filter(|form| !form.saving) {
             toggle_selection(&mut form.selected_models, &model);
         }
         cx.notify();
@@ -833,6 +1075,136 @@ impl ProvidersPage {
                     true
                 })
         });
+    }
+}
+
+fn cleanup_failure_message(
+    reason: &str,
+    provider_id: i64,
+    key_id: Option<i64>,
+    key_error: Option<&str>,
+    provider_error: Option<&str>,
+) -> String {
+    let mut message = format!("{reason}；清理未完成：provider {provider_id}");
+    if let Some(key_id) = key_id {
+        message.push_str(&format!("，key {key_id}"));
+    }
+    if let Some(error) = key_error {
+        message.push_str(&format!(" 删除失败（{error}）"));
+    }
+    if let Some(error) = provider_error {
+        message.push_str(&format!(" 删除失败（{error}）"));
+    }
+    message
+}
+
+async fn cleanup_new_resources(
+    admin: &GatewayHttpClient,
+    provider_id: i64,
+    key_id: Option<i64>,
+    provider_created: bool,
+    reason: &str,
+) -> Option<String> {
+    let mut key_error = None;
+    let key_deleted = match key_id {
+        Some(key_id) => match admin.delete_key(provider_id, key_id).await {
+            Ok(()) => true,
+            Err(error) => {
+                key_error = Some(error.to_string());
+                false
+            }
+        },
+        None => true,
+    };
+    let mut provider_error = None;
+    if provider_created && key_deleted {
+        // The emptiness predicate is part of the server-side DELETE, not a
+        // separate list-then-delete sequence: a concurrently added key makes
+        // this a conflict and keeps the provider instead of orphaning it.
+        match admin.delete_provider_if_empty(provider_id).await {
+            Ok(()) => {}
+            Err(gateway::http_client::ClientError::Http { status, .. })
+                if status.as_u16() == 404 => {}
+            Err(error) => provider_error = Some(error.to_string()),
+        }
+    }
+    if key_error.is_some() || provider_error.is_some() {
+        Some(cleanup_failure_message(
+            reason,
+            provider_id,
+            key_id,
+            key_error.as_deref(),
+            provider_error.as_deref(),
+        ))
+    } else {
+        None
+    }
+}
+
+fn import_error(
+    reason: &str,
+    error: gateway::http_client::ClientError,
+    cleanup_error: Option<String>,
+) -> gateway::http_client::ClientError {
+    let message = match cleanup_error {
+        Some(cleanup_error) => format!("{reason}：{error}；{cleanup_error}"),
+        None => format!("{reason}：{error}"),
+    };
+    gateway::http_client::ClientError::Decode(message)
+}
+
+async fn import_kiro(
+    admin: &GatewayHttpClient,
+    provider_name: &str,
+    endpoint: &str,
+    label: &str,
+    oauth: &KiroOAuth,
+) -> Result<(), gateway::http_client::ClientError> {
+    let input = ProviderInput {
+        name: provider_name,
+        protocol: "kiro",
+        base_url: endpoint,
+        auth_scheme: Some("bearer"),
+        enabled: true,
+    };
+    let (provider_id, provider_created) = match admin
+        .providers()
+        .await?
+        .into_iter()
+        .find(|provider| provider.name.trim() == provider_name)
+    {
+        Some(provider)
+            if provider.protocol == "kiro"
+                && provider.base_url.trim().trim_end_matches('/')
+                    == endpoint.trim().trim_end_matches('/') =>
+        {
+            (provider.id, false)
+        }
+        Some(provider) => {
+            return Err(gateway::http_client::ClientError::Decode(format!(
+                "provider {provider_name} has incompatible protocol or endpoint {}",
+                provider.base_url
+            )));
+        }
+        None => match admin.create_provider(&input).await {
+            Ok(provider_id) => (provider_id, true),
+            Err(_) => {
+                return Err(gateway::http_client::ClientError::Decode(
+                    "provider creation outcome is unknown; verify before retrying".to_owned(),
+                ));
+            }
+        },
+    };
+    match admin.upsert_kiro_key(provider_id, label, oauth).await {
+        Ok(_) => Ok(()),
+        Err(error) => {
+            let cleanup_error = if provider_created {
+                cleanup_new_resources(admin, provider_id, None, true, "导入 Kiro key 失败").await
+            } else {
+                None
+            };
+            Err(import_error("导入 Kiro key 失败", error, cleanup_error))
+        }
     }
 }
 

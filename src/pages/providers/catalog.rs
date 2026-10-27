@@ -143,6 +143,17 @@ pub(super) const PROVIDER_SPECS: &[ProviderSpec] = &[
         auth_scheme: "bearer",
         icon: ProviderIcon::Svg(provider_logos::OPENAI),
     },
+    ProviderSpec {
+        name: "kiro",
+        display: "Kiro",
+        // Kiro's runtime host is derived from the selected account's
+        // api_region; the import form deliberately does not expose an endpoint
+        // field and the write flow supplies the derived URL.
+        base_url: "",
+        protocol: "kiro",
+        auth_scheme: "bearer",
+        icon: ProviderIcon::Svg(provider_logos::KIRO),
+    },
 ];
 
 /// Look up the catalog entry for a stored provider name: an exact match
@@ -159,14 +170,18 @@ pub(super) fn spec_for(provider_name: &str) -> Option<&'static ProviderSpec> {
         })
 }
 
-/// Brand logo for an imported provider that is deliberately absent from the
-/// creation catalog: Kiro's credentials only arrive through the one-off import
-/// script, so offering it in the picker would dead-end at a rejected key.
+/// Brand logo fallback for provider rows whose catalog entry is not available
+/// (for example, rows created by an older gateway).
 pub(super) fn imported_logo(provider_name: &str) -> Option<&'static [u8]> {
     match provider_name.split('-').next().unwrap_or(provider_name) {
         "kiro" => Some(provider_logos::KIRO),
         _ => None,
     }
+}
+
+/// Kiro runtime endpoint for one validated account region.
+pub(super) fn kiro_endpoint(region: &str) -> String {
+    format!("https://runtime.{region}.kiro.dev")
 }
 
 /// Provider region: picks the base_url host for vendors with regional

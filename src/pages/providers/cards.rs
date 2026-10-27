@@ -12,7 +12,7 @@ use gpui::{
 };
 use gpui_kit::assets::IconName;
 use gpui_kit::component::button::{Button, ButtonVariants};
-use gpui_kit::component::input::Input;
+use gpui_kit::component::input::{Input, Textarea};
 use gpui_kit::component::menu::{DropdownMenu, PopupMenuItem};
 use gpui_kit::component::tag::Tag;
 use gpui_kit::component::{ActiveTheme, Disableable, Icon, Sizable};
@@ -26,7 +26,7 @@ use super::catalog::{
     variants_of,
 };
 use super::quota::quota_row;
-use super::{KeyCardData, KeyDrag, KeyEditor, KeyForm, ProvidersPage, reordered};
+use super::{KeyCardData, KeyDrag, KeyEditor, KeyForm, KiroImportForm, ProvidersPage, reordered};
 use crate::app::StatusTip;
 use crate::fmt::mask_api_key;
 use crate::pages::{LoadState, card};
@@ -77,14 +77,10 @@ impl ProvidersPage {
                             })
                             .when(selected, |this| this.bg(cx.theme().accent))
                             .hover(|style| style.bg(cx.theme().accent))
-                            .on_click(cx.listener(move |this, _, _, cx| {
-                                if let Some(form) = &mut this.key_form {
-                                    form.spec_index = index;
-                                    // The probed chips belong to the previously selected provider.
-                                    form.probed_models = None;
-                                    form.selected_models.clear();
+                            .on_click(cx.listener(move |this, _, window, cx| {
+                                if this.key_form.as_ref().is_some_and(|form| !form.saving) {
+                                    this.select_form_provider(index, window, cx);
                                 }
-                                cx.notify();
                             }))
                             .child(provider_icon(spec, 14., cx))
                             .child(
@@ -124,10 +120,13 @@ impl ProvidersPage {
                                     .when(selected, |this| this.bg(cx.theme().accent))
                                     .hover(|style| style.bg(cx.theme().accent))
                                     .on_click(cx.listener(move |this, _, _, cx| {
-                                        if let Some(form) = &mut this.key_form {
+                                        if let Some(form) = &mut this.key_form
+                                            && !form.saving
+                                        {
                                             form.region = region;
                                             form.probed_models = None;
                                             form.selected_models.clear();
+                                            form.probing = false;
                                         }
                                         cx.notify();
                                     }))
@@ -154,10 +153,13 @@ impl ProvidersPage {
                                     .when(selected, |this| this.bg(cx.theme().accent))
                                     .hover(|style| style.bg(cx.theme().accent))
                                     .on_click(cx.listener(|this, _, _, cx| {
-                                        if let Some(form) = &mut this.key_form {
+                                        if let Some(form) = &mut this.key_form
+                                            && !form.saving
+                                        {
                                             form.coding_plan = !form.coding_plan;
                                             form.probed_models = None;
                                             form.selected_models.clear();
+                                            form.probing = false;
                                         }
                                         cx.notify();
                                     }))
@@ -170,89 +172,106 @@ impl ProvidersPage {
                     )
                 },
             )
-            .child(editor_field(
-                "Label",
-                Input::new(&form.label),
-                Some(240.),
-                cx,
-            ))
-            .child(editor_field("API Key", Input::new(&form.api_key), None, cx))
-            .child(editor_field(
-                "并发上限",
-                Input::new(&form.max_concurrency),
-                Some(96.),
-                cx,
-            ))
-            // 模型白名单：点「获取模型」探测后点选；不选 = 全部模型可用。
-            .child(
-                gpui::div()
-                    .flex()
-                    .items_center()
-                    .gap_2()
-                    .child(field_label("模型", cx))
-                    .child(
-                        Button::new("key-form-probe")
-                            .label(if form.probing {
-                                "获取中…"
-                            } else {
-                                "获取模型"
-                            })
-                            .outline()
-                            .compact()
-                            .loading(form.probing)
-                            .disabled(form.probing || form.saving)
-                            .on_click(cx.listener(|this, _, _, cx| this.probe_form_models(cx))),
-                    )
-                    .child(
-                        gpui::div()
-                            .text_size(px(12.))
-                            .text_color(cx.theme().muted_foreground)
-                            .child("不选 = 全部模型"),
-                    ),
+            .when(
+                PROVIDER_SPECS[form.spec_index].name == "kiro",
+                |this| match form.kiro_import.as_ref() {
+                    Some(import) => this.child(self.kiro_import_fields(import, form.saving, cx)),
+                    None => this,
+                },
             )
-            .when_some(form.probed_models.as_ref(), |this, models| {
-                let listed: Vec<&str> = models.iter().map(|model| model.id.as_str()).collect();
-                let orphans = form
-                    .selected_models
-                    .iter()
-                    .filter(|id| !listed.contains(&id.as_str()));
+            .when(PROVIDER_SPECS[form.spec_index].name != "kiro", |this| {
+                this.child(editor_field(
+                    "Label",
+                    Input::new(&form.label),
+                    Some(240.),
+                    cx,
+                ))
+                .child(editor_field("API Key", Input::new(&form.api_key), None, cx))
+                .child(editor_field(
+                    "并发上限",
+                    Input::new(&form.max_concurrency),
+                    Some(96.),
+                    cx,
+                ))
+            })
+            // 普通供应商才显示模型探测；Kiro 导入必须保持纯本地解析。
+            .when(PROVIDER_SPECS[form.spec_index].name != "kiro", |this| {
                 this.child(
                     gpui::div()
                         .flex()
-                        .flex_wrap()
                         .items_center()
-                        .gap_1()
-                        .children(models.iter().map(|model| {
-                            let model_id = model.id.clone();
-                            let selected = form.selected_models.contains(&model.id);
-                            model_chip(
-                                model,
-                                selected,
-                                ElementId::from(gpui::SharedString::from(format!(
-                                    "key-form-model-{model_id}"
-                                ))),
-                                cx,
-                            )
-                            .on_click(cx.listener(
-                                move |this, _, _, cx| this.toggle_form_model(model_id.clone(), cx),
-                            ))
-                        }))
-                        .children(orphans.map(|model_id| {
-                            // Selected but absent from the probe list — keep it visible and
-                            // removable so a whitelist can never hide its own entries.
-                            let model_id = model_id.clone();
-                            orphan_chip(
-                                &model_id,
-                                ElementId::from(gpui::SharedString::from(format!(
-                                    "key-form-orphan-{model_id}"
-                                ))),
-                                cx,
-                            )
-                            .on_click(cx.listener(
-                                move |this, _, _, cx| this.toggle_form_model(model_id.clone(), cx),
-                            ))
-                        })),
+                        .gap_2()
+                        .child(field_label("模型", cx))
+                        .child(
+                            Button::new("key-form-probe")
+                                .label(if form.probing {
+                                    "获取中…"
+                                } else {
+                                    "获取模型"
+                                })
+                                .outline()
+                                .compact()
+                                .loading(form.probing)
+                                .disabled(form.probing || form.saving)
+                                .on_click(cx.listener(|this, _, _, cx| this.probe_form_models(cx))),
+                        )
+                        .child(
+                            gpui::div()
+                                .text_size(px(12.))
+                                .text_color(cx.theme().muted_foreground)
+                                .child("不选 = 全部模型"),
+                        ),
                 )
+            })
+            .when(PROVIDER_SPECS[form.spec_index].name != "kiro", |this| {
+                this.when_some(form.probed_models.as_ref(), |this, models| {
+                    let listed: Vec<&str> = models.iter().map(|model| model.id.as_str()).collect();
+                    let orphans = form
+                        .selected_models
+                        .iter()
+                        .filter(|id| !listed.contains(&id.as_str()));
+                    this.child(
+                        gpui::div()
+                            .flex()
+                            .flex_wrap()
+                            .items_center()
+                            .gap_1()
+                            .children(models.iter().map(|model| {
+                                let model_id = model.id.clone();
+                                let selected = form.selected_models.contains(&model.id);
+                                model_chip(
+                                    model,
+                                    selected,
+                                    ElementId::from(gpui::SharedString::from(format!(
+                                        "key-form-model-{model_id}"
+                                    ))),
+                                    cx,
+                                )
+                                .on_click(cx.listener(
+                                    move |this, _, _, cx| {
+                                        this.toggle_form_model(model_id.clone(), cx)
+                                    },
+                                ))
+                            }))
+                            .children(orphans.map(|model_id| {
+                                // Selected but absent from the probe list — keep it visible and
+                                // removable so a whitelist can never hide its own entries.
+                                let model_id = model_id.clone();
+                                orphan_chip(
+                                    &model_id,
+                                    ElementId::from(gpui::SharedString::from(format!(
+                                        "key-form-orphan-{model_id}"
+                                    ))),
+                                    cx,
+                                )
+                                .on_click(cx.listener(
+                                    move |this, _, _, cx| {
+                                        this.toggle_form_model(model_id.clone(), cx)
+                                    },
+                                ))
+                            })),
+                    )
+                })
             })
             .when_some(form.error.as_ref(), |this, error| {
                 this.child(inline_error(error, cx))
@@ -267,9 +286,12 @@ impl ProvidersPage {
                             .label("取消")
                             .outline()
                             .compact()
+                            .disabled(form.saving)
                             .on_click(cx.listener(|this, _, _, cx| {
-                                this.key_form = None;
-                                cx.notify();
+                                if this.key_form.as_ref().is_some_and(|form| !form.saving) {
+                                    this.key_form = None;
+                                    cx.notify();
+                                }
                             })),
                     )
                     .child(
@@ -283,9 +305,126 @@ impl ProvidersPage {
                             .compact()
                             .loading(form.saving)
                             .disabled(form.saving)
-                            .on_click(cx.listener(|this, _, _, cx| this.save_key(cx))),
+                            .on_click(cx.listener(|this, _, window, cx| this.save_key(window, cx))),
                     ),
             )
+    }
+
+    fn kiro_import_fields(
+        &self,
+        import: &KiroImportForm,
+        saving: bool,
+        cx: &mut Context<Self>,
+    ) -> Div {
+        let summaries: Vec<_> = import
+            .parsed
+            .as_ref()
+            .map(|parsed| {
+                parsed
+                    .summaries()
+                    .map(|summary| {
+                        (
+                            summary.index,
+                            summary.region,
+                            summary.expires_at,
+                            summary.has_profile_arn,
+                        )
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
+        let mut fields = gpui::div().flex().flex_col().gap_2();
+        fields = fields.child(editor_field(
+            "Provider",
+            Input::new(&import.provider_name).disabled(saving),
+            Some(240.),
+            cx,
+        ));
+        fields = fields.child(editor_field(
+            "Label",
+            Input::new(&import.key_label).disabled(saving),
+            Some(240.),
+            cx,
+        ));
+        fields = fields.child(
+            gpui::div()
+                .flex()
+                .items_start()
+                .gap_2()
+                .child(field_label("JSON", cx))
+                .child(
+                    gpui::div()
+                        .flex_1()
+                        .child(Textarea::new(&import.raw_json).h(px(180.)).disabled(saving)),
+                ),
+        );
+        fields = fields.child(
+            gpui::div()
+                .flex()
+                .items_center()
+                .gap_2()
+                .child(field_label("解析", cx))
+                .child(
+                    Button::new("kiro-parse")
+                        .label("解析 JSON")
+                        .outline()
+                        .compact()
+                        .disabled(saving)
+                        .on_click(
+                            cx.listener(|this, _, window, cx| this.parse_kiro_import(window, cx)),
+                        ),
+                )
+                .child(
+                    gpui::div()
+                        .text_size(px(12.))
+                        .text_color(cx.theme().muted_foreground)
+                        .child("解析失败不会发起网络请求"),
+                ),
+        );
+        if !summaries.is_empty() {
+            fields = fields.child(gpui::div().flex().flex_col().gap_1().children(
+                summaries.iter().map(|summary| {
+                    let &(index, ref region, expires_at, has_profile_arn) = summary;
+                    let selected = index == import.selected_account;
+                    let endpoint = super::catalog::kiro_endpoint(region);
+                    gpui::div()
+                        .id(("kiro-account", index))
+                        .flex()
+                        .flex_col()
+                        .gap_1()
+                        .p_2()
+                        .border_1()
+                        .border_color(if selected {
+                            cx.theme().primary
+                        } else {
+                            cx.theme().border
+                        })
+                        .when(selected, |this| this.bg(cx.theme().accent))
+                        .cursor_pointer()
+                        .on_click(cx.listener(move |this, _, _, cx| {
+                            if let Some(form) = &mut this.key_form
+                                && !form.saving
+                                && let Some(import) = &mut form.kiro_import
+                            {
+                                import.selected_account = index;
+                            }
+                            cx.notify();
+                        }))
+                        .child(format!(
+                            "账号 {} · region {} · expires_at {}",
+                            index + 1,
+                            region,
+                            expires_at
+                        ))
+                        .child(format!(
+                            "endpoint {} · profile ARN {}",
+                            endpoint,
+                            if has_profile_arn { "存在" } else { "缺失" }
+                        ))
+                }),
+            ));
+        }
+        fields
     }
 
     /// One key card: provider logo + label header, quota meters, model rows,
@@ -616,7 +755,7 @@ impl ProvidersPage {
       )
     }
 
-    /// The card's edit mode: label and concurrency-cap inputs, save/cancel. The
+    /// The card's edit mode: label and model inputs, save/cancel. The
     /// API key itself is read-only (rotate = delete + re-add): masked by default,
     /// with a reveal toggle and a copy button. Its plaintext is fetched when the
     /// editor opens (the list shapes carry none): until that lands, or if it
@@ -628,7 +767,7 @@ impl ProvidersPage {
         cx: &mut Context<Self>,
     ) -> Div {
         // None = the reveal has not landed (loading), or it failed. The editor
-        // stays usable for label/concurrency/models meanwhile.
+        // stays usable for label/models meanwhile.
         let api_key: Option<String> = editor.api_key.clone();
         let copy_key = api_key.clone();
         let masked = api_key.as_deref().map(mask_api_key);
@@ -703,12 +842,14 @@ impl ProvidersPage {
                 Some(160.),
                 cx,
             ))
-            .child(editor_field(
-                "并发上限",
-                Input::new(&editor.max_concurrency),
-                Some(96.),
-                cx,
-            ))
+            .when(card_data.provider.protocol != "kiro", |this| {
+                this.child(editor_field(
+                    "并发上限",
+                    Input::new(&editor.max_concurrency),
+                    Some(96.),
+                    cx,
+                ))
+            })
             // 模型白名单：chips 来自探测快照，「重新获取」刷新；不选 = 全部模型。
             .child(
                 gpui::div()
