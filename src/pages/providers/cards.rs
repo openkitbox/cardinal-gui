@@ -6,13 +6,13 @@
 use std::sync::Arc;
 
 use gpui::{
-    Anchor, App, AppContext as _, Context, Div, ElementId, Image, ImageFormat, InteractiveElement,
-    IntoElement, ParentElement, Render, StatefulInteractiveElement, Styled, Window, img,
-    prelude::FluentBuilder as _, px, relative,
+    Anchor, App, AppContext as _, Context, Div, ElementId, Entity, Image, ImageFormat,
+    InteractiveElement, IntoElement, ParentElement, Render, StatefulInteractiveElement, Styled,
+    Window, img, prelude::FluentBuilder as _, px, relative,
 };
 use gpui_kit::assets::IconName;
 use gpui_kit::component::button::{Button, ButtonVariants};
-use gpui_kit::component::input::{Input, Textarea};
+use gpui_kit::component::input::{Input, InputState, Textarea};
 use gpui_kit::component::menu::{DropdownMenu, PopupMenuItem};
 use gpui_kit::component::tag::Tag;
 use gpui_kit::component::{ActiveTheme, Disableable, Icon, Sizable};
@@ -175,21 +175,31 @@ impl ProvidersPage {
             .when(
                 PROVIDER_SPECS[form.spec_index].name == "kiro",
                 |this| match form.kiro_import.as_ref() {
-                    Some(import) => this.child(self.kiro_import_fields(import, form.saving, cx)),
+                    Some(import) => this.child(self.kiro_import_fields(
+                        import,
+                        &form.max_concurrency,
+                        form.saving,
+                        cx,
+                    )),
                     None => this,
                 },
             )
             .when(PROVIDER_SPECS[form.spec_index].name != "kiro", |this| {
                 this.child(editor_field(
                     "Label",
-                    Input::new(&form.label),
+                    Input::new(&form.label).disabled(form.saving),
                     Some(240.),
                     cx,
                 ))
-                .child(editor_field("API Key", Input::new(&form.api_key), None, cx))
+                .child(editor_field(
+                    "API Key",
+                    Input::new(&form.api_key).disabled(form.saving),
+                    None,
+                    cx,
+                ))
                 .child(editor_field(
                     "并发上限",
-                    Input::new(&form.max_concurrency),
+                    Input::new(&form.max_concurrency).disabled(form.saving),
                     Some(96.),
                     cx,
                 ))
@@ -313,6 +323,7 @@ impl ProvidersPage {
     fn kiro_import_fields(
         &self,
         import: &KiroImportForm,
+        max_concurrency: &Entity<InputState>,
         saving: bool,
         cx: &mut Context<Self>,
     ) -> Div {
@@ -334,16 +345,29 @@ impl ProvidersPage {
             })
             .unwrap_or_default();
         let mut fields = gpui::div().flex().flex_col().gap_2();
-        fields = fields.child(editor_field(
-            "Provider",
-            Input::new(&import.provider_name).disabled(saving),
-            Some(240.),
-            cx,
-        ));
+        fields = fields.child(
+            gpui::div()
+                .flex()
+                .items_center()
+                .gap_2()
+                .child(field_label("Provider", cx))
+                .child(
+                    gpui::div()
+                        .w(px(240.))
+                        .text_color(cx.theme().muted_foreground)
+                        .child(import.provider_name.read(cx).value().to_string()),
+                ),
+        );
         fields = fields.child(editor_field(
             "Label",
             Input::new(&import.key_label).disabled(saving),
             Some(240.),
+            cx,
+        ));
+        fields = fields.child(editor_field(
+            "并发上限",
+            Input::new(max_concurrency).disabled(saving),
+            Some(96.),
             cx,
         ));
         fields = fields.child(
@@ -838,18 +862,16 @@ impl ProvidersPage {
             )
             .child(editor_field(
                 "Label",
-                Input::new(&editor.label),
+                Input::new(&editor.label).disabled(editor.saving),
                 Some(160.),
                 cx,
             ))
-            .when(card_data.provider.protocol != "kiro", |this| {
-                this.child(editor_field(
-                    "并发上限",
-                    Input::new(&editor.max_concurrency),
-                    Some(96.),
-                    cx,
-                ))
-            })
+            .child(editor_field(
+                "并发上限",
+                Input::new(&editor.max_concurrency).disabled(editor.saving),
+                Some(96.),
+                cx,
+            ))
             // 模型白名单：chips 来自探测快照，「重新获取」刷新；不选 = 全部模型。
             .child(
                 gpui::div()
@@ -967,9 +989,16 @@ impl ProvidersPage {
                             .label("取消")
                             .outline()
                             .compact()
+                            .disabled(editor.saving)
                             .on_click(cx.listener(|this, _, _, cx| {
-                                this.key_editor = None;
-                                cx.notify();
+                                if this
+                                    .key_editor
+                                    .as_ref()
+                                    .is_some_and(|editor| !editor.saving)
+                                {
+                                    this.key_editor = None;
+                                    cx.notify();
+                                }
                             })),
                     )
                     .child(
@@ -1022,9 +1051,10 @@ impl Render for DragGhost {
 /// so a limited key keeps its occupancy visible; with neither, the section
 /// collapses.
 fn model_rows(key: &ProviderKeyView, cx: &App) -> Div {
-    let concurrency = key
-        .max_concurrency
-        .map(|max| format!("并发 {}/{}", key.inflight.unwrap_or(0), max));
+    let concurrency = match key.max_concurrency {
+        Some(max) => format!("并发 {}/{}", key.inflight.unwrap_or(0), max),
+        None => "并发 不限".to_string(),
+    };
     let mut rows: Vec<gpui::AnyElement> = Vec::new();
     match key
         .allowed_models
@@ -1044,9 +1074,7 @@ fn model_rows(key: &ProviderKeyView, cx: &App) -> Div {
                         .text_color(cx.theme().foreground)
                         .child(model.clone()),
                 );
-                if let Some(text) = &concurrency {
-                    row = row.child(Tag::secondary().child(text.clone()));
-                }
+                row = row.child(Tag::secondary().child(concurrency.clone()));
                 rows.push(row.into_any_element());
             }
             if models.len() > KEY_MODEL_ROWS {
@@ -1060,9 +1088,7 @@ fn model_rows(key: &ProviderKeyView, cx: &App) -> Div {
             }
         }
         None => {
-            if let Some(text) = &concurrency {
-                rows.push(Tag::secondary().child(text.clone()).into_any_element());
-            }
+            rows.push(Tag::secondary().child(concurrency).into_any_element());
         }
     }
     gpui::div().flex().flex_col().gap_1().children(rows)

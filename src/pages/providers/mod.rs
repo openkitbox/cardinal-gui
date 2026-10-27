@@ -690,6 +690,20 @@ impl ProvidersPage {
             cx.notify();
             return;
         };
+        let max_concurrency = form.max_concurrency.read(cx).value();
+        let max_concurrency = match Self::parse_concurrency(&max_concurrency) {
+            Ok(Some(limit)) => Some(Some(limit)),
+            // An omitted cap lets a new key use the server default (unlimited)
+            // while preserving an existing key's cap during label-based upsert.
+            Ok(None) => None,
+            Err(message) => {
+                if let Some(form) = &mut self.key_form {
+                    form.error = Some(message.to_string());
+                }
+                cx.notify();
+                return;
+            }
+        };
         let form_generation = import.generation;
         let endpoint = catalog::kiro_endpoint(&oauth.region);
         if let Some(import) = self
@@ -711,7 +725,15 @@ impl ProvidersPage {
         let call = cx
             .global::<GatewayRuntime>()
             .admin_call(move |admin| async move {
-                import_kiro(&admin, &provider_name, &endpoint, &label, &oauth).await
+                import_kiro(
+                    &admin,
+                    &provider_name,
+                    &endpoint,
+                    &label,
+                    &oauth,
+                    max_concurrency,
+                )
+                .await
             });
         cx.spawn(async move |this, cx| {
             let result = call.await;
@@ -838,7 +860,7 @@ impl ProvidersPage {
 
     /// Toggle one model chip in the key editor's whitelist selection.
     fn toggle_editor_model(&mut self, model: String, cx: &mut Context<Self>) {
-        if let Some(editor) = &mut self.key_editor {
+        if let Some(editor) = self.key_editor.as_mut().filter(|editor| !editor.saving) {
             toggle_selection(&mut editor.selected_models, &model);
         }
         cx.notify();
@@ -986,7 +1008,9 @@ impl ProvidersPage {
         let label = editor.label.read(cx).value().trim().to_string();
         let concurrency_raw = editor.max_concurrency.read(cx).value();
         let max_concurrency = match Self::parse_concurrency(&concurrency_raw) {
-            Ok(limit) => limit,
+            Ok(Some(limit)) => Some(Some(limit)),
+            // The editor's blank value explicitly clears the existing cap.
+            Ok(None) => Some(None),
             Err(message) => {
                 if let Some(editor) = &mut self.key_editor {
                     editor.error = Some(message.to_string());
@@ -1021,7 +1045,7 @@ impl ProvidersPage {
                         key_id,
                         Some(&label),
                         None,
-                        Some(max_concurrency),
+                        max_concurrency,
                         allowed_models,
                     )
                     .await
@@ -1159,11 +1183,15 @@ async fn import_kiro(
     endpoint: &str,
     label: &str,
     oauth: &KiroOAuth,
+    max_concurrency: Option<Option<i32>>,
 ) -> Result<(), gateway::http_client::ClientError> {
     let (provider_id, provider_created) = admin
         .find_or_create_kiro_provider(provider_name, endpoint)
         .await?;
-    match admin.upsert_kiro_key(provider_id, label, oauth).await {
+    match admin
+        .upsert_kiro_key(provider_id, label, oauth, max_concurrency)
+        .await
+    {
         Ok(_) => Ok(()),
         Err(error) => {
             let cleanup_error = if provider_created {
