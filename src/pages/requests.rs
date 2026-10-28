@@ -105,6 +105,8 @@ pub struct RequestsPage {
     /// Per-row routing trace, fetched lazily on expand (same lifecycle as
     /// bodies — tied to the visible page, retried on re-expand).
     traces: HashMap<i64, LoadState<Option<DispatchTrace>>>,
+    /// Per-row vendor error details, prepared off the render path on expand.
+    error_details: HashMap<i64, LoadState<ErrorView>>,
 }
 
 /// Display-ready captured bodies (prettied and fenced at fetch time — a
@@ -113,8 +115,10 @@ pub struct RequestsPage {
 struct BodyView {
     request: std::sync::Arc<str>,
     request_md: std::sync::Arc<str>,
+    request_display_lines: usize,
     response: Option<std::sync::Arc<str>>,
     response_md: Option<std::sync::Arc<str>>,
+    response_display_lines: Option<usize>,
     request_truncated: bool,
     response_truncated: bool,
 }
@@ -122,17 +126,57 @@ struct BodyView {
 impl BodyView {
     fn from_capture(bodies: CapturedBodies) -> Self {
         let (request, request_json) = pretty_body(&bodies.request);
+        let request_md = fenced_code(&request, request_json);
+        let request_display_lines = request_md.lines().count().max(1);
         let response = bodies.response.map(|response| pretty_body(&response));
+        let (response_md, response_display_lines) =
+            response.as_ref().map_or((None, None), |(text, json)| {
+                let display = fenced_code(text, *json);
+                let lines = display.lines().count().max(1);
+                (Some(std::sync::Arc::<str>::from(display)), Some(lines))
+            });
         Self {
-            request_md: fenced_code(&request, request_json).into(),
+            request_md: request_md.into(),
             request: request.into(),
-            response_md: response
-                .as_ref()
-                .map(|(text, json)| fenced_code(text, *json).into()),
+            request_display_lines,
+            response_md,
+            response_display_lines,
             response: response.map(|(text, _)| text.into()),
             request_truncated: bodies.request_truncated,
             response_truncated: bodies.response_truncated,
         }
+    }
+}
+
+/// Display-ready vendor error details, prepared once per expanded row.
+struct ErrorView {
+    source: std::sync::Arc<str>,
+    raw: std::sync::Arc<str>,
+    display: std::sync::Arc<str>,
+    display_lines: usize,
+}
+
+impl ErrorView {
+    fn from_error(error: &str) -> Self {
+        let (raw, json) = error_detail(error);
+        let display: std::sync::Arc<str> = fenced_code(&raw, json).into();
+        let display_lines = display.lines().count().max(1);
+        Self {
+            source: error.into(),
+            raw: raw.into(),
+            display,
+            display_lines,
+        }
+    }
+}
+
+fn error_detail_cache_is_current(
+    cached: &LoadState<ErrorView>,
+    current_error: Option<&str>,
+) -> bool {
+    match (cached, current_error) {
+        (LoadState::Loaded(view), Some(error)) => view.source.as_ref() == error,
+        _ => false,
     }
 }
 
@@ -151,6 +195,7 @@ impl RequestsPage {
             expanded: HashSet::new(),
             bodies: HashMap::new(),
             traces: HashMap::new(),
+            error_details: HashMap::new(),
             feed,
         };
         // Read the connect revision off the page's own clone — `feed` moved in.
@@ -215,7 +260,24 @@ impl RequestsPage {
                             .retain(|id, _| rows.iter().any(|row| row.id == *id));
                         page.traces
                             .retain(|id, _| rows.iter().any(|row| row.id == *id));
+                        page.error_details.retain(|id, state| {
+                            let Some(error) = rows
+                                .iter()
+                                .find(|row| row.id == *id)
+                                .and_then(|row| row.error.as_deref())
+                                .filter(|error| !error.is_empty())
+                            else {
+                                return false;
+                            };
+                            // A loading task does not carry its source, so discard it and
+                            // let the expanded-row reconciliation start a task for the newly
+                            // loaded row. Failed preparation is also discarded so re-expand
+                            // can retry it.
+                            !matches!(state, LoadState::Loading | LoadState::Failed(_))
+                                && error_detail_cache_is_current(state, Some(error))
+                        });
                         page.state = LoadState::Loaded(rows);
+                        page.prepare_expanded_error_details(cx);
                     }
                     Err(error) => page.state = LoadState::Failed(error),
                 }
@@ -279,7 +341,77 @@ impl RequestsPage {
             };
             self.fetch_trace(id, request_id, cx);
         }
+        let error = match &self.state {
+            LoadState::Loaded(rows) => rows
+                .iter()
+                .find(|row| row.id == id)
+                .and_then(|row| row.error.clone())
+                .filter(|error| !error.is_empty()),
+            _ => None,
+        };
+        if let Some(error) = error
+            && matches!(
+                self.error_details.get(&id),
+                None | Some(LoadState::Failed(_))
+            )
+        {
+            self.prepare_error_detail(id, error, cx);
+        }
         cx.notify();
+    }
+
+    fn prepare_error_detail(&mut self, id: i64, error: String, cx: &mut Context<Self>) {
+        self.error_details.insert(id, LoadState::Loading);
+        cx.spawn(async move |this, cx| {
+            let prepared = cx
+                .background_spawn(async move { ErrorView::from_error(&error) })
+                .await;
+            this.update(cx, |page, cx| {
+                let current = page
+                    .current_row_error(id)
+                    .is_some_and(|error| error == prepared.source.as_ref());
+                if current {
+                    page.error_details.insert(id, LoadState::Loaded(prepared));
+                    cx.notify();
+                }
+            })
+            .ok();
+        })
+        .detach();
+    }
+
+    fn prepare_expanded_error_details(&mut self, cx: &mut Context<Self>) {
+        let expanded_ids = match &self.state {
+            LoadState::Loaded(rows) => rows
+                .iter()
+                .filter(|row| self.expanded.contains(&row.id))
+                .map(|row| row.id)
+                .collect::<Vec<_>>(),
+            _ => return,
+        };
+        for id in expanded_ids {
+            let Some(error) = self.current_row_error(id) else {
+                continue;
+            };
+            let ready = self.error_details.get(&id).is_some_and(|state| {
+                matches!(state, LoadState::Loading)
+                    || error_detail_cache_is_current(state, Some(error))
+            });
+            if !ready {
+                self.prepare_error_detail(id, error.to_owned(), cx);
+            }
+        }
+    }
+
+    fn current_row_error(&self, id: i64) -> Option<&str> {
+        match &self.state {
+            LoadState::Loaded(rows) => rows
+                .iter()
+                .find(|row| row.id == id)
+                .and_then(|row| row.error.as_deref())
+                .filter(|error| !error.is_empty()),
+            _ => None,
+        }
     }
 
     /// Lazy per-row body fetch over the HTTP admin API (an async round trip
@@ -292,11 +424,16 @@ impl RequestsPage {
             .admin_call(move |admin| async move { admin.request_bodies(id).await });
         cx.spawn(async move |this, cx| {
             let result = load.await;
+            let result = cx
+                .background_spawn(
+                    async move { result.map(|bodies| bodies.map(BodyView::from_capture)) },
+                )
+                .await;
             this.update(cx, |page, cx| {
                 page.bodies.insert(
                     id,
                     match result {
-                        Ok(bodies) => LoadState::Loaded(bodies.map(BodyView::from_capture)),
+                        Ok(bodies) => LoadState::Loaded(bodies),
                         Err(error) => LoadState::Failed(format!("{error:#}")),
                     },
                 );
@@ -718,6 +855,7 @@ fn row_detail(page: &RequestsPage, row: &RequestRow, cx: &mut Context<RequestsPa
                     "请求正文",
                     &bodies.request,
                     &bodies.request_md,
+                    bodies.request_display_lines,
                     bodies.request_truncated.then_some("已截断 · 前 256KB"),
                     cx,
                 ))
@@ -728,6 +866,7 @@ fn row_detail(page: &RequestsPage, row: &RequestRow, cx: &mut Context<RequestsPa
                         "响应正文",
                         response,
                         response_md,
+                        bodies.response_display_lines.unwrap_or(1),
                         bodies
                             .response_truncated
                             .then_some("不完整（截断或含非 UTF-8 帧）"),
@@ -767,19 +906,37 @@ fn row_detail(page: &RequestsPage, row: &RequestRow, cx: &mut Context<RequestsPa
             detail = detail.child(trace_panel(trace, cx));
         }
     }
-    if let Some(error) = row.error.as_deref().filter(|error| !error.is_empty()) {
-        let (detail_text, detail_json) = error_detail(error);
-        let detail_raw: std::sync::Arc<str> = detail_text.clone().into();
-        let detail_md: std::sync::Arc<str> = fenced_code(&detail_text, detail_json).into();
-        detail = detail.child(body_panel(
-            "request-error-detail",
-            row.id,
-            "错误",
-            &detail_raw,
-            &detail_md,
-            None,
-            cx,
-        ));
+    if row.error.as_deref().is_some_and(|error| !error.is_empty()) {
+        match page.error_details.get(&row.id) {
+            None | Some(LoadState::Loading) => {
+                detail = detail.child(
+                    gpui::div()
+                        .text_size(px(12.))
+                        .text_color(cx.theme().muted_foreground)
+                        .child("错误详情加载中…"),
+                );
+            }
+            Some(LoadState::Failed(error)) => {
+                detail = detail.child(
+                    gpui::div()
+                        .text_size(px(12.))
+                        .text_color(cx.theme().danger)
+                        .child(error.clone()),
+                );
+            }
+            Some(LoadState::Loaded(error)) => {
+                detail = detail.child(body_panel(
+                    "request-error-detail",
+                    row.id,
+                    "错误",
+                    &error.raw,
+                    &error.display,
+                    error.display_lines,
+                    None,
+                    cx,
+                ));
+            }
+        }
     }
     detail
 }
@@ -793,12 +950,14 @@ fn row_detail(page: &RequestsPage, row: &RequestRow, cx: &mut Context<RequestsPa
 /// non-scrollable TextView did the latter and pegged the CPU on expand). Its
 /// native scroll handling also keeps the wheel from leaking to the outer
 /// request list (gpui-base's `scrolling_code_block_keeps_wheel_from_the_list`).
+#[allow(clippy::too_many_arguments)]
 fn body_panel(
     name: &'static str,
     row_id: i64,
     label: &str,
     raw: &std::sync::Arc<str>,
     display: &std::sync::Arc<str>,
+    display_lines: usize,
     note: Option<&'static str>,
     cx: &mut Context<RequestsPage>,
 ) -> Div {
@@ -832,8 +991,7 @@ fn body_panel(
     // must carry a definite height. Estimate from the fenced source's line
     // count: underestimate is safe (content scrolls), overestimate only leaves
     // empty space — clamp to the same 320px the old wrapper used.
-    let lines = display.lines().count().max(1) as f32;
-    let height = px((lines * 17.0 + 32.0).clamp(48.0, 320.0));
+    let height = px((display_lines as f32 * 17.0 + 32.0).clamp(48.0, 320.0));
     gpui::div()
         .flex()
         .flex_col()
@@ -1167,5 +1325,71 @@ fn pretty_body(text: &str) -> (String, bool) {
     {
         Ok(pretty) => (pretty, true),
         Err(_) => (text.to_owned(), false),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn body_view_caches_display_line_counts() {
+        let view = BodyView::from_capture(CapturedBodies {
+            request: "alpha\nbeta".to_string(),
+            response: Some("gamma".to_string()),
+            request_truncated: false,
+            response_truncated: false,
+            streaming: false,
+            captured_at: chrono::Utc::now(),
+        });
+
+        assert_eq!(view.request_display_lines, 5);
+        assert_eq!(view.response_display_lines, Some(4));
+    }
+
+    #[test]
+    fn error_detail_cache_is_invalidated_when_row_error_changes() {
+        let cached = LoadState::Loaded(ErrorView::from_error("upstream HTTP 404: old"));
+
+        assert!(error_detail_cache_is_current(
+            &cached,
+            Some("upstream HTTP 404: old")
+        ));
+        assert!(!error_detail_cache_is_current(
+            &cached,
+            Some("upstream HTTP 500: new")
+        ));
+        assert!(!error_detail_cache_is_current(&cached, None));
+    }
+
+    #[test]
+    fn error_view_pretty_prints_json_and_caches_fenced_lines() {
+        let view = ErrorView::from_error("upstream HTTP 404: {\"error\":{\"message\":\"nope\"}}");
+
+        assert_eq!(
+            view.raw.as_ref(),
+            "{\n  \"error\": {\n    \"message\": \"nope\"\n  }\n}"
+        );
+        assert_eq!(
+            view.display.as_ref(),
+            "```json\n{\n  \"error\": {\n    \"message\": \"nope\"\n  }\n}\n```\n\n"
+        );
+        assert_eq!(view.display_lines, 8);
+    }
+
+    #[test]
+    fn error_view_keeps_plain_text_and_chunks_fenced_display() {
+        let error = (0..CODE_CHUNK_LINES + 1)
+            .map(|line| format!("line {line}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let view = ErrorView::from_error(&error);
+
+        assert_eq!(view.raw.as_ref(), error.as_str());
+        assert!(!view.display.contains("```json"));
+        assert_eq!(view.display.lines().count(), view.display_lines);
+        assert_eq!(view.display_lines, 135);
+        assert!(view.display.starts_with("```\nline 0\n"));
+        assert!(view.display.contains("```\nline 128\n"));
     }
 }
