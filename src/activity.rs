@@ -160,6 +160,9 @@ pub(crate) struct ActivityFeed {
     /// it, so opening the client costs one connection instead of a request
     /// per page. None until the frame lands.
     bootstrap: Option<Bootstrap>,
+    /// Bumped when the gateway announces a finished quota probe round: the
+    /// snapshots in the database moved, so quota-showing pages re-read.
+    quota_rev: u64,
     /// Bumped when a bootstrap lands: pages re-apply their slice.
     bootstrap_rev: u64,
 }
@@ -177,6 +180,7 @@ impl ActivityFeed {
             resync: 0,
             bootstrap: None,
             bootstrap_rev: 0,
+            quota_rev: 0,
         };
         this.start_drain(cx);
         this.start_ticker(cx);
@@ -230,6 +234,12 @@ impl ActivityFeed {
         self.bootstrap_rev
     }
 
+    /// Quota-refresh revision: bumped per `QuotaRefreshed` event, so the
+    /// account page re-reads its snapshots exactly when a probe round landed.
+    pub(crate) fn quota_rev(&self) -> u64 {
+        self.quota_rev
+    }
+
     /// One synthetic persisted bump without an SSE event: used when the
     /// gateway link heals (unreachable → connected). The pump's first connect
     /// deliberately baselines without emitting Persisted, so without this the
@@ -277,6 +287,11 @@ impl ActivityFeed {
                 // accumulate, so one dropped frame cannot skew the mirror.
                 self.key_inflight.insert(*key_id, *inflight);
                 self.slot_changes += 1;
+                cx.notify();
+                return;
+            }
+            ActivityEvent::QuotaRefreshed => {
+                self.quota_rev += 1;
                 cx.notify();
                 return;
             }
@@ -537,8 +552,8 @@ fn apply_to(
         // the pushed document) in `apply` before this runs; they carry
         // nothing for the live/settled state machine.
         ActivityEvent::Slot { .. } | ActivityEvent::Resync | ActivityEvent::Bootstrap(_) => false,
-        // QuotaRefreshed: the providers page refreshes its cards on this event
-        // via its own observer; the feed state itself has no quota state.
+        // QuotaRefreshed is applied in `apply` (it bumps `quota_rev`); the
+        // live/settled state machine has nothing to do for it.
         ActivityEvent::QuotaRefreshed => false,
     }
 }

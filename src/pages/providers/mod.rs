@@ -223,6 +223,8 @@ pub struct ProvidersPage {
     seen_slot_changes: u64,
     seen_resync: u64,
     seen_bootstrap: u64,
+    /// Last seen `quota_rev`: a finished probe round re-reads the document.
+    seen_quota: u64,
 }
 
 impl ProvidersPage {
@@ -238,6 +240,7 @@ impl ProvidersPage {
             seen_slot_changes: feed.read(cx).slot_changes(),
             seen_resync: feed.read(cx).resync(),
             seen_bootstrap: feed.read(cx).bootstrap_rev(),
+            seen_quota: feed.read(cx).quota_rev(),
         };
         // The page renders from the PUSHED bootstrap document — providers,
         // every key (with its model snapshot), the stored quota readings and
@@ -258,6 +261,13 @@ impl ProvidersPage {
             let resync = feed.read(cx).resync();
             if resync != page.seen_resync {
                 page.seen_resync = resync;
+                page.reload(cx);
+            }
+            // The gateway's background prober persisted fresh quota snapshots;
+            // nothing else pushes them, so re-read (the old cards stay up).
+            let quota_rev = feed.read(cx).quota_rev();
+            if quota_rev != page.seen_quota {
+                page.seen_quota = quota_rev;
                 page.reload(cx);
             }
             let slot_changes = feed.read(cx).slot_changes();
