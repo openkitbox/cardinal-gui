@@ -41,7 +41,8 @@ const AXIS_LINE_HEIGHT: f32 = 14.;
 const MAX_BAR_WIDTH: f32 = 30.;
 /// X ticks are thinned to one per ~62px of plot width.
 const TICK_SPACING: f32 = 62.;
-const RANK_WIDTH: f32 = 272.;
+/// Wide enough for the stats line with a 次失败 suffix (was 272).
+const RANK_WIDTH: f32 = 299.;
 
 fn palette(index: usize) -> Hsla {
     gpui::rgb(PALETTE[index]).into()

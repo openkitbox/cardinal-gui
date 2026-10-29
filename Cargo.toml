@@ -49,15 +49,3 @@ gateway = { path = "../cardinal", package = "cardinal", features = ["test-suppor
 objc2 = "0.6"
 objc2-app-kit = { version = "0.3.2", default-features = false, features = ["NSApplication", "NSImage"] }
 objc2-foundation = { version = "=0.3.2", default-features = false, features = ["NSData"] }
-
-[patch.crates-io]
-# GPUI Fast (longbridge/gpui-fast): a performance fork of the GPUI core we
-# already use via the gpui-pre snapshots (gpui-kit's upstream). The compat/
-# shadow crates in that repo carry the gpui-pre names and versions, so this
-# patch redirects the whole family to gpui-fast. Drop this section to fall
-# back to the crates.io snapshots.
-gpui-pre = { git = "https://github.com/longbridge/gpui-fast" }
-gpui-pre-macros = { git = "https://github.com/longbridge/gpui-fast" }
-gpui-pre-platform = { git = "https://github.com/longbridge/gpui-fast" }
-gpui-pre-sum-tree = { git = "https://github.com/longbridge/gpui-fast" }
-gpui-pre-web = { git = "https://github.com/longbridge/gpui-fast" }
