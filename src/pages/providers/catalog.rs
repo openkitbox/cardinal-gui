@@ -40,7 +40,7 @@ pub(super) const PROVIDER_SPECS: &[ProviderSpec] = &[
     },
     ProviderSpec {
         name: "glm",
-        display: "GLM 智谱",
+        display: "智谱",
         base_url: "https://open.bigmodel.cn/api/paas/v4",
         protocol: "openai_chat",
         auth_scheme: "bearer",
@@ -72,7 +72,7 @@ pub(super) const PROVIDER_SPECS: &[ProviderSpec] = &[
     },
     ProviderSpec {
         name: "kimi",
-        display: "Kimi 月之暗面",
+        display: "Kimi",
         // Host root, not a full endpoint: the capability table appends
         // /v1/chat/completions, /anthropic/v1/messages, /v1/responses.
         base_url: "https://api.moonshot.cn",
@@ -115,30 +115,6 @@ pub(super) const PROVIDER_SPECS: &[ProviderSpec] = &[
         // A separate row from chat's: a provider row carries ONE protocol, and
         // the relay selects the capability by the client's protocol.
         base_url: "https://api.openai.com/v1",
-        protocol: "openai_embeddings",
-        auth_scheme: "bearer",
-        icon: ProviderIcon::Svg(provider_logos::OPENAI),
-    },
-    ProviderSpec {
-        name: "siliconflow",
-        display: "SiliconFlow 硅基流动",
-        base_url: "https://api.siliconflow.cn/v1",
-        protocol: "openai_embeddings",
-        auth_scheme: "bearer",
-        icon: ProviderIcon::Svg(provider_logos::OPENAI),
-    },
-    ProviderSpec {
-        name: "jina",
-        display: "Jina AI",
-        base_url: "https://api.jina.ai/v1",
-        protocol: "openai_embeddings",
-        auth_scheme: "bearer",
-        icon: ProviderIcon::Svg(provider_logos::OPENAI),
-    },
-    ProviderSpec {
-        name: "voyage",
-        display: "Voyage AI",
-        base_url: "https://api.voyageai.com/v1",
         protocol: "openai_embeddings",
         auth_scheme: "bearer",
         icon: ProviderIcon::Svg(provider_logos::OPENAI),

@@ -270,12 +270,12 @@ impl ProvidersPage {
         options = options
             .child(separator(cx))
             .child(
-                action_option("providers-group-create", "＋ 新建分组", cx).on_click(
+                action_option("providers-group-create", "＋", "新建分组", cx).on_click(
                     cx.listener(|this, _, window, cx| this.begin_group_create(window, cx)),
                 ),
             )
             .child(
-                action_option("providers-group-manage", "⚙ 管理分组…", cx)
+                action_option("providers-group-manage", "⚙", "管理分组…", cx)
                     .on_click(cx.listener(|this, _, _, cx| this.begin_group_manage(cx))),
             );
         // `absolute` takes the list out of document flow; `deferred` draws it
@@ -284,7 +284,7 @@ impl ProvidersPage {
         let floating = gpui::deferred(
             gpui::div()
                 .absolute()
-                .top(px(24.))
+                .top(px(30.))
                 .right(px(0.))
                 .w(px(200.))
                 .child(options),
@@ -297,7 +297,7 @@ impl ProvidersPage {
             .into_any_element()
     }
 
-    /// One selectable filter line: selected = 「✓ 」 prefix + bold. Choosing it
+    /// One selectable filter line: selected = 「✓」 in a fixed-width lead slot + bold. Choosing it
     /// closes the list and re-filters locally (no reload).
     fn filter_option(
         &self,
@@ -317,11 +317,10 @@ impl ProvidersPage {
             .when(selected, |this| {
                 this.font_weight(gpui::FontWeight::SEMIBOLD)
             })
-            .child(if selected {
-                format!("✓ {text}")
-            } else {
-                text
-            })
+            .flex()
+            .items_center()
+            .child(lead_slot(if selected { "✓" } else { "" }))
+            .child(text)
             .on_click(cx.listener(move |this, _, _, cx| {
                 this.group_list_open = false;
                 this.group_filter = option;
@@ -333,12 +332,22 @@ impl ProvidersPage {
 /// A dropdown line that triggers an action instead of a selection.
 fn action_option(
     id: impl Into<ElementId>,
+    icon: &'static str,
     text: &'static str,
     cx: &mut Context<ProvidersPage>,
 ) -> gpui::Stateful<Div> {
     option_row(id, cx)
         .text_color(cx.theme().foreground)
+        .flex()
+        .items_center()
+        .child(lead_slot(icon))
         .child(text)
+}
+
+/// Fixed-width lead cell shared by every dropdown line, so labels align
+/// whether the cell holds a ✓, an action icon, or nothing.
+fn lead_slot(mark: &'static str) -> Div {
+    gpui::div().w(px(16.)).flex_none().child(mark)
 }
 
 /// Shared line chrome: padding, size, pointer and hover highlight.
