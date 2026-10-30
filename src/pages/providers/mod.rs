@@ -19,6 +19,9 @@
 
 mod cards;
 mod catalog;
+mod chip;
+mod group_editor;
+mod groups;
 pub mod kiro_import;
 mod quota;
 
@@ -34,14 +37,16 @@ use gpui_kit::component::input::{InputState, TextareaState};
 use gpui_kit::component::{Icon, Sizable, WindowExt};
 
 use gateway::admin_ops::Bootstrap;
-use gateway::http_client::GatewayHttpClient;
+use gateway::http_client::{GatewayHttpClient, KeyUpdate};
 use gateway::kiro::KiroOAuth;
 
 use gateway::probe::ProbeModel;
 use gateway::quota::KeyQuota;
-use gateway::store::{ProviderInput, ProviderKeyView, ProviderRow, RestRow};
+use gateway::store::{KeyGroupView, ProviderInput, ProviderKeyView, ProviderRow, RestRow};
 
 use catalog::{PROVIDER_SPECS, Region, resolve};
+use group_editor::{GroupCreate, GroupManager};
+use groups::{GroupFilter, Visibility};
 use quota::KeyQuotaView;
 
 use crate::pages::{
@@ -78,6 +83,8 @@ pub(super) struct KeyDrag {
 struct ProvidersData {
     keys: Vec<KeyCardData>,
     rests: HashMap<i64, Vec<RestRow>>,
+    /// Account groups (id order) with their member key ids.
+    groups: Vec<KeyGroupView>,
 }
 
 impl ProvidersData {
@@ -133,7 +140,12 @@ impl ProvidersData {
         for rest in &document.rests {
             rests.entry(rest.key_id).or_default().push(rest.clone());
         }
-        Self { keys, rests }
+        // One boundary copy: the document is borrowed, the page owns its data.
+        Self {
+            keys,
+            rests,
+            groups: document.key_groups.clone(),
+        }
     }
 }
 
@@ -188,6 +200,11 @@ struct KeyEditor {
     max_concurrency: Entity<InputState>,
     /// Model whitelist selection (prefilled from the key; empty = 全部模型).
     selected_models: Vec<String>,
+    /// Group memberships being edited (prefilled from the loaded groups).
+    selected_groups: Vec<i64>,
+    /// The memberships the editor opened with: save submits `group_ids` only
+    /// when `selected_groups` differs from this as a set.
+    initial_groups: Vec<i64>,
     /// Models offered for picking: prefilled from the key's probe snapshot,
     /// refreshed by 重新获取.
     probed_models: Option<Vec<ProbeModel>>,
@@ -216,6 +233,14 @@ pub struct ProvidersPage {
     action_error: Option<String>,
     /// Live card drag-and-drop state (see `KeyDrag`).
     drag: Option<KeyDrag>,
+    /// Which accounts the 分组 dropdown admits (local view state).
+    group_filter: GroupFilter,
+    /// The 分组 dropdown list is open.
+    group_list_open: bool,
+    /// The 新建分组 card (mutually exclusive with `group_manager`).
+    group_create: Option<GroupCreate>,
+    /// The 管理分组 card (mutually exclusive with `group_create`).
+    group_manager: Option<GroupManager>,
     /// Last seen activity-feed revisions: `slot_changes` (the dispatcher
     /// published a new occupancy) applies the pushed values locally;
     /// `bootstrap_rev` (a pushed document landed) re-applies the page slice;
@@ -237,6 +262,10 @@ impl ProvidersPage {
             key_editor: None,
             action_error: None,
             drag: None,
+            group_filter: GroupFilter::All,
+            group_list_open: false,
+            group_create: None,
+            group_manager: None,
             seen_slot_changes: feed.read(cx).slot_changes(),
             seen_resync: feed.read(cx).resync(),
             seen_bootstrap: feed.read(cx).bootstrap_rev(),
@@ -299,7 +328,8 @@ impl ProvidersPage {
 
     /// Tab-row actions (the Status container renders them right-aligned next to
     /// the tabs): refresh reloads the list AND re-probes vendor quotas; 添加
-    /// 账号 only once data has loaded, since the form needs the provider list.
+    /// 账号 and 分组 only once data has loaded, since the form needs the
+    /// provider list and the dropdown needs the groups.
     pub(crate) fn actions(&mut self, cx: &mut Context<Self>) -> Vec<gpui::AnyElement> {
         let refresh = refresh_button(
             "providers-refresh",
@@ -309,7 +339,7 @@ impl ProvidersPage {
             }),
         );
         match &self.state {
-            LoadState::Loaded(_) => vec![
+            LoadState::Loaded(data) => vec![
                 Button::new("key-add")
                     .icon(Icon::new(IconName::Plus).small())
                     .label("添加账号")
@@ -317,6 +347,7 @@ impl ProvidersPage {
                     .compact()
                     .on_click(cx.listener(|this, _, window, cx| this.open_key_form(window, cx)))
                     .into_any_element(),
+                self.group_dropdown(data, cx),
                 refresh.into_any_element(),
             ],
             _ => vec![refresh.into_any_element()],
@@ -342,10 +373,12 @@ impl ProvidersPage {
                 if page.generation != generation {
                     return; // a newer reload is in flight; this snapshot is stale
                 }
-                page.state = match result {
-                    Ok(document) => LoadState::Loaded(ProvidersData::from_bootstrap(&document)),
-                    Err(error) => LoadState::Failed(error),
-                };
+                match result {
+                    Ok(document) => {
+                        page.state = LoadState::Loaded(ProvidersData::from_bootstrap(&document))
+                    }
+                    Err(error) => page.state = LoadState::Failed(error),
+                }
                 cx.notify();
             })
             .ok();
@@ -876,6 +909,14 @@ impl ProvidersPage {
         cx.notify();
     }
 
+    /// Toggle one group chip in the key editor's membership selection.
+    fn toggle_editor_group(&mut self, group_id: i64, cx: &mut Context<Self>) {
+        if let Some(editor) = self.key_editor.as_mut().filter(|editor| !editor.saving) {
+            toggle_selection(&mut editor.selected_groups, &group_id);
+        }
+        cx.notify();
+    }
+
     /// 重新获取 (edit form): re-probe the saved key's model list (this also
     /// refreshes the key's persisted snapshot) and re-offer the ids as chips.
     fn reprobe_editor_models(&mut self, cx: &mut Context<Self>) {
@@ -959,12 +1000,18 @@ impl ProvidersPage {
         let focus = label.read(cx).focus_handle(cx);
         window.focus(&focus, cx);
         let key_id = key.id;
+        let initial_groups = match &self.state {
+            LoadState::Loaded(data) => groups::memberships(&data.groups, key_id),
+            _ => Vec::new(),
+        };
         self.key_editor = Some(KeyEditor {
             provider_id,
             key_id,
             label,
             max_concurrency,
             selected_models: key.allowed_models.clone().unwrap_or_default(),
+            selected_groups: initial_groups.clone(),
+            initial_groups,
             probed_models: key.models.clone(),
             api_key: None,
             probing: false,
@@ -1041,6 +1088,19 @@ impl ProvidersPage {
         let selected = editor.selected_models.clone();
         let allowed_models: Option<Option<Vec<String>>> =
             Some((!selected.is_empty()).then_some(selected));
+        // Group membership is replaced wholesale on the server, so send it only
+        // when the selection really changed (an unchanged save writes nothing);
+        // clearing every group is a change and goes out as an empty array.
+        // Groups deleted since the editor opened are dropped from both sides
+        // first: their chips are gone, and a stale id would fail the write.
+        let live: &[KeyGroupView] = match &self.state {
+            LoadState::Loaded(data) => &data.groups,
+            _ => &[],
+        };
+        let initial_groups = groups::retain_existing(&editor.initial_groups, live);
+        let selected_groups = groups::retain_existing(&editor.selected_groups, live);
+        let group_ids: Option<Vec<i64>> =
+            groups::selection_changed(&initial_groups, &selected_groups).then_some(selected_groups);
         if let Some(editor) = &mut self.key_editor {
             editor.saving = true;
             editor.error = None;
@@ -1053,10 +1113,13 @@ impl ProvidersPage {
                     .update_key(
                         provider_id,
                         key_id,
-                        Some(&label),
-                        None,
-                        max_concurrency,
-                        allowed_models,
+                        &KeyUpdate {
+                            label: Some(&label),
+                            max_concurrency,
+                            allowed_models,
+                            group_ids: group_ids.as_deref(),
+                            ..Default::default()
+                        },
                     )
                     .await
             });
@@ -1225,7 +1288,8 @@ impl crate::pages::ActionPage for ProvidersPage {
 }
 
 impl Render for ProvidersPage {
-    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        self.sync_group_manager(window, cx);
         // No page title/subtitle (the tab bar names the view) and no action row:
         // the actions live in the tab row, so the content starts immediately.
         // Self-heal for a cancelled card drag (gpui has no drag-end event): once
@@ -1244,46 +1308,60 @@ impl Render for ProvidersPage {
         match &self.state {
             LoadState::Loading => frame.child(loading_card(cx)),
             LoadState::Failed(error) => frame.child(error_card(error, cx)),
-            LoadState::Loaded(data) => frame
-                .when_some(self.action_error.as_ref(), |this, error| {
-                    this.child(action_error_card(error, cx))
-                })
-                .when_some(self.key_form.as_ref(), |this, form| {
-                    this.child(self.key_form_card(form, cx))
-                })
-                .when(data.keys.is_empty() && self.key_form.is_none(), |this| {
-                    this.child(empty_card(
-                        "尚无账号",
-                        "点击「+ 添加账号」添加第一个上游账号。",
-                        cx,
-                    ))
-                })
-                .child(
-                    gpui::div()
-                        .flex()
-                        .flex_wrap()
-                        .gap_5()
-                        .children(data.keys.iter().map(|card_data| {
-                            self.key_card(
-                                card_data,
-                                data.rests
-                                    .get(&card_data.key.id)
-                                    .map(Vec::as_slice)
-                                    .unwrap_or(&[]),
-                                cx,
-                            )
-                        })),
-                ),
+            LoadState::Loaded(data) => {
+                // Derived per render from the loaded groups: nothing cached.
+                let filter = self.group_filter.effective(&data.groups);
+                let visibility = Visibility::new(filter, &data.groups);
+                let any_visible = data.keys.iter().any(|card| visibility.admits(card.key.id));
+                frame
+                    .when_some(self.action_error.as_ref(), |this, error| {
+                        this.child(action_error_card(error, cx))
+                    })
+                    .when_some(self.key_form.as_ref(), |this, form| {
+                        this.child(self.key_form_card(form, cx))
+                    })
+                    .when_some(self.group_create.as_ref(), |this, form| {
+                        this.child(self.group_create_card(form, cx))
+                    })
+                    .when_some(self.group_manager.as_ref(), |this, manager| {
+                        this.child(self.group_manager_card(manager, data, cx))
+                    })
+                    .when(
+                        !any_visible && (filter != GroupFilter::All || self.key_form.is_none()),
+                        |this| {
+                            let (title, hint) = filter.empty_copy();
+                            this.child(empty_card(title, hint, cx))
+                        },
+                    )
+                    .child(
+                        gpui::div().flex().flex_wrap().gap_5().children(
+                            data.keys
+                                .iter()
+                                .filter(|card_data| visibility.admits(card_data.key.id))
+                                .map(|card_data| {
+                                    self.key_card(
+                                        card_data,
+                                        data.rests
+                                            .get(&card_data.key.id)
+                                            .map(Vec::as_slice)
+                                            .unwrap_or(&[]),
+                                        &data.groups,
+                                        cx,
+                                    )
+                                }),
+                        ),
+                    )
+            }
         }
     }
 }
 
-/// Toggle `model` in a whitelist selection (click = add, click again = remove).
-fn toggle_selection(selected: &mut Vec<String>, model: &str) {
-    if let Some(index) = selected.iter().position(|kept| kept == model) {
+/// Toggle `item` in a chip selection (click = add, click again = remove).
+fn toggle_selection<T: PartialEq + Clone>(selected: &mut Vec<T>, item: &T) {
+    if let Some(index) = selected.iter().position(|kept| kept == item) {
         selected.remove(index);
     } else {
-        selected.push(model.to_owned());
+        selected.push(item.clone());
     }
 }
 

@@ -17,14 +17,17 @@ use gpui_kit::component::menu::{DropdownMenu, PopupMenuItem};
 use gpui_kit::component::tag::Tag;
 use gpui_kit::component::{ActiveTheme, Disableable, Icon, Sizable};
 
+use gateway::http_client::KeyUpdate;
 use gateway::probe::ProbeModel;
-use gateway::store::ProviderKeyView;
+use gateway::store::{KeyGroupView, ProviderKeyView};
 use gateway::store::{ProviderRow, RestRow};
 
 use super::catalog::{
     PROVIDER_SPECS, ProviderIcon, ProviderSpec, Region, imported_logo, spec_for, variant_of_row,
     variants_of,
 };
+use super::chip::selectable_chip;
+use super::groups::{group_chips, group_tags};
 use super::quota::quota_row;
 use super::{KeyCardData, KeyDrag, KeyEditor, KeyForm, KiroImportForm, ProvidersPage, reordered};
 use crate::app::StatusTip;
@@ -461,6 +464,7 @@ impl ProvidersPage {
         &self,
         card_data: &KeyCardData,
         rests: &[RestRow],
+        groups: &[KeyGroupView],
         cx: &mut Context<Self>,
     ) -> Div {
         let provider = &card_data.provider;
@@ -470,7 +474,7 @@ impl ProvidersPage {
             .as_ref()
             .filter(|editor| editor.key_id == key.id)
         {
-            return self.key_editor_card(editor, card_data, cx);
+            return self.key_editor_card(editor, card_data, groups, cx);
         }
         let provider_id = provider.id;
         let key_id = key.id;
@@ -625,7 +629,13 @@ impl ProvidersPage {
                         };
                         if let Err(error) = weak.update(cx, |this, cx| {
                           this.write(cx, move |admin| async move {
-                            admin.update_key(provider_id, key_id, None, Some(target), None, None).await
+                            admin
+                              .update_key(
+                                provider_id,
+                                key_id,
+                                &KeyUpdate { enabled: Some(target), ..Default::default() },
+                              )
+                              .await
                           });
                         }) {
                           eprintln!("card menu enable failed: {error}");
@@ -657,6 +667,9 @@ impl ProvidersPage {
               }),
           ),
       )
+      // Group tags: the groups this account belongs to, derived from `groups`
+      // at render time; no row when it is in none.
+      .when_some(group_tags(key_id, groups, cx), |this, tags| this.child(tags))
       // Variant markers (kimi/glm only), display-only on their own row under
       // the title: 区域 (国内/国际) + Coding Plan — the variant decides the
       // anthropic capability, so the card says which entry it sits on.
@@ -788,6 +801,7 @@ impl ProvidersPage {
         &self,
         editor: &KeyEditor,
         card_data: &KeyCardData,
+        groups: &[KeyGroupView],
         cx: &mut Context<Self>,
     ) -> Div {
         // None = the reveal has not landed (loading), or it failed. The editor
@@ -872,6 +886,21 @@ impl ProvidersPage {
                 Some(96.),
                 cx,
             ))
+            // 分组归属：点击切换，可多选；保存时只在有变化时提交。
+            .child(
+                gpui::div()
+                    .flex()
+                    .items_center()
+                    .gap_2()
+                    .child(field_label("分组", cx))
+                    .child(
+                        gpui::div()
+                            .text_size(px(12.))
+                            .text_color(cx.theme().muted_foreground)
+                            .child("不选 = 不属于任何分组"),
+                    ),
+            )
+            .child(group_chips(&editor.selected_groups, groups, cx))
             // 模型白名单：chips 来自探测快照，「重新获取」刷新；不选 = 全部模型。
             .child(
                 gpui::div()
@@ -1189,24 +1218,7 @@ fn model_chip(model: &ProbeModel, selected: bool, id: ElementId, cx: &App) -> gp
     if !model.effort_levels.is_empty() {
         chip_text.push_str(" · 推理");
     }
-    let chip = gpui::div()
-        .id(id)
-        .cursor_pointer()
-        .border_1()
-        .rounded_md()
-        .px_2()
-        .py_0p5()
-        .text_size(px(12.))
-        .child(chip_text);
-    if selected {
-        chip.border_color(cx.theme().accent)
-            .bg(cx.theme().accent)
-            .text_color(cx.theme().accent_foreground)
-    } else {
-        chip.border_color(cx.theme().border)
-            .text_color(cx.theme().foreground)
-            .hover(|this| this.bg(cx.theme().accent))
-    }
+    selectable_chip(chip_text, selected, id, cx)
 }
 
 /// A selected model that is NOT in the probed list (vendor listing incomplete,
@@ -1229,7 +1241,7 @@ fn orphan_chip(model_id: &str, id: ElementId, cx: &App) -> gpui::Stateful<Div> {
 /// One labeled input row of a form card. `width` fixes the input width (size
 /// it to the expected content, e.g. a 4-digit cap); `None` fills the row
 /// (credentials and other long values).
-fn editor_field(label: &'static str, input: Input, width: Option<f32>, cx: &App) -> Div {
+pub(super) fn editor_field(label: &'static str, input: Input, width: Option<f32>, cx: &App) -> Div {
     let row = gpui::div()
         .flex()
         .items_center()
@@ -1242,7 +1254,7 @@ fn editor_field(label: &'static str, input: Input, width: Option<f32>, cx: &App)
 }
 
 /// Inline validation/write error line inside a form card.
-fn inline_error(message: &str, cx: &App) -> Div {
+pub(super) fn inline_error(message: &str, cx: &App) -> Div {
     gpui::div()
         .text_size(px(12.))
         .text_color(cx.theme().danger)
