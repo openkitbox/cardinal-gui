@@ -110,6 +110,8 @@ impl QuotaWindowView {
 pub(super) struct KeyQuotaView {
     pub(super) windows: Vec<QuotaWindowView>,
     pub(super) balance: Option<String>,
+    /// Display-ready info lines (plan, expiry, usage counters).
+    pub(super) details: Vec<String>,
     /// When this reading was probed (snapshot time; a live refresh stamps now).
     pub(super) probed_at: chrono::DateTime<chrono::Utc>,
 }
@@ -144,6 +146,7 @@ impl KeyQuotaView {
                 })
                 .collect(),
             balance: quota.balance,
+            details: quota.details,
             probed_at,
         }
     }
@@ -167,6 +170,7 @@ impl KeyQuotaView {
                 })
                 .collect(),
             balance: quota.balance,
+            details: quota.details,
             probed_at,
         }
     }

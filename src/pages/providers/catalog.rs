@@ -132,6 +132,57 @@ pub(super) const PROVIDER_SPECS: &[ProviderSpec] = &[
     },
 ];
 
+/// One wire protocol a custom provider may speak. `protocol` is the value
+/// stored in `gateway_providers.protocol`; `base_url_placeholder` shows the
+/// root shape the gateway expects (it appends the protocol's leaf paths).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(super) struct ProtocolChoice {
+    pub(super) protocol: &'static str,
+    pub(super) display: &'static str,
+    pub(super) base_url_placeholder: &'static str,
+}
+
+/// Protocols offered for custom providers. Kiro is absent: its rows come
+/// only from the OIDC JSON import. Gemini is absent: the gateway serves the
+/// gemini protocol only under the `gemini` vendor name.
+pub(super) const PROTOCOL_CHOICES: &[ProtocolChoice] = &[
+    ProtocolChoice {
+        protocol: "openai_chat",
+        display: "OpenAI Chat",
+        base_url_placeholder: "https://host/v1",
+    },
+    ProtocolChoice {
+        protocol: "openai_responses",
+        display: "OpenAI Responses",
+        base_url_placeholder: "https://host/v1",
+    },
+    ProtocolChoice {
+        protocol: "anthropic_messages",
+        display: "Anthropic Messages",
+        base_url_placeholder: "https://host",
+    },
+    ProtocolChoice {
+        protocol: "openai_embeddings",
+        display: "OpenAI Embeddings",
+        base_url_placeholder: "https://host/v1",
+    },
+];
+
+/// The custom-provider choice for a stored protocol value, if it is one of
+/// the offered protocols.
+pub(super) fn protocol_choice(protocol: &str) -> Option<ProtocolChoice> {
+    PROTOCOL_CHOICES
+        .iter()
+        .find(|choice| choice.protocol == protocol)
+        .copied()
+}
+
+/// A provider row is custom when no catalog entry claims its name and it is
+/// not a Kiro import (derived, never stored: the name is the only source).
+pub(super) fn is_custom(provider_name: &str, protocol: &str) -> bool {
+    spec_for(provider_name).is_none() && protocol != "kiro"
+}
+
 /// Look up the catalog entry for a stored provider name: an exact match
 /// first ("opencode-go" is a full entry, not vendor + variant), then the
 /// first '-'-separated segment — variants (kimi-code-intl, glm-code, …)

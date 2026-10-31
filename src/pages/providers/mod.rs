@@ -44,7 +44,9 @@ use gateway::probe::ProbeModel;
 use gateway::quota::KeyQuota;
 use gateway::store::{KeyGroupView, ProviderInput, ProviderKeyView, ProviderRow, RestRow};
 
-use catalog::{PROVIDER_SPECS, Region, resolve};
+use catalog::{
+    PROTOCOL_CHOICES, PROVIDER_SPECS, ProtocolChoice, Region, is_custom, protocol_choice, resolve,
+};
 use group_editor::{GroupCreate, GroupManager};
 use groups::{GroupFilter, Visibility};
 use quota::KeyQuotaView;
@@ -149,17 +151,58 @@ impl ProvidersData {
     }
 }
 
+/// Where the add form's provider parameters come from.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum FormSource {
+    /// Index into `PROVIDER_SPECS`: fixed endpoint/protocol/auth scheme.
+    Catalog(usize),
+    /// A user-defined provider: the chosen protocol plus the typed base_url;
+    /// the label doubles as the provider name.
+    Custom { protocol: ProtocolChoice },
+}
+
+impl FormSource {
+    /// The Kiro catalog entry, which uses the JSON import instead of an API key.
+    fn is_kiro(self) -> bool {
+        matches!(self, FormSource::Catalog(index) if PROVIDER_SPECS[index].name == "kiro")
+    }
+}
+
+/// The provider row parameters the add form submits, copied out of the
+/// inputs once at submit time so the async call can own them.
+#[derive(Clone, PartialEq, Eq)]
+struct ProviderTarget {
+    name: String,
+    protocol: &'static str,
+    base_url: String,
+    /// `None` lets the gateway infer the scheme from the protocol.
+    auth_scheme: Option<&'static str>,
+}
+
+impl ProviderTarget {
+    fn input(&self) -> ProviderInput<'_> {
+        ProviderInput {
+            name: &self.name,
+            protocol: self.protocol,
+            base_url: &self.base_url,
+            auth_scheme: self.auth_scheme,
+            enabled: true,
+        }
+    }
+}
+
 /// Add-key form: pick a provider from the catalog (with 区域 × Coding Plan
-/// variants for kimi/glm), paste the credential.
+/// variants for kimi/glm) or define a custom one, paste the credential.
 struct KeyForm {
-    /// Index into `PROVIDER_SPECS`.
-    spec_index: usize,
+    source: FormSource,
     /// 区域（仅对有变体的厂商生效；默认国内）。
     region: Region,
     /// Coding Plan 入口（仅对有变体的厂商生效）。
     coding_plan: bool,
     label: Entity<InputState>,
     api_key: Entity<InputState>,
+    /// Custom provider endpoint root (rendered only for `FormSource::Custom`).
+    base_url: Entity<InputState>,
     /// Kiro uses a JSON import instead of the ordinary API-key field.
     kiro_import: Option<KiroImportForm>,
     /// Optional per-key concurrency cap (empty = 不限).
@@ -170,9 +213,53 @@ struct KeyForm {
     selected_models: Vec<String>,
     /// A 获取模型 probe is in flight.
     probing: bool,
+    /// Bumped every time a probe starts; a landing whose sequence is no
+    /// longer current is stale and ignored.
+    probe_seq: u64,
     /// A save is in flight (validating the key upstream, then persisting).
     saving: bool,
     error: Option<String>,
+}
+
+impl KeyForm {
+    /// Derive the provider parameters from the source: catalog entries
+    /// resolve their variant, custom providers take the typed label (as the
+    /// name) and base_url. Err carries the message for the form.
+    fn target(&self, cx: &gpui::App) -> Result<ProviderTarget, &'static str> {
+        match self.source {
+            FormSource::Catalog(index) => {
+                let spec = &PROVIDER_SPECS[index];
+                let (name, base_url) = resolve(spec, self.region, self.coding_plan);
+                Ok(ProviderTarget {
+                    name: name.to_string(),
+                    protocol: spec.protocol,
+                    base_url: base_url.to_string(),
+                    auth_scheme: Some(spec.auth_scheme),
+                })
+            }
+            FormSource::Custom { protocol } => {
+                let label = self.label.read(cx).value();
+                let name = label.trim();
+                if name.is_empty() {
+                    return Err("自定义 provider 的 label 不能为空（同时作为 provider 名）");
+                }
+                if name.contains('/') {
+                    return Err("label 同时作为 provider 名，不能包含 /");
+                }
+                let base_url = self.base_url.read(cx).value();
+                let base_url = base_url.trim();
+                if base_url.is_empty() {
+                    return Err("base_url 不能为空");
+                }
+                Ok(ProviderTarget {
+                    name: name.to_string(),
+                    protocol: protocol.protocol,
+                    base_url: base_url.to_string(),
+                    auth_scheme: None,
+                })
+            }
+        }
+    }
 }
 
 /// State for the Kiro JSON import boundary. The raw document and parsed
@@ -218,7 +305,69 @@ struct KeyEditor {
     saving: bool,
     /// Whether the read-only API key is shown in plaintext (masked by default).
     show_key: bool,
+    /// Endpoint editing for a custom provider row (`catalog::is_custom`);
+    /// `None` for catalog and Kiro rows.
+    custom: Option<CustomEdit>,
     error: Option<String>,
+}
+
+/// The custom provider's editable endpoint plus the values the editor opened
+/// with, so save writes only what changed. The label input doubles as the
+/// provider name (name = label invariant).
+struct CustomEdit {
+    protocol: ProtocolChoice,
+    base_url: Entity<InputState>,
+    initial_name: String,
+    initial_protocol: ProtocolChoice,
+    initial_base_url: String,
+}
+
+/// The custom endpoint as typed, validated and copied out once at submit time.
+struct CustomTarget {
+    protocol: ProtocolChoice,
+    base_url: String,
+}
+
+/// The provider PATCH a custom-row save sends (name = the key label).
+struct ProviderWrite {
+    protocol: &'static str,
+    base_url: String,
+    /// Carried over from the loaded row: the PATCH is a full replace.
+    enabled: bool,
+    /// The row's stored scheme while the protocol is unchanged; `None` after a
+    /// protocol switch lets the gateway infer the scheme for the new protocol.
+    auth_scheme: Option<String>,
+    /// The revealed key, present when the endpoint changed and must be
+    /// re-validated (and its model snapshot rewritten) before the PATCH.
+    validate_with: Option<String>,
+}
+
+impl CustomEdit {
+    /// Validate the typed name (the trimmed label) and base_url. Err carries
+    /// the message for the editor card.
+    fn target(&self, name: &str, cx: &gpui::App) -> Result<CustomTarget, &'static str> {
+        if name.is_empty() {
+            return Err("label 不能为空（同时作为 provider 名）");
+        }
+        if name.contains('/') {
+            return Err("label 同时作为 provider 名，不能包含 /");
+        }
+        let base_url = self.base_url.read(cx).value();
+        let base_url = base_url.trim();
+        if base_url.is_empty() {
+            return Err("base_url 不能为空");
+        }
+        Ok(CustomTarget {
+            protocol: self.protocol,
+            base_url: base_url.to_string(),
+        })
+    }
+
+    /// Protocol or base_url differ from the stored row: the key must be
+    /// re-validated against the new endpoint before anything is written.
+    fn endpoint_changed(&self, target: &CustomTarget) -> bool {
+        target.protocol != self.initial_protocol || target.base_url != self.initial_base_url
+    }
 }
 
 /// Upstream API keys, one card each.
@@ -457,12 +606,15 @@ impl ProvidersPage {
         self.form_generation = self.form_generation.wrapping_add(1);
         let label = cx.new(|cx| InputState::new(window, cx).placeholder("label（如 主用）"));
         let api_key = cx.new(|cx| InputState::new(window, cx).placeholder("sk-…"));
+        let base_url = cx.new(|cx| {
+            InputState::new(window, cx).placeholder(PROTOCOL_CHOICES[0].base_url_placeholder)
+        });
         let max_concurrency =
             cx.new(|cx| InputState::new(window, cx).placeholder("并发上限（空 = 不限）"));
         let focus = label.read(cx).focus_handle(cx);
         window.focus(&focus, cx);
         self.key_form = Some(KeyForm {
-            spec_index: 0,
+            source: FormSource::Catalog(0),
             // Region/plan intentionally survive switching between vendors: they act
             // as a memory of the last choice (resolve ignores them for variant-less
             // vendors), not as per-vendor state.
@@ -470,24 +622,32 @@ impl ProvidersPage {
             coding_plan: false,
             label,
             api_key,
+            base_url,
             kiro_import: None,
             max_concurrency,
             probed_models: None,
             selected_models: Vec::new(),
             probing: false,
+            probe_seq: 0,
             saving: false,
             error: None,
         });
         cx.notify();
     }
 
-    /// Switch the add form between catalog entries. Kiro gets its own import
-    /// state and never enters the ordinary API-key validation path.
-    fn select_form_provider(&mut self, index: usize, window: &mut Window, cx: &mut Context<Self>) {
+    /// Switch the add form between catalog entries and custom protocols. Kiro
+    /// gets its own import state and never enters the ordinary API-key
+    /// validation path.
+    fn select_form_provider(
+        &mut self,
+        source: FormSource,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         let same_provider = self
             .key_form
             .as_ref()
-            .is_some_and(|form| form.spec_index == index);
+            .is_some_and(|form| form.source == source);
         if same_provider {
             return;
         }
@@ -495,11 +655,16 @@ impl ProvidersPage {
         let Some(form) = &mut self.key_form else {
             return;
         };
-        form.spec_index = index;
+        form.source = source;
         form.probed_models = None;
         form.selected_models.clear();
         form.probing = false;
-        form.kiro_import = if PROVIDER_SPECS[index].name == "kiro" {
+        if let FormSource::Custom { protocol } = source {
+            form.base_url.update(cx, |input, cx| {
+                input.set_placeholder(protocol.base_url_placeholder, window, cx)
+            });
+        }
+        form.kiro_import = if source.is_kiro() {
             let raw_json = cx.new(|cx| {
                 TextareaState::new(window, cx)
                     .placeholder("粘贴 Kiro 导出的 JSON（不会发送网络请求）")
@@ -568,19 +733,20 @@ impl ProvidersPage {
         cx.notify();
     }
 
-    /// Save the add-key form: find-or-create the provider row from the catalog
-    /// spec, then create the key. Errors stay in the form.
+    /// Save the add-key form: validate the key upstream, then find-or-create
+    /// the catalog provider row (or create the custom one — a duplicate name
+    /// is an error, never a silent reuse), then create the key. Errors stay
+    /// in the form.
     fn save_key(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let Some(form) = &self.key_form else { return };
-        if PROVIDER_SPECS[form.spec_index].name == "kiro" {
+        if form.source.is_kiro() {
             self.save_kiro_import(window, cx);
             return;
         }
         if form.saving {
             return; // one save in flight at a time
         }
-        let spec: &'static catalog::ProviderSpec = &PROVIDER_SPECS[form.spec_index];
-        let (name, base_url) = resolve(spec, form.region, form.coding_plan);
+        let custom = matches!(form.source, FormSource::Custom { .. });
         let label = form.label.read(cx).value().trim().to_string();
         let api_key = form.api_key.read(cx).value().trim().to_string();
         let concurrency_raw = form.max_concurrency.read(cx).value();
@@ -601,6 +767,16 @@ impl ProvidersPage {
             cx.notify();
             return;
         }
+        let target = match form.target(cx) {
+            Ok(target) => target,
+            Err(message) => {
+                if let Some(form) = &mut self.key_form {
+                    form.error = Some(message.to_string());
+                }
+                cx.notify();
+                return;
+            }
+        };
         let allowed_models: Option<Vec<String>> = if form.selected_models.is_empty() {
             None
         } else {
@@ -609,7 +785,8 @@ impl ProvidersPage {
         let form_generation = self.form_generation;
         // Validate the key upstream before anything is persisted (the provider's
         // model list doubles as the liveness/auth proof); the provider row is
-        // find-or-created only after the key checks out.
+        // created (custom) or find-or-created (catalog) only after the key checks
+        // out, and a custom row is deleted again if the key cannot be created.
         if let Some(form) = &mut self.key_form {
             form.saving = true;
             form.error = None;
@@ -618,16 +795,16 @@ impl ProvidersPage {
         let call = cx
             .global::<GatewayRuntime>()
             .admin_call(move |admin| async move {
-                let input = ProviderInput {
-                    name,
-                    protocol: spec.protocol,
-                    base_url,
-                    auth_scheme: Some(spec.auth_scheme),
-                    enabled: true,
-                };
+                let input = target.input();
                 let models = admin.validate_key(&input, &api_key).await?;
-                let provider_id = admin.find_or_create_provider(&input).await?;
-                let key_id = admin
+                // Custom provider ↔ key is one-to-one (name = label): creating
+                // fails on a taken name instead of attaching to someone else's row.
+                let (provider_id, provider_created) = if custom {
+                    (admin.create_provider(&input).await?, true)
+                } else {
+                    (admin.find_or_create_provider(&input).await?, false)
+                };
+                let key_id = match admin
                     .create_key(
                         provider_id,
                         &label,
@@ -635,7 +812,17 @@ impl ProvidersPage {
                         max_concurrency,
                         allowed_models,
                     )
-                    .await?;
+                    .await
+                {
+                    Ok(key_id) => key_id,
+                    Err(error) if provider_created => {
+                        let cleanup_error =
+                            cleanup_new_resources(&admin, provider_id, None, true, "创建 key 失败")
+                                .await;
+                        return Err(import_error("创建 key 失败", error, cleanup_error));
+                    }
+                    Err(error) => return Err(error),
+                };
                 // Keep the model list validation just fetched as the key's snapshot
                 // (route derivation on /v1/models reads it); losing it only defers
                 // derived attributes until the next successful probe — never fail the
@@ -817,11 +1004,6 @@ impl ProvidersPage {
         if form.probing || form.saving {
             return;
         }
-        let spec: &'static catalog::ProviderSpec = &PROVIDER_SPECS[form.spec_index];
-        let spec_index = form.spec_index;
-        let region = form.region;
-        let coding_plan = form.coding_plan;
-        let (name, base_url) = resolve(spec, region, coding_plan);
         let api_key = form.api_key.read(cx).value().trim().to_string();
         if api_key.is_empty() {
             if let Some(form) = &mut self.key_form {
@@ -830,39 +1012,56 @@ impl ProvidersPage {
             cx.notify();
             return;
         }
-        if let Some(form) = &mut self.key_form {
-            form.probing = true;
-            form.error = None;
-        }
+        let target = match form.target(cx) {
+            Ok(target) => target,
+            Err(message) => {
+                if let Some(form) = &mut self.key_form {
+                    form.error = Some(message.to_string());
+                }
+                cx.notify();
+                return;
+            }
+        };
+        let Some(form) = &mut self.key_form else {
+            return;
+        };
+        form.probing = true;
+        form.probe_seq = form.probe_seq.wrapping_add(1);
+        form.error = None;
+        let probe_seq = form.probe_seq;
         cx.notify();
         // Identity guard inputs, captured before the await: the landing only
-        // applies while the form still probes the same provider/variant and the
-        // same api_key — a switched or reopened form does not receive it.
+        // applies while the form still resolves to the same provider target and
+        // the same api_key — a switched or reopened form does not receive it.
         let form_generation = self.form_generation;
         let guard_key = api_key.clone();
+        let guard_target = target.clone();
         let call = cx
             .global::<GatewayRuntime>()
-            .admin_call(move |admin| async move {
-                let input = ProviderInput {
-                    name,
-                    protocol: spec.protocol,
-                    base_url,
-                    auth_scheme: Some(spec.auth_scheme),
-                    enabled: true,
-                };
-                admin.validate_key(&input, &api_key).await
-            });
+            .admin_call(
+                move |admin| async move { admin.validate_key(&target.input(), &api_key).await },
+            );
         cx.spawn(async move |this, cx| {
             let result = call.await;
             this.update(cx, |page, cx| {
                 let Some(form) = &mut page.key_form else {
                     return;
                 };
-                if page.form_generation != form_generation
-                    || form.spec_index != spec_index
-                    || form.region != region
-                    || form.coding_plan != coding_plan
-                {
+                if page.form_generation != form_generation {
+                    return;
+                }
+                // A newer probe started since this one: its landing owns the
+                // probing flag and the results.
+                if form.probe_seq != probe_seq {
+                    return;
+                }
+                // Same form, but its target moved (variant chip, custom label or
+                // base_url edited): the result describes another provider — drop it
+                // and release the probe so 获取模型 is clickable again.
+                if form.target(cx).as_ref() != Ok(&guard_target) {
+                    form.probing = false;
+                    form.probed_models = None;
+                    cx.notify();
                     return;
                 }
                 if !form.probing {
@@ -917,8 +1116,16 @@ impl ProvidersPage {
         cx.notify();
     }
 
-    /// 重新获取 (edit form): re-probe the saved key's model list (this also
-    /// refreshes the key's persisted snapshot) and re-offer the ids as chips.
+    /// Put a local validation message on the key editor card.
+    fn fail_editor(&mut self, message: &str, cx: &mut Context<Self>) {
+        if let Some(editor) = &mut self.key_editor {
+            editor.error = Some(message.to_string());
+        }
+        cx.notify();
+    }
+
+    /// 重新获取 (edit form): re-probe the key's model list and re-offer the ids
+    /// as chips. Custom rows probe the edited protocol/base_url.
     fn reprobe_editor_models(&mut self, cx: &mut Context<Self>) {
         let Some(editor) = &self.key_editor else {
             return;
@@ -927,6 +1134,31 @@ impl ProvidersPage {
             return;
         }
         let key_id = editor.key_id;
+        // A custom row with an edited endpoint probes the new endpoint with the
+        // revealed key (nothing is persisted until save); otherwise the saved
+        // key is re-probed, which also refreshes its stored snapshot.
+        let endpoint_probe = match &editor.custom {
+            None => None,
+            Some(custom) => {
+                let label = editor.label.read(cx).value().trim().to_string();
+                let target = custom.target(&label, cx);
+                let api_key = editor.api_key.clone();
+                match target {
+                    Err(message) => {
+                        self.fail_editor(message, cx);
+                        return;
+                    }
+                    Ok(target) if custom.endpoint_changed(&target) => match api_key {
+                        Some(api_key) => Some((label, target, api_key)),
+                        None => {
+                            self.fail_editor("密钥尚未加载，请稍后再获取", cx);
+                            return;
+                        }
+                    },
+                    Ok(_) => None,
+                }
+            }
+        };
         if let Some(editor) = &mut self.key_editor {
             editor.probing = true;
             editor.error = None;
@@ -934,7 +1166,21 @@ impl ProvidersPage {
         cx.notify();
         let call = cx
             .global::<GatewayRuntime>()
-            .admin_call(move |admin| async move { admin.list_key_models(key_id).await });
+            .admin_call(move |admin| async move {
+                match endpoint_probe {
+                    Some((name, target, api_key)) => {
+                        let input = ProviderInput {
+                            name: &name,
+                            protocol: target.protocol.protocol,
+                            base_url: &target.base_url,
+                            auth_scheme: None,
+                            enabled: true,
+                        };
+                        admin.validate_key(&input, &api_key).await
+                    }
+                    None => admin.list_key_models(key_id).await,
+                }
+            });
         cx.spawn(async move |this, cx| {
             let result = call.await;
             this.update(cx, |page, cx| {
@@ -1004,6 +1250,29 @@ impl ProvidersPage {
             LoadState::Loaded(data) => groups::memberships(&data.groups, key_id),
             _ => Vec::new(),
         };
+        // Custom rows (no catalog entry, not Kiro) whose protocol is one of the
+        // offered choices and whose name equals the key label also edit their
+        // endpoint (name = label). Any other row gets the plain label +
+        // concurrency editor and its provider is never renamed.
+        let custom = self
+            .provider_row(provider_id)
+            .filter(|row| is_custom(&row.name, &row.protocol) && row.name == key.label)
+            .and_then(|row| {
+                let protocol = protocol_choice(&row.protocol)?;
+                let base_url = cx.new(|cx| {
+                    InputState::new(window, cx).placeholder(protocol.base_url_placeholder)
+                });
+                base_url.update(cx, |input, cx| {
+                    input.set_value(row.base_url.clone(), window, cx)
+                });
+                Some(CustomEdit {
+                    protocol,
+                    base_url,
+                    initial_name: row.name.clone(),
+                    initial_protocol: protocol,
+                    initial_base_url: row.base_url.clone(),
+                })
+            });
         self.key_editor = Some(KeyEditor {
             provider_id,
             key_id,
@@ -1017,10 +1286,47 @@ impl ProvidersPage {
             probing: false,
             saving: false,
             show_key: false,
+            custom,
             error: None,
         });
         cx.notify();
         self.reveal_editor_key(cx);
+    }
+
+    /// The loaded provider row behind a key card, if the page has data.
+    fn provider_row(&self, provider_id: i64) -> Option<&ProviderRow> {
+        let LoadState::Loaded(data) = &self.state else {
+            return None;
+        };
+        data.keys
+            .iter()
+            .map(|card| &card.provider)
+            .find(|provider| provider.id == provider_id)
+    }
+
+    /// Pick the custom provider's protocol in the key editor.
+    fn select_editor_protocol(
+        &mut self,
+        choice: ProtocolChoice,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(custom) = self
+            .key_editor
+            .as_mut()
+            .filter(|editor| !editor.saving)
+            .and_then(|editor| editor.custom.as_mut())
+        else {
+            return;
+        };
+        if custom.protocol == choice {
+            return;
+        }
+        custom.protocol = choice;
+        custom.base_url.update(cx, |input, cx| {
+            input.set_placeholder(choice.base_url_placeholder, window, cx)
+        });
+        cx.notify();
     }
 
     /// Fetch the editor's plaintext credential (one loopback reveal) into the
@@ -1052,7 +1358,9 @@ impl ProvidersPage {
         .detach();
     }
 
-    /// Save the key editor (label + concurrency cap), then reload.
+    /// Save the key editor (label, concurrency cap, model whitelist, groups;
+    /// for custom rows also the provider's name, protocol and base_url), then
+    /// reload.
     fn save_key_editor(&mut self, cx: &mut Context<Self>) {
         let Some(editor) = &self.key_editor else {
             return;
@@ -1101,6 +1409,53 @@ impl ProvidersPage {
         let selected_groups = groups::retain_existing(&editor.selected_groups, live);
         let group_ids: Option<Vec<i64>> =
             groups::selection_changed(&initial_groups, &selected_groups).then_some(selected_groups);
+        // Custom rows: the provider row follows the label (name) and the edited
+        // endpoint. A changed endpoint needs the revealed key to re-validate
+        // before anything is written.
+        let provider_write = match &editor.custom {
+            None => None,
+            Some(custom) => {
+                let target = match custom.target(&label, cx) {
+                    Ok(target) => target,
+                    Err(message) => {
+                        self.fail_editor(message, cx);
+                        return;
+                    }
+                };
+                let endpoint_changed = custom.endpoint_changed(&target);
+                let validate_with = if endpoint_changed {
+                    match editor.api_key.clone() {
+                        Some(api_key) => Some(api_key),
+                        None => {
+                            self.fail_editor("密钥尚未加载，请稍后再保存", cx);
+                            return;
+                        }
+                    }
+                } else {
+                    None
+                };
+                // Fail closed: the PATCH is a full replace, so without the loaded
+                // row there is no trustworthy `enabled`/`auth_scheme` to carry over.
+                let Some(row) = self.provider_row(provider_id) else {
+                    if let Some(editor) = &mut self.key_editor {
+                        editor.error = Some("找不到对应的 provider，请刷新后重试".to_string());
+                        editor.saving = false;
+                    }
+                    cx.notify();
+                    return;
+                };
+                let enabled = row.enabled;
+                let auth_scheme =
+                    (target.protocol == custom.initial_protocol).then(|| row.auth_scheme.clone());
+                (endpoint_changed || label != custom.initial_name).then_some(ProviderWrite {
+                    protocol: target.protocol.protocol,
+                    base_url: target.base_url,
+                    enabled,
+                    auth_scheme,
+                    validate_with,
+                })
+            }
+        };
         if let Some(editor) = &mut self.key_editor {
             editor.saving = true;
             editor.error = None;
@@ -1109,6 +1464,29 @@ impl ProvidersPage {
         let call = cx
             .global::<GatewayRuntime>()
             .admin_call(move |admin| async move {
+                // Provider PATCH goes before the key PATCH: a rejected endpoint or
+                // a taken name leaves the key untouched.
+                if let Some(write) = &provider_write {
+                    let input = ProviderInput {
+                        name: &label,
+                        protocol: write.protocol,
+                        base_url: &write.base_url,
+                        auth_scheme: write.auth_scheme.as_deref(),
+                        enabled: write.enabled,
+                    };
+                    let models = match &write.validate_with {
+                        Some(api_key) => Some(admin.validate_key(&input, api_key).await?),
+                        None => None,
+                    };
+                    admin.update_provider(provider_id, &input).await?;
+                    // The new endpoint's model list becomes the key's snapshot;
+                    // losing it only defers derived attributes to the next probe.
+                    if let Some(models) = models
+                        && let Err(error) = admin.save_key_models(key_id, &models).await
+                    {
+                        tracing::warn!("model snapshot of key {key_id} was not saved: {error}");
+                    }
+                }
                 admin
                     .update_key(
                         provider_id,
@@ -1139,6 +1517,8 @@ impl ProvidersPage {
                         page.action_error = Some(error);
                     }
                     cx.notify();
+                    // An earlier step (provider PATCH) may have landed.
+                    page.reload(cx);
                 }
             })
             .ok();

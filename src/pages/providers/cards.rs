@@ -23,13 +23,15 @@ use gateway::store::{KeyGroupView, ProviderKeyView};
 use gateway::store::{ProviderRow, RestRow};
 
 use super::catalog::{
-    PROVIDER_SPECS, ProviderIcon, ProviderSpec, Region, imported_logo, spec_for, variant_of_row,
-    variants_of,
+    PROTOCOL_CHOICES, PROVIDER_SPECS, ProviderIcon, ProviderSpec, Region, imported_logo, spec_for,
+    variant_of_row, variants_of,
 };
 use super::chip::selectable_chip;
 use super::groups::{group_chips, group_tags};
 use super::quota::quota_row;
-use super::{KeyCardData, KeyDrag, KeyEditor, KeyForm, KiroImportForm, ProvidersPage, reordered};
+use super::{
+    FormSource, KeyCardData, KeyDrag, KeyEditor, KeyForm, KiroImportForm, ProvidersPage, reordered,
+};
 use crate::app::StatusTip;
 use crate::fmt::mask_api_key;
 use crate::pages::{LoadState, card};
@@ -47,6 +49,11 @@ impl ProvidersPage {
     /// The add-key form card: provider picker (catalog), label, credential,
     /// concurrency cap.
     pub(super) fn key_form_card(&self, form: &KeyForm, cx: &mut Context<Self>) -> Div {
+        let catalog_spec = match form.source {
+            FormSource::Catalog(index) => Some(&PROVIDER_SPECS[index]),
+            FormSource::Custom { .. } => None,
+        };
+        let is_kiro = form.source.is_kiro();
         card(cx)
             .child(
                 gpui::div()
@@ -62,7 +69,7 @@ impl ProvidersPage {
                     .gap_1()
                     .child(field_label("Provider", cx))
                     .children(PROVIDER_SPECS.iter().enumerate().map(|(index, spec)| {
-                        let selected = index == form.spec_index;
+                        let selected = form.source == FormSource::Catalog(index);
                         gpui::div()
                             .id(("key-form-provider", index))
                             .flex()
@@ -82,7 +89,11 @@ impl ProvidersPage {
                             .hover(|style| style.bg(cx.theme().accent))
                             .on_click(cx.listener(move |this, _, window, cx| {
                                 if this.key_form.as_ref().is_some_and(|form| !form.saving) {
-                                    this.select_form_provider(index, window, cx);
+                                    this.select_form_provider(
+                                        FormSource::Catalog(index),
+                                        window,
+                                        cx,
+                                    );
                                 }
                             }))
                             .child(provider_icon(spec, 14., cx))
@@ -92,12 +103,109 @@ impl ProvidersPage {
                                     .text_color(cx.theme().foreground)
                                     .child(spec.display),
                             )
-                    })),
+                    }))
+                    .child({
+                        let selected = matches!(form.source, FormSource::Custom { .. });
+                        gpui::div()
+                            .id("key-form-provider-custom")
+                            .flex()
+                            .items_center()
+                            .gap_1()
+                            .rounded_md()
+                            .border_1()
+                            .px_2()
+                            .py_1()
+                            .cursor_pointer()
+                            .border_color(if selected {
+                                cx.theme().primary
+                            } else {
+                                cx.theme().border
+                            })
+                            .when(selected, |this| this.bg(cx.theme().accent))
+                            .hover(|style| style.bg(cx.theme().accent))
+                            .on_click(cx.listener(|this, _, window, cx| {
+                                let Some(form) = this.key_form.as_ref().filter(|f| !f.saving)
+                                else {
+                                    return;
+                                };
+                                if matches!(form.source, FormSource::Custom { .. }) {
+                                    return;
+                                }
+                                this.select_form_provider(
+                                    FormSource::Custom {
+                                        protocol: PROTOCOL_CHOICES[0],
+                                    },
+                                    window,
+                                    cx,
+                                );
+                            }))
+                            .child(
+                                gpui::div()
+                                    .text_size(px(12.))
+                                    .text_color(cx.theme().foreground)
+                                    .child("自定义"),
+                            )
+                    }),
+            )
+            // 自定义 provider：协议单选 + base_url；label 兼作 provider 名。
+            .when_some(
+                match form.source {
+                    FormSource::Custom { protocol } => Some(protocol),
+                    FormSource::Catalog(_) => None,
+                },
+                |this, current| {
+                    this.child(
+                        gpui::div()
+                            .flex()
+                            .items_center()
+                            .flex_wrap()
+                            .gap_1()
+                            .child(field_label("协议", cx))
+                            .children(PROTOCOL_CHOICES.iter().enumerate().map(
+                                |(index, choice)| {
+                                    let choice = *choice;
+                                    selectable_chip(
+                                        choice.display.to_string(),
+                                        choice == current,
+                                        ElementId::from(("key-form-protocol", index)),
+                                        cx,
+                                    )
+                                    .on_click(cx.listener(
+                                        move |this, _, window, cx| {
+                                            if this
+                                                .key_form
+                                                .as_ref()
+                                                .is_some_and(|form| !form.saving)
+                                            {
+                                                this.select_form_provider(
+                                                    FormSource::Custom { protocol: choice },
+                                                    window,
+                                                    cx,
+                                                );
+                                            }
+                                        },
+                                    ))
+                                },
+                            )),
+                    )
+                    .child(editor_field(
+                        "Base URL",
+                        Input::new(&form.base_url).disabled(form.saving),
+                        None,
+                        cx,
+                    ))
+                    .child(
+                        gpui::div()
+                            .text_size(px(12.))
+                            .text_color(cx.theme().muted_foreground)
+                            .child("Label 同时作为 provider 名（直连前缀 <label>/<model>），不能包含 /"),
+                    )
+                },
             )
             // 入口变体：仅 kimi/glm 有区域 × Coding Plan 之分；两个小按钮单选区域，
             // 一个 chip 切换 Coding Plan（风格对齐上面的 provider 选择按钮）。
             .when(
-                variants_of(&PROVIDER_SPECS[form.spec_index]).is_some(),
+                catalog_spec.is_some_and(|spec| variants_of(spec).is_some()),
                 |this| {
                     this.child(
                         gpui::div()
@@ -175,9 +283,7 @@ impl ProvidersPage {
                     )
                 },
             )
-            .when(
-                PROVIDER_SPECS[form.spec_index].name == "kiro",
-                |this| match form.kiro_import.as_ref() {
+            .when(is_kiro, |this| match form.kiro_import.as_ref() {
                     Some(import) => this.child(self.kiro_import_fields(
                         import,
                         &form.max_concurrency,
@@ -185,9 +291,8 @@ impl ProvidersPage {
                         cx,
                     )),
                     None => this,
-                },
-            )
-            .when(PROVIDER_SPECS[form.spec_index].name != "kiro", |this| {
+                })
+            .when(!is_kiro, |this| {
                 this.child(editor_field(
                     "Label",
                     Input::new(&form.label).disabled(form.saving),
@@ -208,7 +313,7 @@ impl ProvidersPage {
                 ))
             })
             // 普通供应商才显示模型探测；Kiro 导入必须保持纯本地解析。
-            .when(PROVIDER_SPECS[form.spec_index].name != "kiro", |this| {
+            .when(!is_kiro, |this| {
                 this.child(
                     gpui::div()
                         .flex()
@@ -236,7 +341,7 @@ impl ProvidersPage {
                         ),
                 )
             })
-            .when(PROVIDER_SPECS[form.spec_index].name != "kiro", |this| {
+            .when(!is_kiro, |this| {
                 this.when_some(form.probed_models.as_ref(), |this, models| {
                     let listed: Vec<&str> = models.iter().map(|model| model.id.as_str()).collect();
                     let orphans = form
@@ -702,6 +807,9 @@ impl ProvidersPage {
         if let Some(balance) = &quota.balance {
           this = this.child(gpui::div().text_size(px(12.)).text_color(cx.theme().muted_foreground).child(format!("余额 {balance}")));
         }
+        for detail in &quota.details {
+          this = this.child(gpui::div().text_size(px(12.)).text_color(cx.theme().muted_foreground).child(detail.clone()));
+        }
         this
       })
       // Model rows: one line per whitelisted model (see `model_rows`), pinned
@@ -880,6 +988,44 @@ impl ProvidersPage {
                 Some(160.),
                 cx,
             ))
+            // 自定义 provider：协议单选 + base_url；label 兼作 provider 名。
+            .when_some(editor.custom.as_ref(), |this, custom| {
+                let locked = editor.saving || editor.probing;
+                this.child(
+                    gpui::div()
+                        .flex()
+                        .items_center()
+                        .flex_wrap()
+                        .gap_1()
+                        .child(field_label("协议", cx))
+                        .children(PROTOCOL_CHOICES.iter().enumerate().map(|(index, choice)| {
+                            let choice = *choice;
+                            selectable_chip(
+                                choice.display.to_string(),
+                                choice == custom.protocol,
+                                ElementId::from(("key-editor-protocol", index)),
+                                cx,
+                            )
+                            .when(!locked, |chip| {
+                                chip.on_click(cx.listener(move |this, _, window, cx| {
+                                    this.select_editor_protocol(choice, window, cx)
+                                }))
+                            })
+                        })),
+                )
+                .child(editor_field(
+                    "Base URL",
+                    Input::new(&custom.base_url).disabled(locked),
+                    None,
+                    cx,
+                ))
+                .child(
+                    gpui::div()
+                        .text_size(px(12.))
+                        .text_color(cx.theme().muted_foreground)
+                        .child("Label 同时作为 provider 名；改名会改变直连前缀 <label>/<model>（路由不受影响）"),
+                )
+            })
             .child(editor_field(
                 "并发上限",
                 Input::new(&editor.max_concurrency).disabled(editor.saving),
