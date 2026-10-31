@@ -22,6 +22,7 @@ use gateway::probe::ProbeModel;
 use gateway::store::{KeyGroupView, ProviderKeyView};
 use gateway::store::{ProviderRow, RestRow};
 
+use super::balance::balance_row;
 use super::catalog::{
     PROTOCOL_CHOICES, PROVIDER_SPECS, ProviderIcon, ProviderSpec, Region, imported_logo, spec_for,
     variant_of_row, variants_of,
@@ -805,7 +806,7 @@ impl ProvidersPage {
           this = this.child(quota_row(&quota.windows, quota.probed_at, cx));
         }
         if let Some(balance) = &quota.balance {
-          this = this.child(gpui::div().text_size(px(12.)).text_color(cx.theme().muted_foreground).child(format!("余额 {balance}")));
+          this = this.child(balance_row(balance, quota.probed_at, cx));
         }
         for detail in &quota.details {
           this = this.child(gpui::div().text_size(px(12.)).text_color(cx.theme().muted_foreground).child(detail.clone()));

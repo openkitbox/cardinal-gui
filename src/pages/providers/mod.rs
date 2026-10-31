@@ -14,9 +14,11 @@
 //! a page-level error card (row-level operations).
 //!
 //! Layout: page state + behavior here; `catalog` = the provider catalog and
-//! variant resolution (pure data/logic), `quota` = quota view models, `cards`
-//! = the card rendering.
+//! variant resolution (pure data/logic), `quota` = quota view models,
+//! `balance` = the prepaid balance meter + depletion chart, `cards` = the card
+//! rendering.
 
+mod balance;
 mod cards;
 mod catalog;
 mod chip;
@@ -24,6 +26,7 @@ mod group_editor;
 mod groups;
 pub mod kiro_import;
 mod quota;
+mod trend;
 
 use std::collections::HashMap;
 
@@ -111,6 +114,16 @@ impl ProvidersData {
                 .or_default()
                 .push(point.clone());
         }
+        // The current balance segment per key (opener first), for the cards'
+        // depletion charts.
+        let mut balance_histories: HashMap<i64, Vec<gateway::store::BalanceHistoryPoint>> =
+            HashMap::new();
+        for point in &document.balance_history {
+            balance_histories
+                .entry(point.key_id)
+                .or_default()
+                .push(point.clone());
+        }
         // A key always has its provider (same document, same transaction-free
         // read; the row carries a FK) — a key without one is skipped rather
         // than rendered without its provider.
@@ -127,6 +140,10 @@ impl ProvidersData {
                             quota,
                             probed_at,
                             histories.get(&key.id).map(Vec::as_slice).unwrap_or(&[]),
+                            balance_histories
+                                .get(&key.id)
+                                .map(Vec::as_slice)
+                                .unwrap_or(&[]),
                         )
                     }),
                 })
@@ -565,7 +582,7 @@ impl ProvidersPage {
                     if let Some(quota) = quotas.remove(&card.key.id) {
                         card.quota = Some(match card.quota.take() {
                             Some(previous) => previous.live(quota, now),
-                            None => KeyQuotaView::new(quota, now, &[]),
+                            None => KeyQuotaView::new(quota, now, &[], &[]),
                         });
                     }
                 }
