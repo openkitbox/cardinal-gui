@@ -832,30 +832,12 @@ impl ProvidersPage {
               }),
           ),
       )
-      // Group tags: the groups this account belongs to, derived from `groups`
-      // at render time; no row when it is in none.
-      .when_some(group_tags(key_id, groups, cx), |this, tags| this.child(tags))
-      // Variant markers (kimi/glm only), display-only on their own row under
-      // the title: 区域 (国内/国际) + Coding Plan — the variant decides the
-      // anthropic capability, so the card says which entry it sits on.
-      // Non-catalog rows (a manually-added provider) render no markers.
-      .when_some(variant_of_row(&provider.name, &provider.base_url), |this, (region, coding_plan)| {
-        let marker = |text: &'static str, cx: &mut Context<Self>| {
-          gpui::div()
-            .rounded_md()
-            .border_1()
-            .px_1p5()
-            .text_size(px(10.))
-            .border_color(cx.theme().accent)
-            .text_color(cx.theme().muted_foreground)
-            .child(text)
-        };
-        let mut row = gpui::div().flex().items_center().gap_2().child(marker(region.label(), cx));
-        if coding_plan {
-          row = row.child(marker("Coding Plan", cx));
-        }
-        this.child(row)
-      })
+      // Tag row: the groups this account belongs to (derived from `groups`
+      // at render time), then the variant markers (kimi/glm only):
+      // 区域 (国内/国际) + Coding Plan — the variant decides the anthropic
+      // capability, so the card says which entry it sits on. Display-only;
+      // wraps when long; no row when there is no tag at all.
+      .when_some(tag_row(key_id, provider, groups, cx), |this, row| this.child(row))
       // Quota: one meter per probed window, and/or a balance line. A key
       // without a reading (unknown vendor, probe never succeeded) renders
       // neither — the section collapses and the card shrinks.
@@ -1485,4 +1467,39 @@ pub(super) fn inline_error(message: &str, cx: &App) -> Div {
         .text_size(px(12.))
         .text_color(cx.theme().danger)
         .child(message.to_string())
+}
+
+/// A card's tag row: group tags followed by the variant markers. Non-catalog
+/// rows (a manually-added provider) carry no markers. `None` when empty.
+fn tag_row(key_id: i64, provider: &ProviderRow, groups: &[KeyGroupView], cx: &App) -> Option<Div> {
+    let mut tags = group_tags(key_id, groups, cx);
+    if let Some((region, coding_plan)) = variant_of_row(&provider.name, &provider.base_url) {
+        tags.push(variant_marker(region.label(), cx));
+        if coding_plan {
+            tags.push(variant_marker("Coding Plan", cx));
+        }
+    }
+    if tags.is_empty() {
+        return None;
+    }
+    Some(
+        gpui::div()
+            .flex()
+            .flex_wrap()
+            .items_center()
+            .gap_1()
+            .children(tags),
+    )
+}
+
+fn variant_marker(text: &'static str, cx: &App) -> Div {
+    gpui::div()
+        .flex_none()
+        .rounded_md()
+        .border_1()
+        .px_1p5()
+        .text_size(px(10.))
+        .border_color(cx.theme().accent)
+        .text_color(cx.theme().muted_foreground)
+        .child(text)
 }

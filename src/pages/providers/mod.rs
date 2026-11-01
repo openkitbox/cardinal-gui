@@ -52,7 +52,7 @@ use catalog::{
     PROTOCOL_CHOICES, PROVIDER_SPECS, ProtocolChoice, Region, is_custom, protocol_choice, resolve,
 };
 use group_editor::{GroupCreate, GroupManager};
-use groups::{GroupFilter, Visibility};
+use groups::{GroupFilter, KeyFacts, Visibility};
 use quota::KeyQuotaView;
 
 use crate::pages::{
@@ -166,6 +166,24 @@ impl ProvidersData {
             rests,
             groups: document.key_groups.clone(),
         }
+    }
+
+    /// The filter-relevant facts of every account, in card order.
+    fn key_facts(&self) -> impl Iterator<Item = KeyFacts> + '_ {
+        self.keys.iter().map(|card| KeyFacts {
+            id: card.key.id,
+            provider_id: card.provider.id,
+            archived: card.key.archived_at.is_some(),
+        })
+    }
+
+    /// The stored name of the provider row `id`, taken from any of its
+    /// accounts' cards; `None` when no account of it is loaded.
+    fn provider_name(&self, id: i64) -> Option<&str> {
+        self.keys
+            .iter()
+            .find(|card| card.provider.id == id)
+            .map(|card| card.provider.name.as_str())
     }
 }
 
@@ -569,13 +587,8 @@ impl ProvidersPage {
     /// to enabled, unarchived accounts with a quota reading. Derived per
     /// render; `None` when nothing sums.
     fn quota_summary(&self, data: &ProvidersData, cx: &App) -> Option<gpui::Div> {
-        let filter = self.group_filter.effective(&data.groups);
-        let archived = data
-            .keys
-            .iter()
-            .filter(|card| card.key.archived_at.is_some())
-            .map(|card| card.key.id);
-        let visibility = Visibility::new(filter, &data.groups, archived);
+        let filter = self.group_filter.effective(&data.groups, data.key_facts());
+        let visibility = Visibility::new(filter, &data.groups, data.key_facts());
         let cards = data.keys.iter().filter_map(|card| {
             let visible = visibility.admits(card.key.id)
                 && card.key.enabled
@@ -2036,13 +2049,8 @@ impl Render for ProvidersPage {
             LoadState::Failed(error) => frame.child(error_card(error, cx)),
             LoadState::Loaded(data) => {
                 // Derived per render from the loaded groups: nothing cached.
-                let filter = self.group_filter.effective(&data.groups);
-                let archived = data
-                    .keys
-                    .iter()
-                    .filter(|card| card.key.archived_at.is_some())
-                    .map(|card| card.key.id);
-                let visibility = Visibility::new(filter, &data.groups, archived);
+                let filter = self.group_filter.effective(&data.groups, data.key_facts());
+                let visibility = Visibility::new(filter, &data.groups, data.key_facts());
                 let any_visible = data.keys.iter().any(|card| visibility.admits(card.key.id));
                 frame
                     .when_some(self.action_error.as_ref(), |this, error| {
