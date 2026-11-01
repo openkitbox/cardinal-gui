@@ -22,17 +22,19 @@ pub(crate) enum StatusTab {
     Routes,
     Requests,
     Users,
+    Keys,
     Settings,
 }
 
 impl StatusTab {
     /// All tabs, in tab-bar order; `as usize` indexes into this.
-    pub(crate) const ALL: [StatusTab; 6] = [
+    pub(crate) const ALL: [StatusTab; 7] = [
         StatusTab::Usage,
         StatusTab::Providers,
         StatusTab::Routes,
         StatusTab::Requests,
         StatusTab::Users,
+        StatusTab::Keys,
         StatusTab::Settings,
     ];
 
@@ -44,6 +46,7 @@ impl StatusTab {
             StatusTab::Routes => "路由",
             StatusTab::Requests => "请求",
             StatusTab::Users => "用户",
+            StatusTab::Keys => "Key",
             StatusTab::Settings => "设置",
         }
     }

@@ -129,6 +129,55 @@ pub(crate) fn account_model(account: Option<&str>, served_model: Option<&str>) -
     }
 }
 
+/// Micro-USD per USD.
+const MICROUS_PER_USD: u64 = 1_000_000;
+
+/// USD for lists and balances, from micro-USD, integer arithmetic only.
+///
+/// Rules (one style for every page that uses it):
+/// - at most 4 decimals: the 5th and 6th micro-USD digits are rounded half
+///   away from zero (`12_350` → `$0.0124`, `12_349` → `$0.0123`);
+/// - trailing fractional zeros are trimmed, but at least 2 decimals stay
+///   (`10_000_000` → `$10.00`, `10_499_700` → `$10.4997`);
+/// - a negative amount puts the minus before the dollar sign
+///   (`-500_000` → `-$0.50`); one that rounds to zero shows no sign.
+///
+/// Use [`usd_exact`] where a 1 µUSD difference must stay visible.
+pub(crate) fn usd_microus(microus: i64) -> String {
+    let magnitude = microus.unsigned_abs();
+    // 1e-4 USD units; `u64::MAX` leaves room for the +50 on `i64::MIN`.
+    let ten_thousandths = (magnitude + 50) / 100;
+    let digits = format!("{:04}", ten_thousandths % 10_000);
+    dollars(
+        microus < 0 && ten_thousandths != 0,
+        ten_thousandths / 10_000,
+        &digits,
+    )
+}
+
+/// Exact USD from micro-USD: every significant digit of the six kept, with
+/// the same sign and trailing-zero rule as [`usd_microus`]
+/// (`-1_234_567` → `-$1.234567`, `2_000_000` → `$2.00`). For confirm
+/// previews and reconciliation, where rounding could hide a difference.
+pub(crate) fn usd_exact(microus: i64) -> String {
+    let magnitude = microus.unsigned_abs();
+    let digits = format!("{:06}", magnitude % MICROUS_PER_USD);
+    dollars(microus < 0, magnitude / MICROUS_PER_USD, &digits)
+}
+
+/// `[-]$whole.fraction` with `fraction_digits` trimmed of trailing zeros down
+/// to two digits.
+fn dollars(negative: bool, whole: u64, fraction_digits: &str) -> String {
+    let trimmed = fraction_digits.trim_end_matches('0');
+    let fraction = if trimmed.len() < 2 {
+        &fraction_digits[..2]
+    } else {
+        trimmed
+    };
+    let sign = if negative { "-" } else { "" };
+    format!("{sign}${whole}.{fraction}")
+}
+
 /// How long ago a quota snapshot was probed, humanized for the card header:
 /// <60s 「刚刚」, <1h 「N 分钟前」, <24h 「N 小时前」, else 「N 天前」.
 /// A future timestamp (clock skew) reads as 「刚刚」.

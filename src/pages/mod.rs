@@ -6,6 +6,8 @@
 //! through `GatewayHttpClient`'s write methods and end in a reload.
 
 mod feed;
+mod gateway_keys;
+mod ledger;
 mod providers;
 mod requests;
 mod routes;
@@ -13,8 +15,10 @@ mod settings;
 mod status;
 mod usage;
 mod usage_trend;
+mod user_groups;
 mod users;
 
+pub use gateway_keys::GatewayKeysPage;
 pub use providers::ProvidersPage;
 pub use requests::RequestsPage;
 pub use routes::RoutesPage;
@@ -28,7 +32,8 @@ use gpui::{
     StatefulInteractiveElement, Styled, Window, px,
 };
 use gpui_kit::assets::IconName;
-use gpui_kit::component::button::Button;
+use gpui_kit::component::button::{Button, ButtonVariants as _};
+use gpui_kit::component::input::Input;
 use gpui_kit::component::spinner::Spinner;
 use gpui_kit::component::{ActiveTheme, Icon, Sizable};
 
@@ -221,4 +226,104 @@ pub(crate) fn empty_card(title: &'static str, hint: impl Into<String>, cx: &App)
                 .text_color(cx.theme().muted_foreground)
                 .child(hint.into()),
         )
+}
+
+/// Segmented control: a pill track with the active option on a raised
+/// thumb. `on_pick` runs on the page when an option is clicked.
+pub(crate) fn segmented<P: 'static, T: Copy + Eq + 'static>(
+    id_prefix: &'static str,
+    options: &[(T, &'static str)],
+    current: T,
+    cx: &mut Context<P>,
+    on_pick: impl Fn(&mut P, T, &mut Context<P>) + Copy + 'static,
+) -> Div {
+    let mut track = gpui::div()
+        .flex()
+        .flex_shrink_0()
+        .p(px(2.))
+        .rounded(px(7.))
+        .bg(cx.theme().muted);
+    for (index, &(value, label)) in options.iter().enumerate() {
+        let on = value == current;
+        let foreground = cx.theme().foreground;
+        let mut option = gpui::div()
+            .id(gpui::ElementId::NamedInteger(
+                id_prefix.into(),
+                index as u64,
+            ))
+            .h(px(22.))
+            .px(px(10.))
+            .flex()
+            .items_center()
+            .rounded(px(5.))
+            .text_size(px(12.))
+            .cursor_pointer()
+            .text_color(if on {
+                foreground
+            } else {
+                cx.theme().muted_foreground
+            })
+            .child(label);
+        if on {
+            option = option.bg(cx.theme().popover).shadow_sm();
+        } else {
+            option = option.hover(move |style| style.text_color(foreground));
+        }
+        track = track
+            .child(option.on_click(cx.listener(move |page, _, _, cx| on_pick(page, value, cx))));
+    }
+    track
+}
+
+/// Fixed-width dimmed label at the start of an editor row.
+pub(crate) fn field_label(label: &'static str, cx: &App) -> Div {
+    gpui::div()
+        .w(px(72.))
+        .flex_shrink_0()
+        .text_color(cx.theme().muted_foreground)
+        .child(label)
+}
+
+/// One labeled editor row; `width` sizes the input, `None` fills the row.
+pub(crate) fn editor_row(label: &'static str, input: Input, width: Option<f32>, cx: &App) -> Div {
+    let row = gpui::div()
+        .flex()
+        .items_center()
+        .gap_2()
+        .child(field_label(label, cx));
+    match width {
+        Some(width) => row.child(input.w(px(width))),
+        None => row.child(gpui::div().flex_1().child(input.w_full())),
+    }
+}
+
+/// A ghost icon button with a tooltip. The icon must be embedded (default
+/// set or `assets::VENDORED`), else it renders blank.
+pub(crate) fn icon_button(
+    id: impl Into<gpui::ElementId>,
+    icon: IconName,
+    tooltip: &'static str,
+    on_click: impl Fn(&ClickEvent, &mut Window, &mut App) + 'static,
+) -> Button {
+    Button::new(id)
+        .icon(Icon::new(icon).small())
+        .ghost()
+        .compact()
+        .tooltip(tooltip)
+        .on_click(on_click)
+}
+
+/// `YYYY-MM-DD HH:MM` in the GUI display timezone.
+pub(crate) fn display_time(at: chrono::DateTime<chrono::Utc>) -> String {
+    at.with_timezone(&crate::ui_tz::display_tz())
+        .format("%Y-%m-%d %H:%M")
+        .to_string()
+}
+
+/// Small inline error text under an editor field or form.
+pub(crate) fn inline_error(message: impl Into<gpui::SharedString>, cx: &App) -> Div {
+    gpui::div()
+        .text_size(px(12.))
+        .text_color(cx.theme().danger)
+        .child(message.into())
 }

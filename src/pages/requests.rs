@@ -20,6 +20,7 @@ use gateway::relay::trace::{DispatchTrace, SkipReason};
 use gateway::store::RequestRow;
 
 use crate::fmt::format_cost;
+use crate::fmt::usd_microus;
 use crate::pages::{LoadState, empty_card, error_card, loading_card, page_frame, refresh_button};
 use crate::runtime::GatewayRuntime;
 
@@ -738,12 +739,14 @@ fn requests_header(cx: &App) -> Div {
         .child(fixed_header("推理", cx))
         .child(route_header(cx))
         .child(caller_header(cx))
+        .child(user_header(cx))
         .child(supplier_header(cx))
         .child(status_header(cx))
         .child(ttft_header(cx))
         .child(speed_header(cx))
         .child(label("Token 入/出", true))
-        .child(label("费用", true))
+        .child(label("标准价", true))
+        .child(label("扣费", true))
 }
 
 /// One request row: the clickable main line (7 columns, same widths as the
@@ -784,6 +787,7 @@ fn request_row(page: &RequestsPage, row: &RequestRow, cx: &mut Context<RequestsP
             row.agent.as_deref(),
             row.caller_key.as_deref(),
         )))
+        .child(user_cell(row.login.as_deref().unwrap_or("—").to_string()))
         // 供应商列：账号 label / 实际服务的上游模型 ID，与动态同一口径
         // （`fmt::account_model`：模型 ID 去掉前导厂商命名空间）。
         .child(supplier_cell(crate::fmt::account_model(
@@ -801,7 +805,8 @@ fn request_row(page: &RequestsPage, row: &RequestRow, cx: &mut Context<RequestsP
             format!("{}/{}", tokens(row.input_tokens), tokens(row.output_tokens)),
             true,
         ))
-        .child(flex_col(format_cost(row.cost_usd), true));
+        .child(flex_col(format_cost(row.cost_usd), true))
+        .child(charged_cell(row));
     let mut wrapper = gpui::div().flex().flex_col().w_full().child(line);
     if page.expanded.contains(&row_id) {
         wrapper = wrapper.child(row_detail(page, row, cx));
@@ -1260,6 +1265,53 @@ fn caller_header(cx: &App) -> Div {
         .text_size(px(12.))
         .text_color(cx.theme().muted_foreground)
         .child("调用方")
+}
+
+/// User cell — the login owning the caller's gateway key, fixed narrow column.
+fn user_cell(text: String) -> Div {
+    gpui::div()
+        .flex_none()
+        .w(px(96.))
+        .px_2()
+        .py_1()
+        .truncate()
+        .child(text)
+}
+
+/// The user column's header cell (fixed width, matching the data cells).
+fn user_header(cx: &App) -> Div {
+    gpui::div()
+        .flex_none()
+        .w(px(96.))
+        .px_2()
+        .py_1()
+        .text_size(px(12.))
+        .text_color(cx.theme().muted_foreground)
+        .child("用户")
+}
+
+/// The amount debited for one attempt, `None` when the row was not billed:
+/// no charge recorded (unknown usage, unpriced model, in-process caller) or
+/// a zero/absent rate (an internal free user is charged 0 at rate 0 — that
+/// is not revenue, so it reads like an unbilled row).
+fn billed_charge(row: &RequestRow) -> Option<(i64, i64)> {
+    let rate_bp = row.rate_bp.filter(|rate_bp| *rate_bp > 0)?;
+    Some((row.charged_microus?, rate_bp))
+}
+
+/// The 扣费 cell: the debited USD with the rate on hover, `—` when unbilled
+/// ([`billed_charge`]).
+fn charged_cell(row: &RequestRow) -> gpui::Stateful<Div> {
+    let Some((charged, rate_bp)) = billed_charge(row) else {
+        return flex_col("—", true).id(("charged-none", row.id as u64));
+    };
+    let tip = format!("倍率 {}", gateway::billing::format_rate(rate_bp));
+    flex_col(usd_microus(charged), true)
+        .id(("charged-tip", row.id as u64))
+        .tooltip(move |_, cx| {
+            cx.new(|_| crate::app::StatusTip { text: tip.clone() })
+                .into()
+        })
 }
 
 /// Optional token count, em-dash when unmeasured.

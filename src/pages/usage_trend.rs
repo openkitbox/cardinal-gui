@@ -1,5 +1,5 @@
 //! Usage trend card: a segmented metric switch (Token /
-//! 费用 / 请求) and a split-dimension switch (路由 / 模型 / 供应商 / 客户端 / 用户) over a
+//! 标准价 / 营收 / 请求) and a split-dimension switch (路由 / 模型 / 供应商 / 客户端 / 用户) over a
 //! stacked-column chart with a hover tooltip, flanked by a per-category
 //! ranking. The top 7 categories take the palette colours; the rest fold
 //! into 其他. Geometry and paint happen in a `canvas` element; the tooltip
@@ -18,7 +18,7 @@ use gpui::{
 };
 use gpui_kit::component::ActiveTheme;
 
-use crate::fmt::humanize_count;
+use crate::fmt::{humanize_count, usd_microus};
 use crate::pages::card;
 use crate::pages::usage::{ResolvedRange, UsagePage};
 
@@ -49,31 +49,41 @@ fn palette(index: usize) -> Hsla {
 }
 
 /// Trend metric of the chart and the ranking (speed is window-level only, so
-/// the trend offers the three additive metrics).
+/// the trend offers the additive metrics). 标准价 is the catalog cost
+/// (`cost_usd`), 营收 the amount debited to users (`charged_microus`); the
+/// two are shown side by side, never subtracted.
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub(crate) enum TrendMetric {
     Tokens,
     Cost,
+    Revenue,
     Requests,
 }
 
 impl TrendMetric {
-    pub(crate) const ALL: [TrendMetric; 3] = [Self::Tokens, Self::Cost, Self::Requests];
+    pub(crate) const ALL: [TrendMetric; 4] =
+        [Self::Tokens, Self::Cost, Self::Revenue, Self::Requests];
 
     fn label(self) -> &'static str {
         match self {
             Self::Tokens => "Token",
-            Self::Cost => "费用",
+            Self::Cost => "标准价",
+            Self::Revenue => "营收",
             Self::Requests => "请求",
         }
     }
 
+    /// The chart value of one row. 营收 stays in micro-USD (whole numbers,
+    /// exact in f64 far past any realistic window total) so its labels can
+    /// go back to integers for [`usd_microus`]; the f64 is only for stacking
+    /// and the Y scale.
     fn value(self, row: &TrendRow) -> f64 {
         match self {
             // cached_input_tokens is already contained in input_tokens
             // (llm::server::usage contract) — same sum as the KPI card.
             Self::Tokens => (row.input_tokens + row.output_tokens) as f64,
             Self::Cost => row.cost_usd.unwrap_or(0.),
+            Self::Revenue => row.charged_microus as f64,
             Self::Requests => row.requests as f64,
         }
     }
@@ -83,6 +93,7 @@ impl TrendMetric {
         match self {
             Self::Tokens => humanize_count(value.round() as i64),
             Self::Requests => format!("{}", value.round() as i64),
+            Self::Revenue => usd_microus(value.round() as i64),
             // No more digits than it takes.
             Self::Cost => {
                 if value >= 10. {
@@ -111,7 +122,9 @@ fn category_fallback(split: TrendSplit) -> &'static str {
         TrendSplit::Route => "（直连）",
         TrendSplit::Model | TrendSplit::Provider => "（未知）",
         // No agent and no caller key: a local unidentified caller.
-        TrendSplit::Client | TrendSplit::User => "（本机）",
+        TrendSplit::Client => "（本机）",
+        // No owning user: an in-process call or an unattributed key.
+        TrendSplit::User => "（未归属）",
     }
 }
 
@@ -125,6 +138,8 @@ pub(crate) struct TrendCategory {
     tokens: i64,
     cached_input_tokens: i64,
     cost: Option<f64>,
+    /// Amount debited, micro-USD (0 when nothing was charged).
+    charged_microus: i64,
     /// Successful-row timing (speed line under the rank bar): output tokens
     /// over decode windows (total_ms - ttft_ms).
     timed_output: i64,
@@ -169,6 +184,7 @@ fn prepare(
         cached_input_tokens: i64,
         cost: f64,
         priced: bool,
+        charged_microus: i64,
         timed_output: i64,
         decode_ms: i64,
         metric: f64,
@@ -212,6 +228,7 @@ fn prepare(
             agg.cost += cost;
             agg.priced = true;
         }
+        agg.charged_microus += row.charged_microus;
         agg.timed_output += row.timed_output;
         agg.decode_ms += row.decode_ms;
         let value = metric.value(row);
@@ -236,6 +253,7 @@ fn prepare(
         tokens: agg.tokens,
         cached_input_tokens: agg.cached_input_tokens,
         cost: agg.priced.then_some(agg.cost),
+        charged_microus: agg.charged_microus,
         timed_output: agg.timed_output,
         decode_ms: agg.decode_ms,
         metric_value: agg.metric,
@@ -256,6 +274,7 @@ fn prepare(
             acc.cached_input_tokens += agg.cached_input_tokens;
             acc.cost += agg.cost;
             acc.priced |= agg.priced;
+            acc.charged_microus += agg.charged_microus;
             acc.timed_output += agg.timed_output;
             acc.decode_ms += agg.decode_ms;
             acc.metric += agg.metric;
@@ -678,7 +697,10 @@ impl UsagePage {
         if metric != TrendMetric::Cost
             && let Some(cost) = category.cost
         {
-            stats.push(format!("${cost:.2}"));
+            stats.push(format!("标准价 ${cost:.2}"));
+        }
+        if metric != TrendMetric::Revenue && category.charged_microus > 0 {
+            stats.push(format!("营收 {}", usd_microus(category.charged_microus)));
         }
         if category.decode_ms > 0 {
             stats.push(format!(

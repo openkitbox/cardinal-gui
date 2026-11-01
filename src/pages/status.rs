@@ -1,5 +1,5 @@
-//! Status page: the single view of the application. Its five views (概览,
-//! 账号, 路由, 请求, 设置) switch via a top tab bar. Tab
+//! Status page: the single view of the application. Its views (概览, 账号,
+//! 路由, 请求, 用户, Key, 设置) switch via a top tab bar. Tab
 //! selection lives in `AppState::status_tab` (single source of truth), so
 //! the tab bar highlight and this page stay in sync without cross-entity
 //! calls; this container only renders whichever child is active.
@@ -8,8 +8,10 @@ use gpui::{AppContext as _, Context, Entity, IntoElement, ParentElement, Render,
 use gpui_kit::component::tab::{Tab, TabBar};
 
 use crate::app::{AppState, StatusTab};
+use crate::pages::users::ShowUserKeys;
 use crate::pages::{
-    ActionPage, ProvidersPage, RequestsPage, RoutesPage, SettingsPage, UsagePage, UsersPage,
+    ActionPage, GatewayKeysPage, ProvidersPage, RequestsPage, RoutesPage, SettingsPage, UsagePage,
+    UsersPage,
 };
 
 /// Container for the four status views. Owns their entities (created eagerly,
@@ -23,6 +25,7 @@ pub struct StatusPage {
     requests: Entity<RequestsPage>,
     usage: Entity<UsagePage>,
     users: Entity<UsersPage>,
+    keys: Entity<GatewayKeysPage>,
     settings: Entity<SettingsPage>,
     /// The status tab currently showing; a change activates a child: its
     /// snapshot reloads silently (`begin_load` keeps the old data on screen —
@@ -50,12 +53,25 @@ impl StatusPage {
             }
         })
         .detach();
+        let users = cx.new(|cx| UsersPage::new(window, cx));
+        let keys = cx.new(|cx| GatewayKeysPage::new(window, cx));
+        // 用户 → 「查看该用户的 key」: preset the Key tab's user filter, then
+        // switch to it (the tab activation reloads the keys).
+        cx.subscribe(&users, |page, _, event: &ShowUserKeys, cx| {
+            let ShowUserKeys(user_id) = *event;
+            page.keys
+                .update(cx, |keys, cx| keys.set_user_filter(Some(user_id), cx));
+            page.state
+                .update(cx, |state, cx| state.set_status_tab(StatusTab::Keys, cx));
+        })
+        .detach();
         Self {
             providers: cx.new(|cx| ProvidersPage::new(feed.clone(), cx)),
             routes: cx.new(|cx| RoutesPage::new(feed.clone(), cx)),
             requests: cx.new(|cx| RequestsPage::new(feed.clone(), cx)),
             usage: cx.new(|cx| UsagePage::new(feed.clone(), window, cx)),
-            users: cx.new(|cx| UsersPage::new(feed, window, cx)),
+            users,
+            keys,
             settings: cx.new(|cx| SettingsPage::new(window, cx)),
             state,
             active_tab: None,
@@ -73,6 +89,7 @@ impl StatusPage {
             StatusTab::Requests => self.requests.update(cx, |page, cx| page.reload(cx)),
             StatusTab::Usage => self.usage.update(cx, |page, cx| page.reload(cx)),
             StatusTab::Users => self.users.update(cx, |page, cx| page.reload(cx)),
+            StatusTab::Keys => self.keys.update(cx, |page, cx| page.reload(cx)),
             StatusTab::Settings => {}
         }
     }
@@ -90,6 +107,7 @@ impl Render for StatusPage {
             StatusTab::Requests => self.requests.update(cx, |page, cx| page.actions(cx)),
             StatusTab::Usage => self.usage.update(cx, |page, cx| page.actions(cx)),
             StatusTab::Users => self.users.update(cx, |page, cx| page.actions(cx)),
+            StatusTab::Keys => self.keys.update(cx, |page, cx| page.actions(cx)),
             StatusTab::Settings => Vec::new(),
         };
         let content = match tab {
@@ -98,6 +116,7 @@ impl Render for StatusPage {
             StatusTab::Requests => self.requests.clone().into_any_element(),
             StatusTab::Usage => self.usage.clone().into_any_element(),
             StatusTab::Users => self.users.clone().into_any_element(),
+            StatusTab::Keys => self.keys.clone().into_any_element(),
             StatusTab::Settings => self.settings.clone().into_any_element(),
         };
 

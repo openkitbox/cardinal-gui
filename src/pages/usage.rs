@@ -1,4 +1,4 @@
-//! Usage page: five KPI cards (led-strip blocks: label / big value /
+//! Usage page: six KPI cards (led-strip blocks: label / big value /
 //! sub line, or a meter for the cache hit rate) over the trend card, with the
 //! 动态 feed (`pages::feed`) below. The led-trend (metric/split
 //! switches, stacked-column chart with hover tooltip, per-category ranking)
@@ -20,9 +20,10 @@ use gpui_kit::component::date_picker::{
     DatePicker, DatePickerEvent, DatePickerState, DateTime as PickerValue,
 };
 
-use gateway::store::{GatewayKeyRow, TrendRow, TrendSplit, UsageWindow};
+use gateway::http_client::UsageScope;
+use gateway::store::{GatewayKeyRow, TrendRow, TrendSplit, UsageWindow, UserRow};
 
-use crate::fmt::humanize_count;
+use crate::fmt::{humanize_count, usd_microus};
 use crate::pages::usage_trend::{TrendData, TrendGeometryCell, TrendMetric};
 use crate::pages::{
     LoadState, card, empty_card, error_card, loading_card, page_frame, refresh_button,
@@ -112,34 +113,47 @@ type TrendCache =
     std::cell::RefCell<Option<((u64, TrendMetric, TrendSplit), std::rc::Rc<TrendData>)>>;
 
 /// The 客户端 filter over the overview's aggregates: every caller, one
-/// caller identity (a gateway key label or a self-named `cardinal-x` value),
-/// or the unidentified 本机 rows. The wire spelling of a selection: `Label`
-/// sends the identity as-is, `Local` sends the reserved value `null`.
+/// gateway key, the unidentified 本机 rows, or every key one user owns. The
+/// wire spelling of a selection is its [`UsageScope`]: `Key` sends `key_id`
+/// (labels are only unique per user, so a key is named by id and displayed
+/// as `login/label`), `Local` sends the reserved `caller=null`, `User` sends
+/// `user_id`.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(super) enum ClientFilter {
     All,
     Local,
-    Label(String),
+    Key { id: i64, name: String },
+    User { id: i64, login: String },
 }
 
 impl ClientFilter {
-    /// The `caller` query parameter value of this selection.
-    fn query(&self) -> Option<&str> {
+    /// The usage scope this selection queries.
+    fn scope(&self) -> UsageScope {
         match self {
-            Self::All => None,
-            Self::Local => Some("null"),
-            Self::Label(label) => Some(label.as_str()),
+            Self::All => UsageScope::All,
+            Self::Local => UsageScope::Local,
+            Self::Key { id, .. } => UsageScope::Key(*id),
+            Self::User { id, .. } => UsageScope::User(*id),
         }
     }
 
-    /// Dropdown display text of this selection.
-    fn label(&self) -> &str {
+    /// Dropdown display text of this selection (a user reads `用户 login`
+    /// so it never looks like a key label of the same name).
+    fn label(&self) -> String {
         match self {
-            Self::All => "全部",
-            Self::Local => "本机",
-            Self::Label(label) => label.as_str(),
+            Self::All => "全部".to_string(),
+            Self::Local => "本机".to_string(),
+            Self::Key { name, .. } => name.clone(),
+            Self::User { login, .. } => format!("用户 {login}"),
         }
     }
+}
+
+/// The 客户端 dropdown's key entries: (id, `login/label`).
+fn key_options(keys: &[GatewayKeyRow]) -> Vec<(i64, String)> {
+    keys.iter()
+        .map(|key| (key.id, format!("{}/{}", key.login, key.label)))
+        .collect()
 }
 
 /// Usage statistics dashboard.
@@ -163,17 +177,22 @@ pub struct UsagePage {
     pub(super) range: UsageRange,
     /// The custom-range date picker in the tab row.
     range_picker: gpui::Entity<DatePickerState>,
-    /// Trend metric (Token / 费用 / 请求); switching is client-side.
+    /// Trend metric (Token / 标准价 / 营收 / 请求); switching is client-side.
     pub(super) trend_metric: TrendMetric,
     /// Trend split dimension; switching refetches.
     pub(super) trend_split: TrendSplit,
-    /// 客户端 dropdown's selection (全部 / 本机 / one label); switching refetches.
+    /// 客户端 dropdown's selection (全部 / 本机 / one key / one user);
+    /// switching refetches.
     pub(super) client_filter: ClientFilter,
-    /// Dropdown options: the registered gateway key labels — seeded from the
-    /// pushed bootstrap document, refetched on a `resync` gap. A failure
-    /// degrades to just the fixed 全部/本机 entries.
-    key_labels: Vec<String>,
-    /// Last seen activity-feed revisions: `bootstrap_rev` seeds the label list
+    /// Dropdown options: the registered gateway keys as (id, `login/label`) —
+    /// seeded from the pushed bootstrap document, refetched on a `resync` gap.
+    /// A failure degrades to just the fixed 全部/本机 entries.
+    keys: Vec<(i64, String)>,
+    /// Dropdown 按用户 group: the users' (id, login), loaded from
+    /// `/api/users` (not in the bootstrap document). A failure degrades to an
+    /// empty group.
+    users: Vec<(i64, String)>,
+    /// Last seen activity-feed revisions: `bootstrap_rev` seeds the key list
     /// from the pushed document; `resync` (a stream-continuity gap) falls back
     /// to the pull reloads.
     seen_bootstrap: u64,
@@ -227,7 +246,8 @@ impl UsagePage {
             trend_metric: TrendMetric::Tokens,
             trend_split: TrendSplit::Route,
             client_filter: ClientFilter::All,
-            key_labels: Vec::new(),
+            keys: Vec::new(),
+            users: Vec::new(),
             seen_bootstrap: feed.read(cx).bootstrap_rev(),
             seen_resync: feed.read(cx).resync(),
             client_list_open: false,
@@ -251,12 +271,9 @@ impl UsagePage {
             if bootstrap_rev != page.seen_bootstrap {
                 page.seen_bootstrap = bootstrap_rev;
                 if let Some(document) = feed.read(cx).bootstrap() {
-                    page.key_labels = document
-                        .gateway_keys
-                        .iter()
-                        .map(|key| key.label.clone())
-                        .collect();
+                    page.keys = key_options(&document.gateway_keys);
                 }
+                page.reload_users(cx);
                 page.reload(cx);
             }
             // A stream-continuity gap: the mirrors may be stale — fall back to
@@ -265,6 +282,7 @@ impl UsagePage {
             if resync != page.seen_resync {
                 page.seen_resync = resync;
                 page.reload_keys(cx);
+                page.reload_users(cx);
                 page.reload(cx);
             }
             let persisted = feed.read(cx).persisted();
@@ -294,30 +312,46 @@ impl UsagePage {
             && landed > 0
             && let Some(document) = this.feed.read(cx).bootstrap()
         {
-            this.key_labels = document
-                .gateway_keys
-                .iter()
-                .map(|key| key.label.clone())
-                .collect();
+            this.keys = key_options(&document.gateway_keys);
+            this.reload_users(cx);
             this.reload(cx);
         }
         this
     }
 
-    /// (Re)load the 客户端 dropdown's label list (the registered gateway key
-    /// labels, enabled or not). A failure degrades silently to the fixed
+    /// (Re)load the 客户端 dropdown's key list (every registered gateway key,
+    /// enabled or not, as `login/label`). A failure degrades silently to the fixed
     /// 全部/本机 entries; a reload is harmless to re-run.
     fn reload_keys(&mut self, cx: &mut Context<Self>) {
         let load = cx
             .global::<GatewayRuntime>()
-            .admin_call(move |admin| async move { admin.gateway_keys().await });
+            .admin_call(move |admin| async move { admin.gateway_keys(None).await });
         cx.spawn(async move |this, cx| {
             let result = load.await;
             this.update(cx, |page, cx| {
                 if let Ok(keys) = result {
-                    page.key_labels = keys
-                        .iter()
-                        .map(|key: &GatewayKeyRow| key.label.clone())
+                    page.keys = key_options(&keys);
+                    cx.notify();
+                }
+            })
+            .ok();
+        })
+        .detach();
+    }
+
+    /// (Re)load the 客户端 dropdown's 按用户 group. A failure degrades
+    /// silently to an empty group; a reload is harmless to re-run.
+    fn reload_users(&mut self, cx: &mut Context<Self>) {
+        let load = cx
+            .global::<GatewayRuntime>()
+            .admin_call(|admin| async move { admin.users().await });
+        cx.spawn(async move |this, cx| {
+            let result = load.await;
+            this.update(cx, |page, cx| {
+                if let Ok(users) = result {
+                    page.users = users
+                        .into_iter()
+                        .map(|user: UserRow| (user.id, user.login))
                         .collect();
                     cx.notify();
                 }
@@ -336,12 +370,12 @@ impl UsagePage {
         let generation = self.generation;
         let resolved = self.range.resolve();
         let split = self.trend_split;
-        let caller = self.client_filter.query().map(str::to_string);
+        let filter = self.client_filter.clone();
         let load = cx
             .global::<GatewayRuntime>()
             .admin_call(move |admin| async move {
                 let window = admin
-                    .usage_window(resolved.since, resolved.until, caller.as_deref())
+                    .usage_window(resolved.since, resolved.until, filter.scope())
                     .await?;
                 let trend = admin
                     .usage_trend(
@@ -349,7 +383,7 @@ impl UsagePage {
                         resolved.until,
                         split,
                         resolved.offset,
-                        caller.as_deref(),
+                        filter.scope(),
                     )
                     .await?;
                 Ok((window, trend, resolved))
@@ -376,9 +410,8 @@ impl UsagePage {
     /// the opened list floats above page content via `deferred` (never
     /// stretches the tab row). Choosing one closes the list and reloads.
     fn client_dropdown(&mut self, cx: &mut Context<Self>) -> gpui::AnyElement {
-        let selection = self.client_filter.clone();
         let trigger = Button::new("usage-client-filter")
-            .label(selection.label().to_string())
+            .label(self.client_filter.label())
             .outline()
             .compact()
             .on_click(cx.listener(|this, _, _, cx| {
@@ -406,11 +439,37 @@ impl UsagePage {
         for (id, option) in fixed {
             options = options.child(self.client_option(id, option, cx));
         }
-        for (index, label) in self.key_labels.iter().enumerate() {
+        for (key_id, name) in &self.keys {
             let id = ElementId::from(gpui::SharedString::from(format!(
-                "usage-client-label-{index}"
+                "usage-client-key-{key_id}"
             )));
-            options = options.child(self.client_option(id, ClientFilter::Label(label.clone()), cx));
+            let option = ClientFilter::Key {
+                id: *key_id,
+                name: name.clone(),
+            };
+            options = options.child(self.client_option(id, option, cx));
+        }
+        if !self.users.is_empty() {
+            options = options.child(
+                gpui::div()
+                    .px_2()
+                    .pt_2()
+                    .pb_1()
+                    .border_t_1()
+                    .border_color(cx.theme().border)
+                    .text_size(px(11.))
+                    .text_color(cx.theme().muted_foreground)
+                    .child("按用户"),
+            );
+        }
+        for (id, login) in &self.users {
+            let element_id =
+                ElementId::from(gpui::SharedString::from(format!("usage-client-user-{id}")));
+            let option = ClientFilter::User {
+                id: *id,
+                login: login.clone(),
+            };
+            options = options.child(self.client_option(element_id, option, cx));
         }
         // `absolute` takes the list out of document flow; `deferred` draws it
         // after all ancestors so it floats above page content.
@@ -438,7 +497,7 @@ impl UsagePage {
         cx: &mut Context<Self>,
     ) -> gpui::Stateful<Div> {
         let selected = self.client_filter == option;
-        let text = option.label().to_string();
+        let text = option.label();
         gpui::div()
             .id(id)
             .cursor_pointer()
@@ -517,6 +576,7 @@ impl UsagePage {
                 "usage-refresh",
                 cx.listener(|this, _, _, cx| {
                     this.reload_keys(cx);
+                    this.reload_users(cx);
                     this.reload(cx);
                 }),
             )
@@ -560,7 +620,13 @@ impl Render for UsagePage {
                             requests_sub(window),
                             cx,
                         ))
-                        .child(kpi_card("费用", cost_value(window), cost_sub(window), cx))
+                        .child(kpi_card(
+                            "营收",
+                            usd_microus(window.charged_microus),
+                            "扣费合计".to_string(),
+                            cx,
+                        ))
+                        .child(kpi_card("标准价", cost_value(window), cost_sub(window), cx))
                         .child(hit_rate_card(window, cx))
                         .child(kpi_card(
                             "输出速度",
