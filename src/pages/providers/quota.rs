@@ -76,6 +76,27 @@ impl QuotaWindowView {
         QuotaBand::from_pct(self.used_pct)
     }
 
+    /// Display name from the probe ("5 小时", "本周").
+    pub(super) fn name(&self) -> &str {
+        &self.name
+    }
+
+    /// Share of the window already used, 0–100.
+    pub(super) fn used_pct(&self) -> f64 {
+        self.used_pct
+    }
+
+    /// When the window resets, when the vendor says so.
+    pub(super) fn resets_at(&self) -> Option<DateTime<Utc>> {
+        self.resets_at
+    }
+
+    /// The window's full allowance ("$70.00", "10000") when the vendor
+    /// reports an absolute one; `None` for percent-only windows.
+    pub(super) fn total(&self) -> Option<&str> {
+        self.total.as_deref()
+    }
+
     fn new(window: QuotaWindow, history: Vec<(chrono::DateTime<chrono::Utc>, f64)>) -> Self {
         Self {
             name: window.name,
@@ -400,16 +421,24 @@ fn pct_label(pct: f64) -> String {
 /// total itself when the total string is not a plain number (keeps the unit
 /// prefix/suffix as-is).
 fn remaining_amount(total: &str, remaining_pct: f64) -> String {
+    let Some((prefix, amount, suffix)) = parse_amount(total) else {
+        return total.to_string();
+    };
+    format!("{prefix}{:.2}{suffix}", amount * remaining_pct / 100.)
+}
+
+/// Split a window total into its unit prefix, number and unit suffix
+/// (`"$70.00"` → `("$", 70.0, "")`, `"10000"` → `("", 10000.0, "")`).
+/// `None` when the digits do not form a number.
+pub(super) fn parse_amount(total: &str) -> Option<(&str, f64, &str)> {
     let (prefix, digits) = total.split_at(total.find(|c: char| c.is_ascii_digit()).unwrap_or(0));
     let (num, suffix) = digits.split_at(
         digits
             .find(|c: char| !(c.is_ascii_digit() || c == '.'))
             .unwrap_or(digits.len()),
     );
-    let Some(amount) = num.parse::<f64>().ok() else {
-        return total.to_string();
-    };
-    format!("{prefix}{:.2}{suffix}", amount * remaining_pct / 100.)
+    let amount: f64 = num.parse().ok()?;
+    Some((prefix, amount, suffix))
 }
 
 /// Reset line under a bar: "重置 21:40 · 4 小时后" when the reset is within

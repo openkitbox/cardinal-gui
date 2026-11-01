@@ -166,11 +166,15 @@ pub(super) fn selection_changed(initial: &[i64], selected: &[i64]) -> bool {
     initial != selected
 }
 
-/// The key editor's 分组 row: every group as a toggle chip (highlighted when
-/// the account is a member); a hint when no group exists yet.
+/// A 分组 row (key editor, Kiro import): every group as a toggle chip
+/// (highlighted when selected); a hint when no group exists yet. `id_prefix`
+/// keeps the chip ids of different forms apart; `toggle` is the page method
+/// that flips one group in that form's selection.
 pub(super) fn group_chips(
     selected: &[i64],
     groups: &[KeyGroupView],
+    id_prefix: &'static str,
+    toggle: fn(&mut ProvidersPage, i64, &mut Context<ProvidersPage>),
     cx: &mut Context<ProvidersPage>,
 ) -> Div {
     if groups.is_empty() {
@@ -189,10 +193,10 @@ pub(super) fn group_chips(
             selectable_chip(
                 group.name.clone(),
                 selected.contains(&group_id),
-                ElementId::from(("key-editor-group", group_id as u64)),
+                ElementId::from((id_prefix, group_id as u64)),
                 cx,
             )
-            .on_click(cx.listener(move |this, _, _, cx| this.toggle_editor_group(group_id, cx)))
+            .on_click(cx.listener(move |this, _, _, cx| toggle(this, group_id, cx)))
         }))
 }
 

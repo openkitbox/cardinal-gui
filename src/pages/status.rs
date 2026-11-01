@@ -126,7 +126,16 @@ impl Render for StatusPage {
                             })
                             .children(StatusTab::ALL.map(|tab| Tab::new().label(tab.label()))),
                     )
-                    .child(gpui::div().flex().items_center().gap_2().children(actions)),
+                    .child(
+                        gpui::div()
+                            .flex()
+                            .flex_1()
+                            .min_w_0()
+                            .justify_end()
+                            .items_center()
+                            .gap_2()
+                            .children(actions),
+                    ),
             )
             .child(
                 gpui::div()

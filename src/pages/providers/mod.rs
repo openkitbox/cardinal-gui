@@ -26,22 +26,23 @@ mod group_editor;
 mod groups;
 pub mod kiro_import;
 mod quota;
+mod summary;
 mod trend;
 
 use std::collections::HashMap;
+use std::sync::Arc;
 
 use gpui::{
-    AppContext as _, Context, Entity, Focusable as _, InteractiveElement, IntoElement,
+    App, AppContext as _, Context, Entity, Focusable as _, InteractiveElement, IntoElement,
     ParentElement, Render, Styled, Window, prelude::FluentBuilder as _,
 };
 use gpui_kit::assets::IconName;
 use gpui_kit::component::button::{Button, ButtonVariant};
 use gpui_kit::component::input::{InputState, TextareaState};
-use gpui_kit::component::{Icon, Sizable, WindowExt};
+use gpui_kit::component::{Disableable, Icon, Sizable, WindowExt};
 
 use gateway::admin_ops::Bootstrap;
 use gateway::http_client::{GatewayHttpClient, KeyUpdate};
-use gateway::kiro::KiroOAuth;
 
 use gateway::probe::ProbeModel;
 use gateway::quota::KeyQuota;
@@ -285,13 +286,42 @@ impl KeyForm {
 struct KiroImportForm {
     raw_json: Entity<TextareaState>,
     provider_name: Entity<InputState>,
+    /// The label of a single-account document, or the `{prefix}-NNN` prefix
+    /// of a multi-account one.
     key_label: Entity<InputState>,
     parsed: Option<kiro_import::ParsedKiroExport>,
     parsed_raw_json: Option<String>,
-    selected_account: usize,
     default_provider_name: String,
+    /// Groups every imported key joins; empty = none.
+    selected_groups: Vec<i64>,
+    /// The running (or last finished) import; `None` before the first save.
+    progress: Option<ImportProgress>,
     generation: u64,
 }
+
+/// Progress of one Kiro import run. Failure lines carry the label and the
+/// gateway's error text only, never credential content.
+struct ImportProgress {
+    done: usize,
+    total: usize,
+    /// `(label, error)` per failed account, sorted by label.
+    failures: Vec<(String, String)>,
+}
+
+/// What a finished import run reports back to the form.
+struct ImportOutcome {
+    /// Accounts the run attempted; more than `failures.len()` means at
+    /// least one account landed.
+    total: usize,
+    failures: Vec<(String, String)>,
+    /// Set when the provider row was created by this run, every account
+    /// failed, and removing the now-empty row failed too.
+    cleanup_error: Option<String>,
+}
+
+/// Accounts imported in parallel within one run (each is one gateway POST
+/// that may refresh a token upstream).
+const KIRO_IMPORT_CONCURRENCY: usize = 4;
 
 /// Inline edit form for one existing key. The credential itself is NOT
 /// editable — rotating a key is delete + re-create (#1248: position/cooldown
@@ -495,7 +525,9 @@ impl ProvidersPage {
     /// Tab-row actions (the Status container renders them right-aligned next to
     /// the tabs): refresh reloads the list AND re-probes vendor quotas; 添加
     /// 账号 and 分组 only once data has loaded, since the form needs the
-    /// provider list and the dropdown needs the groups.
+    /// provider list and the dropdown needs the groups. Once loaded, the
+    /// available-quota summary of the visible, enabled accounts leads the
+    /// row and fills the gap before the buttons.
     pub(crate) fn actions(&mut self, cx: &mut Context<Self>) -> Vec<gpui::AnyElement> {
         let refresh = refresh_button(
             "providers-refresh",
@@ -505,19 +537,54 @@ impl ProvidersPage {
             }),
         );
         match &self.state {
-            LoadState::Loaded(data) => vec![
-                Button::new("key-add")
-                    .icon(Icon::new(IconName::Plus).small())
-                    .label("添加账号")
-                    .outline()
-                    .compact()
-                    .on_click(cx.listener(|this, _, window, cx| this.open_key_form(window, cx)))
-                    .into_any_element(),
-                self.group_dropdown(data, cx),
-                refresh.into_any_element(),
-            ],
+            LoadState::Loaded(data) => {
+                // A running import owns the form; replacing it would drop the
+                // run's result.
+                let saving = self.key_form.as_ref().is_some_and(|form| form.saving);
+                let mut actions: Vec<gpui::AnyElement> = Vec::with_capacity(4);
+                actions.extend(
+                    self.quota_summary(data, cx)
+                        .map(IntoElement::into_any_element),
+                );
+                actions.push(
+                    Button::new("key-add")
+                        .icon(Icon::new(IconName::Plus).small())
+                        .label("添加账号")
+                        .outline()
+                        .compact()
+                        .disabled(saving)
+                        .on_click(cx.listener(|this, _, window, cx| this.open_key_form(window, cx)))
+                        .into_any_element(),
+                );
+                actions.push(self.group_dropdown(data, cx));
+                actions.push(refresh.into_any_element());
+                actions
+            }
             _ => vec![refresh.into_any_element()],
         }
+    }
+
+    /// The tab-row quota summary over the cards the page currently shows
+    /// (same group filter and archive rule as [`Render::render`]), limited
+    /// to enabled, unarchived accounts with a quota reading. Derived per
+    /// render; `None` when nothing sums.
+    fn quota_summary(&self, data: &ProvidersData, cx: &App) -> Option<gpui::Div> {
+        let filter = self.group_filter.effective(&data.groups);
+        let archived = data
+            .keys
+            .iter()
+            .filter(|card| card.key.archived_at.is_some())
+            .map(|card| card.key.id);
+        let visibility = Visibility::new(filter, &data.groups, archived);
+        let cards = data.keys.iter().filter_map(|card| {
+            let visible = visibility.admits(card.key.id)
+                && card.key.enabled
+                && card.key.archived_at.is_none();
+            let quota = card.quota.as_ref().filter(|_| visible)?;
+            Some((card.provider.name.as_str(), quota))
+        });
+        let totals = summary::summarize(cards, chrono::Utc::now());
+        summary::render(&totals, cx)
     }
 
     /// (Re)load the page snapshot over the admin API: ONE
@@ -675,8 +742,12 @@ impl ProvidersPage {
         .detach();
     }
 
-    /// Open the add-key form, defaulting to the first catalog provider.
+    /// Open the add-key form, defaulting to the first catalog provider. A
+    /// form that is still saving is kept, so its run can land its result.
     fn open_key_form(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.key_form.as_ref().is_some_and(|form| form.saving) {
+            return;
+        }
         self.form_generation = self.form_generation.wrapping_add(1);
         let label = cx.new(|cx| InputState::new(window, cx).placeholder("label（如 主用）"));
         let api_key = cx.new(|cx| InputState::new(window, cx).placeholder("sk-…"));
@@ -752,8 +823,9 @@ impl ProvidersPage {
                 key_label,
                 parsed: None,
                 parsed_raw_json: None,
-                selected_account: 0,
                 default_provider_name: "kiro".to_string(),
+                selected_groups: Vec::new(),
+                progress: None,
                 generation: self.form_generation,
             })
         } else {
@@ -774,15 +846,22 @@ impl ProvidersPage {
         let raw_json = import.raw_json.read(cx).value();
         match kiro_import::parse(&raw_json) {
             Ok(parsed) => {
-                let region = parsed
-                    .summaries()
-                    .next()
-                    .map(|summary| summary.region)
-                    .unwrap_or_else(|| "us-east-1".to_string());
-                let default_name = format!("kiro-{region}");
+                // The provider row's endpoint is the accounts' API region, so
+                // the default name follows it (not the OIDC `region`).
+                let default_name = match parsed.api_region() {
+                    Ok(api_region) => format!("kiro-{api_region}"),
+                    Err(error) => {
+                        import.parsed = None;
+                        import.parsed_raw_json = None;
+                        form.error = Some(error.to_string());
+                        cx.notify();
+                        return;
+                    }
+                };
                 let current_name = import.provider_name.read(cx).value();
                 if current_name.contains('/') {
                     import.parsed = None;
+                    import.parsed_raw_json = None;
                     form.error = Some("Provider 名称不能包含 /".to_string());
                     cx.notify();
                     return;
@@ -793,9 +872,17 @@ impl ProvidersPage {
                         .update(cx, |input, cx| input.set_value(&default_name, window, cx));
                 }
                 import.default_provider_name = default_name;
+                let placeholder = if parsed.account_count() > 1 {
+                    "label 前缀（自动编号 前缀-001…）"
+                } else {
+                    "label（如 主用）"
+                };
+                import.key_label.update(cx, |input, cx| {
+                    input.set_placeholder(placeholder, window, cx)
+                });
                 import.parsed = Some(parsed);
                 import.parsed_raw_json = Some(raw_json.to_string());
-                import.selected_account = 0;
+                import.progress = None;
                 form.error = None;
             }
             Err(error) => {
@@ -986,13 +1073,42 @@ impl ProvidersPage {
                     return;
                 }
             };
-        let selected_account = import.selected_account;
-        let Some(oauth) = parsed.oauth(selected_account) else {
+        let existing_keys: Option<&[KeyCardData]> = match &self.state {
+            LoadState::Loaded(data) => Some(&data.keys),
+            LoadState::Loading | LoadState::Failed(_) => None,
+        };
+        // Auto-numbering continues after the loaded labels; numbering blind
+        // could hit an existing label, which the gateway upserts in place.
+        if existing_keys.is_none() && parsed.account_count() > 1 {
             if let Some(form) = &mut self.key_form {
-                form.error = Some("所选 Kiro 账号不存在".to_string());
+                form.error = Some("账号列表尚未加载，无法自动编号".to_string());
             }
             cx.notify();
             return;
+        }
+        let existing_labels = existing_keys
+            .unwrap_or_default()
+            .iter()
+            .map(|card| card.key.label.as_str());
+        let labels = match parsed.import_labels(&label, existing_labels) {
+            Ok(labels) => labels,
+            Err(message) => {
+                if let Some(form) = &mut self.key_form {
+                    form.error = Some(message.to_string());
+                }
+                cx.notify();
+                return;
+            }
+        };
+        let endpoint = match parsed.api_region() {
+            Ok(api_region) => catalog::kiro_endpoint(api_region),
+            Err(error) => {
+                if let Some(form) = &mut self.key_form {
+                    form.error = Some(error.to_string());
+                }
+                cx.notify();
+                return;
+            }
         };
         let max_concurrency = form.max_concurrency.read(cx).value();
         let max_concurrency = match Self::parse_concurrency(&max_concurrency) {
@@ -1008,66 +1124,150 @@ impl ProvidersPage {
                 return;
             }
         };
-        let form_generation = import.generation;
-        let endpoint = catalog::kiro_endpoint(&oauth.region);
-        if let Some(import) = self
-            .key_form
-            .as_mut()
-            .and_then(|form| form.kiro_import.as_mut())
-        {
-            import
-                .raw_json
-                .update(cx, |input, cx| input.set_value("", window, cx));
-            import.parsed = None;
-            import.parsed_raw_json = None;
+        // A group deleted since the page loaded would fail every item with
+        // the same 400; refuse the batch up front instead.
+        if !import.selected_groups.is_empty() {
+            let live = match &self.state {
+                LoadState::Loaded(data) => data.groups.as_slice(),
+                LoadState::Loading | LoadState::Failed(_) => &[],
+            };
+            let existing = groups::retain_existing(&import.selected_groups, live);
+            if existing.len() != import.selected_groups.len() {
+                if let Some(form) = &mut self.key_form {
+                    form.error = Some("所选分组已被删除，请刷新后重新选择".to_string());
+                }
+                cx.notify();
+                return;
+            }
         }
+        let group_ids: Option<Arc<[i64]>> = if import.selected_groups.is_empty() {
+            None
+        } else {
+            Some(Arc::from(import.selected_groups.as_slice()))
+        };
+        let form_generation = import.generation;
+        let jobs: Vec<(String, kiro_import::ImportItem)> =
+            labels.into_iter().zip(parsed.into_import_items()).collect();
+        let total = jobs.len();
         if let Some(form) = &mut self.key_form {
+            if let Some(import) = &mut form.kiro_import {
+                import
+                    .raw_json
+                    .update(cx, |input, cx| input.set_value("", window, cx));
+                import.parsed = None;
+                import.parsed_raw_json = None;
+                import.progress = Some(ImportProgress {
+                    done: 0,
+                    total,
+                    failures: Vec::new(),
+                });
+            }
             form.saving = true;
             form.error = None;
         }
         cx.notify();
+        let (progress_tx, mut progress_rx) = tokio::sync::mpsc::unbounded_channel::<()>();
         let call = cx
             .global::<GatewayRuntime>()
             .admin_call(move |admin| async move {
-                import_kiro(
-                    &admin,
+                import_kiro_accounts(
+                    admin,
                     &provider_name,
                     &endpoint,
-                    &label,
-                    &oauth,
+                    jobs,
+                    group_ids,
                     max_concurrency,
+                    progress_tx,
                 )
                 .await
             });
+        // Every finished account ticks the counter; the loop ends once the
+        // import (and with it every sender) is gone.
+        cx.spawn(async move |this, cx| {
+            while progress_rx.recv().await.is_some() {
+                let ticked = this.update(cx, |page, cx| {
+                    if let Some(progress) = page
+                        .kiro_import_mut(form_generation)
+                        .and_then(|import| import.progress.as_mut())
+                    {
+                        progress.done = (progress.done + 1).min(progress.total);
+                        cx.notify();
+                    }
+                });
+                if ticked.is_err() {
+                    break;
+                }
+            }
+        })
+        .detach();
         cx.spawn(async move |this, cx| {
             let result = call.await;
             this.update(cx, |page, cx| {
-                let Some(form) = &mut page.key_form else {
-                    return;
-                };
-                let Some(import) = &form.kiro_import else {
-                    return;
-                };
-                if import.generation != form_generation {
-                    return;
-                }
-                match result {
-                    Ok(()) => {
-                        page.key_form = None;
-                        page.action_error = None;
-                        page.reload(cx);
-                        page.refresh_quotas(cx);
-                    }
-                    Err(error) => {
-                        form.saving = false;
-                        form.error = Some(error);
-                        cx.notify();
-                    }
-                }
+                page.finish_kiro_import(form_generation, result, cx)
             })
             .ok();
         })
         .detach();
+    }
+
+    /// The open Kiro import form, if it is still the one `generation` names.
+    fn kiro_import_mut(&mut self, generation: u64) -> Option<&mut KiroImportForm> {
+        self.key_form
+            .as_mut()?
+            .kiro_import
+            .as_mut()
+            .filter(|import| import.generation == generation)
+    }
+
+    /// Land a finished import run: a clean run closes the form; failures keep
+    /// it open with the per-label failure lines. Any imported account
+    /// triggers a reload and a quota probe, even when the form that started
+    /// the run is gone — only the form update is skipped then.
+    fn finish_kiro_import(
+        &mut self,
+        generation: u64,
+        result: Result<ImportOutcome, String>,
+        cx: &mut Context<Self>,
+    ) {
+        let imported_any = result
+            .as_ref()
+            .is_ok_and(|outcome| outcome.failures.len() < outcome.total);
+        if imported_any {
+            self.reload(cx);
+            self.refresh_quotas(cx);
+        }
+        if self.kiro_import_mut(generation).is_some() {
+            match result {
+                Ok(outcome) if outcome.failures.is_empty() => {
+                    self.key_form = None;
+                    self.action_error = None;
+                }
+                Ok(outcome) => {
+                    if let Some(form) = &mut self.key_form {
+                        form.saving = false;
+                        form.error = outcome.cleanup_error;
+                        let progress = form
+                            .kiro_import
+                            .as_mut()
+                            .and_then(|import| import.progress.as_mut());
+                        if let Some(progress) = progress {
+                            progress.done = progress.total;
+                            progress.failures = outcome.failures;
+                        }
+                    }
+                }
+                Err(error) => {
+                    if let Some(form) = &mut self.key_form {
+                        form.saving = false;
+                        form.error = Some(error);
+                        if let Some(import) = &mut form.kiro_import {
+                            import.progress = None;
+                        }
+                    }
+                }
+            }
+        }
+        cx.notify();
     }
 
     /// 获取模型 (add form): probe the typed credential against the chosen
@@ -1186,6 +1386,16 @@ impl ProvidersPage {
     fn toggle_editor_group(&mut self, group_id: i64, cx: &mut Context<Self>) {
         if let Some(editor) = self.key_editor.as_mut().filter(|editor| !editor.saving) {
             toggle_selection(&mut editor.selected_groups, &group_id);
+        }
+        cx.notify();
+    }
+
+    /// Toggle one group chip in the Kiro import's membership selection.
+    fn toggle_import_group(&mut self, group_id: i64, cx: &mut Context<Self>) {
+        if let Some(form) = self.key_form.as_mut().filter(|form| !form.saving)
+            && let Some(import) = &mut form.kiro_import
+        {
+            toggle_selection(&mut import.selected_groups, &group_id);
         }
         cx.notify();
     }
@@ -1704,31 +1914,93 @@ fn import_error(
     gateway::http_client::ClientError::Decode(message)
 }
 
-async fn import_kiro(
-    admin: &GatewayHttpClient,
+/// Per-account failure text: well-known gateway errors in Chinese, anything
+/// else verbatim.
+fn import_failure_message(error: &str) -> String {
+    if error.contains("unknown group id") {
+        "分组不存在".to_string()
+    } else {
+        error.to_string()
+    }
+}
+
+/// Import `jobs` (label + account) under one find-or-created Kiro provider,
+/// at most [`KIRO_IMPORT_CONCURRENCY`] at a time, sending one tick per
+/// finished account. Per-account failures are collected, not fatal; when
+/// this run created the provider and every account failed, the empty row is
+/// removed again. Only the provider lookup itself fails the whole run.
+async fn import_kiro_accounts(
+    admin: GatewayHttpClient,
     provider_name: &str,
     endpoint: &str,
-    label: &str,
-    oauth: &KiroOAuth,
+    jobs: Vec<(String, kiro_import::ImportItem)>,
+    group_ids: Option<Arc<[i64]>>,
     max_concurrency: Option<Option<i32>>,
-) -> Result<(), gateway::http_client::ClientError> {
+    progress: tokio::sync::mpsc::UnboundedSender<()>,
+) -> Result<ImportOutcome, gateway::http_client::ClientError> {
     let (provider_id, provider_created) = admin
         .find_or_create_kiro_provider(provider_name, endpoint)
         .await?;
-    match admin
-        .upsert_kiro_key(provider_id, label, oauth, max_concurrency)
-        .await
-    {
-        Ok(_) => Ok(()),
-        Err(error) => {
-            let cleanup_error = if provider_created {
-                cleanup_new_resources(admin, provider_id, None, true, "导入 Kiro key 失败").await
-            } else {
-                None
-            };
-            Err(import_error("导入 Kiro key 失败", error, cleanup_error))
+    let total = jobs.len();
+    let limit = Arc::new(tokio::sync::Semaphore::new(KIRO_IMPORT_CONCURRENCY));
+    let mut tasks = tokio::task::JoinSet::new();
+    // Labels live here, keyed by task, so even a panicked task's failure
+    // line names its account.
+    let mut labels: HashMap<tokio::task::Id, String> = HashMap::with_capacity(total);
+    for (label, item) in jobs {
+        let admin = admin.clone();
+        let limit = Arc::clone(&limit);
+        let group_ids = group_ids.clone();
+        let progress = progress.clone();
+        let task_label = label.clone();
+        let handle = tasks.spawn(async move {
+            let _permit = limit
+                .acquire_owned()
+                .await
+                .expect("import semaphore is never closed");
+            let result = admin
+                .import_kiro(
+                    provider_id,
+                    &task_label,
+                    &item.credentials,
+                    group_ids.as_deref(),
+                    max_concurrency,
+                )
+                .await;
+            // A closed receiver only means nobody watches the counter.
+            let _ = progress.send(());
+            result
+                .err()
+                .map(|error| import_failure_message(&error.to_string()))
+        });
+        labels.insert(handle.id(), label);
+    }
+    drop(progress);
+    let mut failures: Vec<(String, String)> = Vec::new();
+    while let Some(joined) = tasks.join_next_with_id().await {
+        match joined {
+            Ok((_, None)) => {}
+            Ok((id, Some(error))) => {
+                let label = labels.remove(&id).unwrap_or_default();
+                failures.push((label, error));
+            }
+            Err(error) => {
+                let label = labels.remove(&error.id()).unwrap_or_default();
+                failures.push((label, format!("导入任务异常：{error}")));
+            }
         }
     }
+    failures.sort();
+    let cleanup_error = if provider_created && failures.len() == total {
+        cleanup_new_resources(&admin, provider_id, None, true, "Kiro 账号全部导入失败").await
+    } else {
+        None
+    };
+    Ok(ImportOutcome {
+        total,
+        failures,
+        cleanup_error,
+    })
 }
 
 impl crate::pages::ActionPage for ProvidersPage {

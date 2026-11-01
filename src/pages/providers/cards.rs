@@ -29,6 +29,7 @@ use super::catalog::{
 };
 use super::chip::selectable_chip;
 use super::groups::{group_chips, group_tags};
+use super::kiro_import;
 use super::quota::quota_row;
 use super::{
     FormSource, KeyCardData, KeyDrag, KeyEditor, KeyForm, KiroImportForm, ProvidersPage, reordered,
@@ -415,11 +416,7 @@ impl ProvidersPage {
                     )
                     .child(
                         Button::new("key-form-save")
-                            .label(if form.saving {
-                                "验证中…"
-                            } else {
-                                "保存"
-                            })
+                            .label(save_label(form))
                             .primary()
                             .compact()
                             .loading(form.saving)
@@ -436,23 +433,10 @@ impl ProvidersPage {
         saving: bool,
         cx: &mut Context<Self>,
     ) -> Div {
-        let summaries: Vec<_> = import
-            .parsed
-            .as_ref()
-            .map(|parsed| {
-                parsed
-                    .summaries()
-                    .map(|summary| {
-                        (
-                            summary.index,
-                            summary.region,
-                            summary.expires_at,
-                            summary.has_profile_arn,
-                        )
-                    })
-                    .collect()
-            })
-            .unwrap_or_default();
+        let (existing_keys, groups): (&[KeyCardData], &[KeyGroupView]) = match &self.state {
+            LoadState::Loaded(data) => (&data.keys, &data.groups),
+            LoadState::Loading | LoadState::Failed(_) => (&[], &[]),
+        };
         let mut fields = gpui::div().flex().flex_col().gap_2();
         fields = fields.child(
             gpui::div()
@@ -479,6 +463,27 @@ impl ProvidersPage {
             Some(96.),
             cx,
         ));
+        fields = fields
+            .child(
+                gpui::div()
+                    .flex()
+                    .items_center()
+                    .gap_2()
+                    .child(field_label("分组", cx))
+                    .child(
+                        gpui::div()
+                            .text_size(px(12.))
+                            .text_color(cx.theme().muted_foreground)
+                            .child("不选 = 不属于任何分组"),
+                    ),
+            )
+            .child(group_chips(
+                &import.selected_groups,
+                groups,
+                "kiro-import-group",
+                ProvidersPage::toggle_import_group,
+                cx,
+            ));
         fields = fields.child(
             gpui::div()
                 .flex()
@@ -514,48 +519,71 @@ impl ProvidersPage {
                         .child("解析失败不会发起网络请求"),
                 ),
         );
-        if !summaries.is_empty() {
-            fields = fields.child(gpui::div().flex().flex_col().gap_1().children(
-                summaries.iter().map(|summary| {
-                    let &(index, ref region, expires_at, has_profile_arn) = summary;
-                    let selected = index == import.selected_account;
-                    let endpoint = super::catalog::kiro_endpoint(region);
+        if let Some(parsed) = &import.parsed {
+            let count = parsed.account_count();
+            if count > 1 {
+                // A batch: the label field is a prefix; preview the numbering
+                // against every loaded key label (render-time, nothing cached).
+                let prefix = import.key_label.read(cx).value();
+                let prefix = prefix.trim();
+                let preview = if prefix.is_empty() {
+                    format!("将导入 {count} 个账号（请填写 label 前缀）")
+                } else {
+                    let existing = existing_keys.iter().map(|card| card.key.label.as_str());
+                    match kiro_import::label_span(prefix, existing, count) {
+                        Some((first, last)) => format!("将导入 {count} 个账号：{first} … {last}"),
+                        None => format!("将导入 {count} 个账号"),
+                    }
+                };
+                fields = fields.child(
                     gpui::div()
-                        .id(("kiro-account", index))
+                        .text_size(px(12.))
+                        .text_color(cx.theme().muted_foreground)
+                        .child(preview),
+                );
+            } else {
+                fields = fields.children(parsed.summaries().map(|summary| {
+                    gpui::div()
                         .flex()
                         .flex_col()
                         .gap_1()
                         .p_2()
                         .border_1()
-                        .border_color(if selected {
-                            cx.theme().primary
-                        } else {
-                            cx.theme().border
-                        })
-                        .when(selected, |this| this.bg(cx.theme().accent))
-                        .cursor_pointer()
-                        .on_click(cx.listener(move |this, _, _, cx| {
-                            if let Some(form) = &mut this.key_form
-                                && !form.saving
-                                && let Some(import) = &mut form.kiro_import
-                            {
-                                import.selected_account = index;
-                            }
-                            cx.notify();
-                        }))
+                        .border_color(cx.theme().border)
                         .child(format!(
-                            "账号 {} · region {} · expires_at {}",
-                            index + 1,
-                            region,
-                            expires_at
+                            "region {} · API region {} · expires_at {}",
+                            summary.region, summary.api_region, summary.expires_at
                         ))
                         .child(format!(
                             "endpoint {} · profile ARN {}",
-                            endpoint,
-                            if has_profile_arn { "存在" } else { "缺失" }
+                            super::catalog::kiro_endpoint(summary.api_region),
+                            if summary.has_profile_arn {
+                                "存在"
+                            } else {
+                                "缺失"
+                            }
                         ))
-                }),
-            ));
+                }));
+            }
+        }
+        if let Some(progress) = import.progress.as_ref().filter(|_| !saving) {
+            let failed = progress.failures.len();
+            fields = fields.child(
+                gpui::div()
+                    .flex()
+                    .flex_col()
+                    .gap_1()
+                    .child(format!(
+                        "导入完成：成功 {}，失败 {failed}",
+                        progress.total - failed
+                    ))
+                    .children(
+                        progress
+                            .failures
+                            .iter()
+                            .map(|(label, error)| inline_error(&format!("{label}: {error}"), cx)),
+                    ),
+            );
         }
         fields
     }
@@ -1078,7 +1106,13 @@ impl ProvidersPage {
                             .child("不选 = 不属于任何分组"),
                     ),
             )
-            .child(group_chips(&editor.selected_groups, groups, cx))
+            .child(group_chips(
+                &editor.selected_groups,
+                groups,
+                "key-editor-group",
+                ProvidersPage::toggle_editor_group,
+                cx,
+            ))
             // 模型白名单：chips 来自探测快照，「重新获取」刷新；不选 = 全部模型。
             .child(
                 gpui::div()
@@ -1350,6 +1384,20 @@ fn letter_tile(letter: &str, height: f32, cx: &App) -> Div {
         .font_weight(gpui::FontWeight::MEDIUM)
         .text_color(cx.theme().muted_foreground)
         .child(letter.to_string())
+}
+
+/// The add form's save button text: the Kiro import counts its accounts
+/// while running.
+fn save_label(form: &KeyForm) -> String {
+    let progress = form
+        .kiro_import
+        .as_ref()
+        .and_then(|import| import.progress.as_ref());
+    match progress {
+        Some(progress) if form.saving => format!("导入中 {}/{}", progress.done, progress.total),
+        _ if form.saving => "验证中…".to_string(),
+        _ => "保存".to_string(),
+    }
 }
 
 /// Small fixed-width field label used by the form cards.
