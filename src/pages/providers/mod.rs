@@ -618,6 +618,63 @@ impl ProvidersPage {
         }
     }
 
+    /// Whether the key is archived as the page last loaded it (`None` if
+    /// unknown). Read at click time like [`Self::key_enabled`].
+    fn key_archived(&self, provider_id: i64, key_id: i64) -> Option<bool> {
+        match &self.state {
+            LoadState::Loaded(data) => data
+                .keys
+                .iter()
+                .find(|c| c.provider.id == provider_id && c.key.id == key_id)
+                .map(|c| c.key.archived_at.is_some()),
+            _ => None,
+        }
+    }
+
+    /// Archive or unarchive one key. Same success/failure handling as
+    /// [`Self::write`]; an unarchive additionally probes quotas, because the
+    /// gateway skipped the key while it was archived and its reading is stale.
+    fn set_key_archived(
+        &mut self,
+        provider_id: i64,
+        key_id: i64,
+        archived: bool,
+        cx: &mut Context<Self>,
+    ) {
+        let call = cx
+            .global::<GatewayRuntime>()
+            .admin_call(move |admin| async move {
+                admin
+                    .update_key(
+                        provider_id,
+                        key_id,
+                        &KeyUpdate {
+                            archived: Some(archived),
+                            ..Default::default()
+                        },
+                    )
+                    .await
+            });
+        cx.spawn(async move |this, cx| {
+            let result = call.await;
+            this.update(cx, |page, cx| match result {
+                Ok(()) => {
+                    page.action_error = None;
+                    page.reload(cx);
+                    if !archived {
+                        page.refresh_quotas(cx);
+                    }
+                }
+                Err(error) => {
+                    page.action_error = Some(error);
+                    cx.notify();
+                }
+            })
+            .ok();
+        })
+        .detach();
+    }
+
     /// Open the add-key form, defaulting to the first catalog provider.
     fn open_key_form(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         self.form_generation = self.form_generation.wrapping_add(1);
@@ -1708,7 +1765,12 @@ impl Render for ProvidersPage {
             LoadState::Loaded(data) => {
                 // Derived per render from the loaded groups: nothing cached.
                 let filter = self.group_filter.effective(&data.groups);
-                let visibility = Visibility::new(filter, &data.groups);
+                let archived = data
+                    .keys
+                    .iter()
+                    .filter(|card| card.key.archived_at.is_some())
+                    .map(|card| card.key.id);
+                let visibility = Visibility::new(filter, &data.groups, archived);
                 let any_visible = data.keys.iter().any(|card| visibility.admits(card.key.id));
                 frame
                     .when_some(self.action_error.as_ref(), |this, error| {

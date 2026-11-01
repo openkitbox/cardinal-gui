@@ -25,6 +25,8 @@ pub(super) enum GroupFilter {
     All,
     Ungrouped,
     Named(i64),
+    /// Archived accounts only; every other filter hides them.
+    Archived,
 }
 
 impl GroupFilter {
@@ -44,22 +46,30 @@ impl GroupFilter {
             Self::All => ("尚无账号", "点击「+ 添加账号」添加第一个上游账号。"),
             Self::Ungrouped => ("没有未分组的账号", "所有账号都已归入至少一个分组。"),
             Self::Named(_) => ("该分组暂无账号", "在账号的编辑面板里勾选分组。"),
+            Self::Archived => ("没有已归档的账号", "在账号卡片的 ⋯ 菜单里选择「归档」。"),
         }
     }
 }
 
-/// A filter resolved against the current groups: the set of account ids the
-/// filter keys on, copied out of the groups (ids are `Copy`, so it holds no
-/// borrow). Built per render.
+/// A filter resolved against the current groups and accounts: the set of
+/// account ids the filter keys on, copied out of the groups, plus the ids of
+/// the archived accounts (ids are `Copy`, so it holds no borrow). Built per
+/// render.
 pub(super) struct Visibility {
     filter: GroupFilter,
     members: HashSet<i64>,
+    archived: HashSet<i64>,
 }
 
 impl Visibility {
-    pub(super) fn new(filter: GroupFilter, groups: &[KeyGroupView]) -> Self {
+    /// `archived` yields the ids of the archived accounts.
+    pub(super) fn new(
+        filter: GroupFilter,
+        groups: &[KeyGroupView],
+        archived: impl Iterator<Item = i64>,
+    ) -> Self {
         let members = match filter {
-            GroupFilter::All => HashSet::new(),
+            GroupFilter::All | GroupFilter::Archived => HashSet::new(),
             GroupFilter::Ungrouped => groups
                 .iter()
                 .flat_map(|group| group.key_ids.iter().copied())
@@ -70,12 +80,20 @@ impl Visibility {
                 .flat_map(|group| group.key_ids.iter().copied())
                 .collect(),
         };
-        Self { filter, members }
+        Self {
+            filter,
+            members,
+            archived: archived.collect(),
+        }
     }
 
-    /// Whether the account's card is shown.
+    /// Whether the account's card is shown. An archived account shows only
+    /// under [`GroupFilter::Archived`], which shows nothing else.
     pub(super) fn admits(&self, key_id: i64) -> bool {
+        let archived = self.archived.contains(&key_id);
         match self.filter {
+            GroupFilter::Archived => archived,
+            _ if archived => false,
             GroupFilter::All => true,
             GroupFilter::Ungrouped => !self.members.contains(&key_id),
             GroupFilter::Named(_) => self.members.contains(&key_id),
@@ -83,16 +101,27 @@ impl Visibility {
     }
 }
 
-/// Dropdown counts: accounts in total, accounts in no group, and per group
-/// (same order as `groups`) the members that still exist in the account list.
+/// Dropdown counts over the unarchived accounts: in total, in no group, and
+/// per group (same order as `groups`) the members that still exist in the
+/// account list; plus the number of archived accounts.
 pub(super) struct Counts {
     pub(super) all: usize,
     pub(super) ungrouped: usize,
     pub(super) per_group: Vec<usize>,
+    pub(super) archived: usize,
 }
 
-pub(super) fn counts(key_ids: impl Iterator<Item = i64>, groups: &[KeyGroupView]) -> Counts {
-    let existing: HashSet<i64> = key_ids.collect();
+/// `keys` yields each account's id and whether it is archived.
+pub(super) fn counts(keys: impl Iterator<Item = (i64, bool)>, groups: &[KeyGroupView]) -> Counts {
+    let mut existing: HashSet<i64> = HashSet::new();
+    let mut archived = 0;
+    for (id, is_archived) in keys {
+        if is_archived {
+            archived += 1;
+        } else {
+            existing.insert(id);
+        }
+    }
     let mut grouped: HashSet<i64> = HashSet::new();
     let mut per_group = Vec::with_capacity(groups.len());
     for group in groups {
@@ -107,6 +136,7 @@ pub(super) fn counts(key_ids: impl Iterator<Item = i64>, groups: &[KeyGroupView]
         all: existing.len(),
         ungrouped: existing.len() - grouped.len(),
         per_group,
+        archived,
     }
 }
 
@@ -217,6 +247,7 @@ impl ProvidersPage {
                 .iter()
                 .find(|group| group.id == id)
                 .map_or("全部", |group| group.name.as_str()),
+            GroupFilter::Archived => "归档",
         };
         let trigger = Button::new("providers-group-filter")
             .label(current)
@@ -229,7 +260,11 @@ impl ProvidersPage {
         if !self.group_list_open {
             return trigger.into_any_element();
         }
-        let counts = counts(data.keys.iter().map(|card| card.key.id), &data.groups);
+        let keys = data
+            .keys
+            .iter()
+            .map(|card| (card.key.id, card.key.archived_at.is_some()));
+        let counts = counts(keys, &data.groups);
         let mut options = gpui::div()
             .id("providers-group-list")
             .flex()
@@ -268,6 +303,14 @@ impl ProvidersPage {
             ));
         }
         options = options
+            .child(separator(cx))
+            .child(self.filter_option(
+                "providers-group-archived",
+                filter,
+                GroupFilter::Archived,
+                format!("归档 ({})", counts.archived),
+                cx,
+            ))
             .child(separator(cx))
             .child(
                 action_option("providers-group-create", "＋", "新建分组", cx).on_click(

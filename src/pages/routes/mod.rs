@@ -83,9 +83,11 @@ struct RouteKey {
     provider_name: String,
     label: String,
     position: i32,
-    /// Manually disabled on the accounts page — the stage marks the entry
-    /// (dispatch skips disabled keys just like cooled ones).
-    enabled: bool,
+    /// False when disabled or archived on the accounts page — the stage marks
+    /// the entry (dispatch skips such keys just like cooled ones).
+    active: bool,
+    /// Archived on the accounts page: the picker no longer offers the account.
+    archived: bool,
     /// The key's model whitelist (None/empty = unrestricted). The picker hides
     /// chips outside it — a route can only reference models the account serves.
     allowed_models: Option<Vec<String>>,
@@ -129,7 +131,8 @@ impl RoutesData {
                     provider_name: (*provider_name).to_string(),
                     label: key.label.clone(),
                     position: key.position,
-                    enabled: key.enabled,
+                    active: key.enabled && key.archived_at.is_none(),
+                    archived: key.archived_at.is_some(),
                     allowed_models: key.allowed_models.clone(),
                 })
             })
@@ -1655,7 +1658,7 @@ impl RoutesPage {
             })
     }
 
-    /// The inline account dropdown of one picker row: every enabled account,
+    /// The inline account dropdown of one picker row: every unarchived account,
     /// one clickable line each. Choosing one closes the list and fetches models.
     /// The id is needed for scrollability, so this returns a Stateful Div.
     fn account_list(
@@ -1676,7 +1679,8 @@ impl RoutesPage {
                 "picker-account-list-{row_index}"
             ))))
             .overflow_y_scroll();
-        if data.keys.is_empty() {
+        let mut offered = data.keys.iter().filter(|key| !key.archived).peekable();
+        if offered.peek().is_none() {
             list = list.child(
                 gpui::div()
                     .p_2()
@@ -1685,7 +1689,7 @@ impl RoutesPage {
                     .child("没有账号——先在账号页添加"),
             );
         }
-        for key in &data.keys {
+        for key in offered {
             let key_id = key.id;
             list = list.child(
                 gpui::div()

@@ -301,7 +301,11 @@ impl ProvidersPage {
         data: &ProvidersData,
         cx: &mut Context<Self>,
     ) -> Div {
-        let member_counts = counts(data.keys.iter().map(|card| card.key.id), &data.groups);
+        let keys = data
+            .keys
+            .iter()
+            .map(|card| (card.key.id, card.key.archived_at.is_some()));
+        let member_counts = counts(keys, &data.groups);
         let mut body = card(cx).child(
             gpui::div()
                 .flex()

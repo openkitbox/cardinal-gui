@@ -481,7 +481,7 @@ impl RoutesPage {
                                 .keys
                                 .iter()
                                 .find(|key| key.id == entry.key_id)
-                                .is_some_and(|key| !key.enabled),
+                                .is_some_and(|key| !key.active),
                             last_success: data
                                 .success
                                 .iter()

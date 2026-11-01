@@ -585,6 +585,7 @@ impl ProvidersPage {
         let provider_id = provider.id;
         let key_id = key.id;
         let enabled = key.enabled;
+        let archived = key.archived_at.is_some();
         let label = key.label.clone();
         let edit_key = key.clone();
         let spec = spec_for(&provider.name);
@@ -658,7 +659,7 @@ impl ProvidersPage {
       })
       .relative()
       .w(px(KEY_CARD_WIDTH))
-      .when(!key.enabled || !provider.enabled, |this| this.opacity(0.6))
+      .when(!key.enabled || !provider.enabled || archived, |this| this.opacity(0.6))
       .when(dim_source, |this| this.opacity(0.4))
       // Insert indicator: a 2px accent line in the gap on the side where the
       // dragged card would land (left = before this card, right = after).
@@ -691,6 +692,19 @@ impl ProvidersPage {
               .text_color(cx.theme().foreground)
               .child(key.label.clone()),
           )
+          .when(archived, |this| {
+            this.child(
+              gpui::div()
+                .flex_none()
+                .rounded_md()
+                .border_1()
+                .px_1p5()
+                .text_size(px(10.))
+                .border_color(cx.theme().accent)
+                .text_color(cx.theme().muted_foreground)
+                .child("已归档"),
+            )
+          })
           // The quota reading's probe age lives on the title row (配额 header
           // row removed — the card is one row shorter).
           .when_some(card_data.quota.as_ref(), |this, quota| {
@@ -755,6 +769,21 @@ impl ProvidersPage {
                       move |_, window, cx| {
                         if let Err(error) = weak.update(cx, |this, cx| this.open_key_editor(provider_id, &edit_key, window, cx)) {
                           eprintln!("card menu edit failed: {error}");
+                        }
+                      }
+                    }))
+                    .item(PopupMenuItem::new(if archived { "移出归档" } else { "归档" }).on_click({
+                      let weak = weak_menu.clone();
+                      move |_, _window, cx| {
+                        // Cached menu entity: read the current state at click time,
+                        // falling back to the captured value (as 启用 does).
+                        let read = weak.read_with(cx, |page, _| page.key_archived(provider_id, key_id));
+                        let target = match read {
+                          Ok(Some(current)) => !current,
+                          _ => !archived,
+                        };
+                        if let Err(error) = weak.update(cx, |this, cx| this.set_key_archived(provider_id, key_id, target, cx)) {
+                          eprintln!("card menu archive failed: {error}");
                         }
                       }
                     }))
