@@ -1,19 +1,21 @@
 //! The account cards: add-form, display and edit modes are one card swapping
 //! contents — they share [`KEY_CARD_WIDTH`] (an edit card narrower than the
-//! card it replaced reads as a layout jump). Pure rendering; all behavior
-//! lives in `super` (the page impl).
+//! card it replaced reads as a layout jump). Two display shapes: one card per
+//! account (未分组 / a named group / 归档) and one POOLED card per provider
+//! (全部 / a provider filter), whose pooled numbers come from the `pool`
+//! module. Pure rendering; all behavior lives in `super` (the page impl).
 
 use std::sync::Arc;
 
 use gpui::{
     Anchor, App, AppContext as _, Context, Div, ElementId, Entity, Image, ImageFormat,
-    InteractiveElement, IntoElement, ParentElement, Render, StatefulInteractiveElement, Styled,
-    Window, img, prelude::FluentBuilder as _, px, relative,
+    InteractiveElement, IntoElement, ParentElement, StatefulInteractiveElement, Styled, WeakEntity,
+    img, prelude::FluentBuilder as _, px, relative,
 };
 use gpui_kit::assets::IconName;
 use gpui_kit::component::button::{Button, ButtonVariants};
 use gpui_kit::component::input::{Input, InputState, Textarea};
-use gpui_kit::component::menu::{DropdownMenu, PopupMenuItem};
+use gpui_kit::component::menu::{DropdownMenu, PopupMenu, PopupMenuItem};
 use gpui_kit::component::tag::Tag;
 use gpui_kit::component::{ActiveTheme, Disableable, Icon, Sizable};
 
@@ -30,9 +32,13 @@ use super::catalog::{
 use super::chip::selectable_chip;
 use super::groups::{group_chips, group_tags};
 use super::kiro_import;
+use super::pool;
+use super::pool::PoolAccount;
+use super::pool_card::{pool_counts, pool_quota, pooled_account_row, variant_row};
 use super::quota::quota_row;
 use super::{
-    FormSource, KeyCardData, KeyDrag, KeyEditor, KeyForm, KiroImportForm, ProvidersPage, reordered,
+    FormSource, KeyCardData, KeyEditor, KeyForm, KiroImportForm, ProviderGroup, ProvidersData,
+    ProvidersPage,
 };
 use crate::app::StatusTip;
 use crate::fmt::mask_api_key;
@@ -588,17 +594,15 @@ impl ProvidersPage {
         fields
     }
 
-    /// One key card: provider logo + label header, quota meters, model rows,
-    /// status tags and row actions. `rests` are the key's active cooldowns (health info):
-    /// one tag per row — a whole-key row or a per-model row — showing the
-    /// recovery time, with a shared clear action. Dragging starts only from the
-    /// grip dots in the top-left corner; the whole card stays a drop target —
-    /// dropping on the left/right half of another card inserts before/after it.
+    /// One per-account key card: provider logo + label header, quota meters,
+    /// model rows, status tags and row actions. `rests` are the key's active
+    /// cooldowns (health info): one tag per row with a shared clear action.
     pub(super) fn key_card(
         &self,
         card_data: &KeyCardData,
         rests: &[RestRow],
         groups: &[KeyGroupView],
+        now: chrono::DateTime<chrono::Utc>,
         cx: &mut Context<Self>,
     ) -> Div {
         let provider = &card_data.provider;
@@ -610,336 +614,148 @@ impl ProvidersPage {
         {
             return self.key_editor_card(editor, card_data, groups, cx);
         }
-        let provider_id = provider.id;
         let key_id = key.id;
-        let enabled = key.enabled;
         let archived = key.archived_at.is_some();
-        let label = key.label.clone();
-        let edit_key = key.clone();
         let spec = spec_for(&provider.name);
-
-        // Drag-and-drop wiring: this card is both a drag source and a drop target.
-        let weak = cx.weak_entity();
-        let weak_drag = weak.clone();
-        let weak_move = weak.clone();
-        let weak_menu = weak.clone();
-        let drag_label = key.label.clone();
-        let (is_drag_source, insert_after) = match &self.drag {
-            Some(drag) => (
-                drag.dragged == key_id,
-                match drag.target {
-                    Some((target, after)) if target == key_id && drag.dragged != key_id => {
-                        Some(after)
-                    }
-                    _ => None,
-                },
-            ),
-            None => (false, None),
-        };
-        // Drag visuals only apply while a drag is actually active (gpui-fast is
-        // retained-mode: this also keeps a stale leftover from sticking around).
-        let active = cx.has_active_drag();
-        let dim_source = active && is_drag_source;
-        let insert_after = insert_after.filter(|_| active);
-
+        let rests = live_rests(rests, now);
         card(cx)
-      .group("key-card")
-      .on_drag_move::<DraggedKey>(move |event, _window, cx| {
-        // The drag *origin* card's move listener fires wherever the pointer is
-        // ("as long as the drag started on this element"); only a card whose
-        // bounds actually contain the pointer may claim target status.
-        if !event.bounds.contains(&event.event.position) {
-          return;
-        }
-        let after = event.event.position.x >= event.bounds.center().x;
-        weak_move
-          .update(cx, |this, cx| {
-            let dragged = this.drag.as_ref().map(|drag| drag.dragged).unwrap_or_default();
-            let target = Some((key_id, after));
-            if this.drag.as_ref().map(|drag| drag.target) != Some(target) {
-              this.drag = Some(KeyDrag { dragged, target });
-              cx.notify();
-            }
-          })
-          .ok();
-      })
-      .on_drop::<DraggedKey>(move |dropped, _window, cx| {
-        weak
-          .update(cx, |this, cx| {
-            let Some(drag) = this.drag.take() else { return };
-            let Some((target, after)) = drag.target else {
-              cx.notify();
-              return;
-            };
-            let LoadState::Loaded(data) = &this.state else {
-              cx.notify();
-              return;
-            };
-            let ids: Vec<i64> = data.keys.iter().map(|card| card.key.id).collect();
-            let order = reordered(&ids, dropped.id, target, after);
-            if order == ids {
-              cx.notify(); // dropped on itself: clear the drag visuals
-              return;
-            }
-            this.write(cx, move |admin| async move { admin.reorder_keys(&order).await });
-          })
-          .ok();
-      })
-      .relative()
-      .w(px(KEY_CARD_WIDTH))
-      .when(!key.enabled || !provider.enabled, |this| this.opacity(0.6))
-      .when(dim_source, |this| this.opacity(0.4))
-      // Insert indicator: a 2px accent line in the gap on the side where the
-      // dragged card would land (left = before this card, right = after).
-      .when_some(insert_after, |this, after| {
-        this.child(
-          gpui::div()
-            .absolute()
-            .top_0()
-            .bottom_0()
-            .w(px(2.))
-            .bg(cx.theme().primary)
-            .when(after, |this| this.right(px(-11.)))
-            .when(!after, |this| this.left(px(-11.))),
-        )
-      })
-      // Header: provider icon, key label, probe age, and the ⋯ menu holding
-      // enable/edit/delete. The logo's position is fixed — the drag grip
-      // lives in the card padding, left of it.
-      .child(
-        gpui::div()
-          .flex()
-          .items_center()
-          .gap_2()
-          .child(provider_icon_for(provider, spec, 18., cx))
-          .child(
-            gpui::div()
-              .flex_1()
-              .overflow_hidden()
-              .font_weight(gpui::FontWeight::MEDIUM)
-              .text_color(cx.theme().foreground)
-              .child(key.label.clone()),
-          )
-          .when(archived, |this| {
-            this.child(
-              gpui::div()
-                .flex_none()
-                .rounded_md()
-                .border_1()
-                .px_1p5()
-                .text_size(px(10.))
-                .border_color(cx.theme().accent)
-                .text_color(cx.theme().muted_foreground)
-                .child("已归档"),
+            .w(px(KEY_CARD_WIDTH))
+            .when(!key.enabled || !provider.enabled, |this| this.opacity(0.6))
+            // Header: provider icon, key label, probe age and the ⋯ menu
+            // holding enable/edit/archive/delete.
+            .child(
+                gpui::div()
+                    .flex()
+                    .items_center()
+                    .gap_2()
+                    .child(provider_icon_for(provider, spec, 18., cx))
+                    .child(
+                        gpui::div()
+                            .flex_1()
+                            .overflow_hidden()
+                            .font_weight(gpui::FontWeight::MEDIUM)
+                            .text_color(cx.theme().foreground)
+                            .child(key.label.clone()),
+                    )
+                    .when(archived, |this| this.child(archived_badge(cx)))
+                    // The quota reading's probe age lives on the title row
+                    // (配额 header row removed — the card is one row shorter).
+                    .when_some(card_data.quota.as_ref(), |this, quota| {
+                        this.child(probe_age_label(quota.probed_at, cx))
+                    })
+                    .child(key_menu_button(provider.id, key, cx.weak_entity())),
             )
-          })
-          // The quota reading's probe age lives on the title row (配额 header
-          // row removed — the card is one row shorter).
-          .when_some(card_data.quota.as_ref(), |this, quota| {
-            this.child(
-              gpui::div()
-                .text_size(px(11.))
-                .text_color(cx.theme().muted_foreground)
-                .child(crate::fmt::probe_age(quota.probed_at, chrono::Utc::now())),
+            // Tag row: the groups this account belongs to (derived from
+            // `groups` at render time), then the variant markers (kimi/glm
+            // only): 区域 (国内/国际) + Coding Plan — the variant decides the
+            // anthropic capability, so the card says which entry it sits on.
+            // Display-only; wraps when long; no row when there is no tag.
+            .when_some(tag_row(key_id, provider, groups, cx), |this, row| {
+                this.child(row)
+            })
+            // Quota: one meter per probed window, and/or a balance line. A key
+            // without a reading (unknown vendor, probe never succeeded) renders
+            // neither — the section collapses and the card shrinks.
+            .when_some(card_data.quota.as_ref(), |this, quota| {
+                let mut this = this;
+                if !quota.windows.is_empty() {
+                    this = this.child(quota_row(&quota.windows, quota.probed_at, cx));
+                }
+                if let Some(balance) = &quota.balance {
+                    this = this.child(balance_row(balance, quota.probed_at, cx));
+                }
+                for detail in &quota.details {
+                    this = this.child(
+                        gpui::div()
+                            .text_size(px(12.))
+                            .text_color(cx.theme().muted_foreground)
+                            .child(detail.clone()),
+                    );
+                }
+                this
+            })
+            // Model rows: one line per whitelisted model (see `model_rows`),
+            // pinned to the card's bottom. Cards in a grid row share the
+            // tallest card's height while the quota meters above vary in row
+            // count, so a flex-1 spacer here absorbs the slack — the model
+            // block and footer align across sibling cards (same idiom as the
+            // footer's clear-button spacer).
+            .child(gpui::div().flex_1())
+            .child(model_rows(key, cx))
+            // Footer: cooldown tags + clear action. Without a cooldown an
+            // empty spacer row keeps a grid row's card bottoms even.
+            .map(|this| {
+                if rests.is_empty() {
+                    this.child(gpui::div().pt_1().child(gpui::div().flex_1()))
+                } else {
+                    this.child(rest_tags(key_id, &rests, now, cx))
+                }
+            })
+    }
+
+    /// One provider's pooled card (全部 and per-provider filters): header with
+    /// the provider's account counts, the pooled quota of its available
+    /// accounts, then one compact row per unarchived account. Trend charts,
+    /// model rows and group tags stay on the per-account cards — a pool has no
+    /// single account to chart or tag.
+    pub(super) fn provider_card(
+        &self,
+        group: &ProviderGroup<'_>,
+        data: &ProvidersData,
+        now: chrono::DateTime<chrono::Utc>,
+        cx: &mut Context<Self>,
+    ) -> Div {
+        let provider = group.provider;
+        // An open editor replaces the card it belongs to, as on the
+        // per-account cards.
+        if let Some(editor) = self.key_editor.as_ref()
+            && let Some(card_data) = group.cards.iter().find(|card| card.key.id == editor.key_id)
+        {
+            return self.key_editor_card(editor, card_data, &data.groups, cx);
+        }
+        // The group's cards are the provider's unarchived accounts (the
+        // pooled filters never admit an archived one). An archived account is
+        // in no count and spends nothing, so the pool reads the same as over
+        // every account the provider has (pinned in pool.rs's tests), without
+        // rescanning the whole key list per card.
+        let accounts: Vec<PoolAccount<'_>> =
+            group.cards.iter().copied().map(PoolAccount::from).collect();
+        let pooled = pool::pool(&accounts, now, crate::ui_tz::display_tz());
+        let spec = spec_for(&provider.name);
+        card(cx)
+            .w(px(KEY_CARD_WIDTH))
+            .when(!provider.enabled, |this| this.opacity(0.6))
+            .child(
+                gpui::div()
+                    .flex()
+                    .items_center()
+                    .gap_2()
+                    .child(provider_icon_for(provider, spec, 18., cx))
+                    .child(
+                        gpui::div()
+                            .flex_1()
+                            .overflow_hidden()
+                            .font_weight(gpui::FontWeight::MEDIUM)
+                            .text_color(cx.theme().foreground)
+                            .child(provider.name.clone()),
+                    )
+                    // Dimming alone is easy to miss: say why the pool spends
+                    // nothing.
+                    .when(!provider.enabled, |this| {
+                        this.child(Tag::danger().child("已停用"))
+                    })
+                    .child(pool_counts(pooled.counts, cx)),
             )
-          })
-          .child(
-            Button::new(("key-menu", key_id as u64))
-              .icon(Icon::new(IconName::Ellipsis).small())
-              .ghost()
-              .compact()
-              .dropdown_menu_with_anchor(Anchor::TopRight, {
-                let weak_menu = weak_menu.clone();
-                let log = move |msg: String| {
-                  use std::io::Write as _;
-                  if let Ok(mut file) = std::fs::OpenOptions::new().create(true).append(true).open("/tmp/cardinal/card-menu.log") {
-                    let _ = writeln!(file, "{msg}");
-                  }
-                };
-                move |menu, _, _| {
-                  log(format!("[build] menu provider={provider_id} key={key_id} captured_enabled={enabled}"));
-                  menu
-                    .item(PopupMenuItem::new("启用").checked(enabled).on_click({
-                      let weak = weak_menu.clone();
-                      // listener_for-style plumbing (the library's own pattern):
-                      // the handler carries the window itself, and Entity::update
-                      // never consults the entity→window map — which has no entry
-                      // for this page and made update_in fail with
-                      // "entity has no current window".
-                      move |_, _window, cx| {
-                        // The menu entity is cached between opens, so the captured
-                        // `enabled` can go stale — read the key's current state at
-                        // click time; the captured value is only the fallback.
-                        let read = weak.read_with(cx, |page, _| page.key_enabled(provider_id, key_id));
-                        let target = match read {
-                          Ok(Some(current)) => !current,
-                          _ => !enabled,
-                        };
-                        if let Err(error) = weak.update(cx, |this, cx| {
-                          this.write(cx, move |admin| async move {
-                            admin
-                              .update_key(
-                                provider_id,
-                                key_id,
-                                &KeyUpdate { enabled: Some(target), ..Default::default() },
-                              )
-                              .await
-                          });
-                        }) {
-                          eprintln!("card menu enable failed: {error}");
-                        }
-                      }
-                    }))
-                    .separator()
-                    .item(PopupMenuItem::new("编辑").icon(Icon::new(IconName::Pencil).small()).on_click({
-                      let weak = weak_menu.clone();
-                      let edit_key = edit_key.clone();
-                      move |_, window, cx| {
-                        if let Err(error) = weak.update(cx, |this, cx| this.open_key_editor(provider_id, &edit_key, window, cx)) {
-                          eprintln!("card menu edit failed: {error}");
-                        }
-                      }
-                    }))
-                    .item(PopupMenuItem::new(if archived { "移出归档" } else { "归档" })
-                      .icon(Icon::new(if archived { IconName::ArchiveRestore } else { IconName::Archive }).small())
-                      .on_click({
-                      let weak = weak_menu.clone();
-                      move |_, _window, cx| {
-                        // Cached menu entity: read the current state at click time,
-                        // falling back to the captured value (as 启用 does).
-                        let read = weak.read_with(cx, |page, _| page.key_archived(provider_id, key_id));
-                        let target = match read {
-                          Ok(Some(current)) => !current,
-                          _ => !archived,
-                        };
-                        if let Err(error) = weak.update(cx, |this, cx| this.set_key_archived(provider_id, key_id, target, cx)) {
-                          eprintln!("card menu archive failed: {error}");
-                        }
-                      }
-                    }))
-                    .item(PopupMenuItem::new("删除").icon(Icon::new(IconName::Delete).small()).on_click({
-                      let weak = weak_menu.clone();
-                      let label = label.clone();
-                      move |_, window, cx| {
-                        if let Err(error) =
-                          weak.update(cx, |this, cx| this.confirm_delete_key(provider_id, key_id, label.clone(), window, cx))
-                        {
-                          eprintln!("card menu delete failed: {error}");
-                        }
-                      }
-                    }))
-                }
-              }),
-          ),
-      )
-      // Tag row: the groups this account belongs to (derived from `groups`
-      // at render time), then the variant markers (kimi/glm only):
-      // 区域 (国内/国际) + Coding Plan — the variant decides the anthropic
-      // capability, so the card says which entry it sits on. Display-only;
-      // wraps when long; no row when there is no tag at all.
-      .when_some(tag_row(key_id, provider, groups, cx), |this, row| this.child(row))
-      // Quota: one meter per probed window, and/or a balance line. A key
-      // without a reading (unknown vendor, probe never succeeded) renders
-      // neither — the section collapses and the card shrinks.
-      .when_some(card_data.quota.as_ref(), |this, quota| {
-        let mut this = this;
-        if !quota.windows.is_empty() {
-          this = this.child(quota_row(&quota.windows, quota.probed_at, cx));
-        }
-        if let Some(balance) = &quota.balance {
-          this = this.child(balance_row(balance, quota.probed_at, cx));
-        }
-        for detail in &quota.details {
-          this = this.child(gpui::div().text_size(px(12.)).text_color(cx.theme().muted_foreground).child(detail.clone()));
-        }
-        this
-      })
-      // Model rows: one line per whitelisted model (see `model_rows`), pinned
-      // to the card's bottom. Cards in a grid row share the tallest card's
-      // height while the quota meters above vary in row count, so a flex-1
-      // spacer here absorbs the slack — the model block and footer align
-      // across sibling cards (same idiom as the footer's clear-button spacer).
-      .child(gpui::div().flex_1())
-      .child(model_rows(key, cx))
-      // Footer: status tags + row actions.
-      .child(
-        gpui::div()
-          .flex()
-          .items_center()
-          .gap_1()
-          .pt_1()
-          // One cooldown tag per rest row (whole-key rows omit the model); the
-          // reason and the clear action (which wakes the whole key) appear once.
-          .when(!rests.is_empty(), |this| {
-            let mut this = this;
-            for (index, rest) in rests.iter().enumerate() {
-              // Same calendar day shows just the clock; anything further
-              // (a monthly quota reset, an 8-day cap) must carry the date.
-              let until = rest.rest_until.with_timezone(&crate::ui_tz::display_tz());
-              let today = chrono::Utc::now()
-                .with_timezone(&crate::ui_tz::display_tz())
-                .date_naive();
-              let until = if until.date_naive() == today {
-                until.format("%H:%M").to_string()
-              } else {
-                until.format("%m-%d %H:%M").to_string()
-              };
-              let (tag, tip) = match &rest.model {
-                Some(model) => (format!("冷却 {model} · {until} 恢复"), rest.reason.clone()),
-                None => (format!("冷却 · {until} 恢复"), rest.reason.clone()),
-              };
-              // The reason is not shown inline — a long upstream message (e.g. a
-              // monthly quota notice) would be truncated into noise. It lives on
-              // the tag's tooltip, revealed on hover.
-              let tag_el = match tip {
-                Some(reason) if !reason.is_empty() => {
-                  let reason = reason.clone();
-                  gpui::div()
-                    .id(("rest-tag", index as u64))
-                    .child(Tag::warning().child(tag))
-                    .tooltip(move |_, cx| cx.new(|_| StatusTip { text: reason.clone() }).into())
-                }
-                _ => gpui::div().id(("rest-tag", index as u64)).child(Tag::warning().child(tag)),
-              };
-              this = this.child(tag_el);
-            }
-            // Spacer pushes the clear button to the right edge of the footer row.
-            this.child(gpui::div().flex_1()).child(Button::new(("rest-clear", key_id as u64)).label("清除").ghost().compact().on_click(
-              cx.listener(move |this, _, _, cx| {
-                this.write(cx, move |admin| async move { admin.clear_rest(key_id).await });
-              }),
-            ))
-          })
-          .when(rests.is_empty(), |this| this.child(gpui::div().flex_1())),
-      )
-      // Drag grip (three dots, single column): lives in the card's left
-      // padding, vertically aligned with the header logo — the logo's position
-      // never shifts. Hidden until hovered; the only grab cursor on the card.
-      .child(
-        gpui::div()
-          .id(("key-grip", key_id as u64))
-          .absolute()
-          .top(px(14.))
-          .left(px(3.5))
-          .w(px(12.))
-          .p_1()
-          .opacity(0.)
-          .group_hover("key-card", |this| this.opacity(0.5))
-          .cursor_grab()
-          .on_drag(DraggedKey { id: key_id }, move |_dragged, _offset, _window, cx| {
-            weak_drag
-              .update(cx, |this, cx| {
-                this.drag = Some(KeyDrag { dragged: key_id, target: None });
-                cx.notify();
-              })
-              .ok();
-            cx.new(|_| DragGhost { label: drag_label.clone() })
-          })
-          .flex()
-          .flex_col()
-          .gap(px(3.))
-          .children((0..3).map(|_| gpui::div().w(px(2.)).h(px(2.)).rounded_full().bg(cx.theme().muted_foreground).opacity(0.5))),
-      )
+            .when_some(variant_row(provider, cx), |this, row| this.child(row))
+            .when_some(pool_quota(&pooled, cx), |this, block| this.child(block))
+            .children(group.cards.iter().map(|card_data| {
+                let rests = data
+                    .rests
+                    .get(&card_data.key.id)
+                    .map(Vec::as_slice)
+                    .unwrap_or(&[]);
+                pooled_account_row(card_data, rests, now, cx)
+            }))
     }
 
     /// The card's edit mode: label and model inputs, save/cancel. The
@@ -1241,30 +1057,252 @@ impl ProvidersPage {
     }
 }
 
-/// Drag payload for card reordering (the value carried by an active drag).
-struct DraggedKey {
-    id: i64,
+/// The cooldowns in `rests` still in force at `now`. The gateway drops expired
+/// rows only when it builds the snapshot, and the page keeps rendering that
+/// snapshot, so a cooldown that ended since must not show as resting.
+#[must_use]
+pub(super) fn live_rests(rests: &[RestRow], now: chrono::DateTime<chrono::Utc>) -> Vec<&RestRow> {
+    rests.iter().filter(|rest| rest.rest_until > now).collect()
 }
 
-/// The little chip following the cursor while a card is dragged.
-struct DragGhost {
-    label: String,
-}
-
-impl Render for DragGhost {
-    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        gpui::div()
-            .px_3()
-            .py_1()
-            .rounded_md()
-            .border_1()
-            .border_color(cx.theme().primary)
-            .bg(cx.theme().accent)
-            .text_size(px(12.))
-            .text_color(cx.theme().foreground)
-            .opacity(0.9)
-            .child(self.label.clone())
+/// The cooldown footer: one warning tag per rest row (a whole-key row omits
+/// the model; the reason rides the tag's tooltip rather than the row, where a
+/// long upstream message would be truncated into noise) plus the 清除 action
+/// that wakes the whole key. `rests` are the [`live_rests`] at `now`; callers
+/// render the footer only when there is one.
+pub(super) fn rest_tags(
+    key_id: i64,
+    rests: &[&RestRow],
+    now: chrono::DateTime<chrono::Utc>,
+    cx: &mut Context<ProvidersPage>,
+) -> Div {
+    let mut footer = gpui::div().flex().items_center().gap_1().pt_1();
+    let today = now.with_timezone(&crate::ui_tz::display_tz()).date_naive();
+    for (index, rest) in rests.iter().enumerate() {
+        // Same calendar day shows just the clock; anything further (a monthly
+        // quota reset, an 8-day cap) must carry the date.
+        let until = rest.rest_until.with_timezone(&crate::ui_tz::display_tz());
+        let until = if until.date_naive() == today {
+            until.format("%H:%M").to_string()
+        } else {
+            until.format("%m-%d %H:%M").to_string()
+        };
+        let tag = match &rest.model {
+            Some(model) => format!("冷却 {model} · {until} 恢复"),
+            None => format!("冷却 · {until} 恢复"),
+        };
+        let id: ElementId = ("rest-tag", index as u64).into();
+        let element = match rest.reason.as_ref().filter(|reason| !reason.is_empty()) {
+            Some(reason) => {
+                let reason = reason.clone();
+                gpui::div()
+                    .id(id)
+                    .child(Tag::warning().child(tag))
+                    .tooltip(move |_, cx| {
+                        cx.new(|_| StatusTip {
+                            text: reason.clone(),
+                        })
+                        .into()
+                    })
+            }
+            None => gpui::div().id(id).child(Tag::warning().child(tag)),
+        };
+        footer = footer.child(element);
     }
+    // Spacer pushes the clear button to the right edge of the footer row.
+    footer.child(gpui::div().flex_1()).child(
+        Button::new(("rest-clear", key_id as u64))
+            .label("清除")
+            .ghost()
+            .compact()
+            .on_click(cx.listener(move |this, _, _, cx| {
+                this.write(
+                    cx,
+                    move |admin| async move { admin.clear_rest(key_id).await },
+                );
+            })),
+    )
+}
+
+/// The ⋯ menu button of one account — the per-account card's header and the
+/// pooled card's rows share it. Only the ids and the two flags the items
+/// display are captured (the menu entity is cached between opens and cannot
+/// borrow the card); every click resolves the key through the page.
+pub(super) fn key_menu_button(
+    provider_id: i64,
+    key: &ProviderKeyView,
+    weak: WeakEntity<ProvidersPage>,
+) -> impl IntoElement {
+    let shown = MenuKey {
+        provider_id,
+        key_id: key.id,
+        enabled: key.enabled,
+        archived: key.archived_at.is_some(),
+    };
+    Button::new(("key-menu", key.id as u64))
+        .icon(Icon::new(IconName::Ellipsis).small())
+        .ghost()
+        .compact()
+        .dropdown_menu_with_anchor(Anchor::TopRight, move |menu, _, _| {
+            key_menu(menu, shown, weak.clone())
+        })
+}
+
+/// What the ⋯ menu captures of its account: the ids it acts on and the state
+/// its items show. `Copy`, so a render never clones a key view for a menu.
+#[derive(Clone, Copy)]
+struct MenuKey {
+    provider_id: i64,
+    key_id: i64,
+    enabled: bool,
+    archived: bool,
+}
+
+/// What a toggle item (启用, 归档) writes, from the key's state read back at
+/// click time: the opposite of it, or `None` when there is nothing to write —
+/// the key left the list after the menu was built (`Ok(None)`) or the page is
+/// gone (`Err`). Never falls back to the render-time value, which would write
+/// a stale target for a dead key id.
+#[must_use]
+fn toggle_target<E>(read: Result<Option<bool>, E>) -> Option<bool> {
+    read.ok().flatten().map(|current| !current)
+}
+
+/// The account menu: 启用/停用、编辑、归档/移出归档、删除. The state the items show
+/// is captured at render time; every click resolves the key again through the
+/// page, because the cached menu entity can outlive the snapshot it was built
+/// from, and a key that left the list is a no-op in every item.
+fn key_menu(menu: PopupMenu, shown: MenuKey, weak: WeakEntity<ProvidersPage>) -> PopupMenu {
+    let MenuKey {
+        provider_id,
+        key_id,
+        enabled,
+        archived,
+    } = shown;
+    // Breadcrumb kept from the menu's first debugging round.
+    if let Ok(mut file) = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open("/tmp/cardinal/card-menu.log")
+    {
+        use std::io::Write as _;
+        let _ = writeln!(
+            file,
+            "[build] menu provider={provider_id} key={key_id} captured_enabled={enabled}"
+        );
+    }
+    menu.item(PopupMenuItem::new("启用").checked(enabled).on_click({
+        let weak = weak.clone();
+        // listener_for-style plumbing (the library's own pattern): the handler
+        // carries the window itself, and Entity::update never consults the
+        // entity→window map — which has no entry for this page and made
+        // update_in fail with "entity has no current window".
+        move |_, _window, cx| {
+            // The menu entity is cached between opens, so the captured
+            // `enabled` can go stale — read the key's current state at click
+            // time, and write nothing for a key that left the list.
+            let read = weak.read_with(cx, |page, _| page.key_enabled(provider_id, key_id));
+            let Some(target) = toggle_target(read) else {
+                return;
+            };
+            if let Err(error) = weak.update(cx, |this, cx| {
+                this.write(cx, move |admin| async move {
+                    admin
+                        .update_key(
+                            provider_id,
+                            key_id,
+                            &KeyUpdate {
+                                enabled: Some(target),
+                                ..Default::default()
+                            },
+                        )
+                        .await
+                });
+            }) {
+                eprintln!("card menu enable failed: {error}");
+            }
+        }
+    }))
+    .separator()
+    .item(
+        PopupMenuItem::new("编辑")
+            .icon(Icon::new(IconName::Pencil).small())
+            .on_click({
+                let weak = weak.clone();
+                move |_, window, cx| {
+                    if let Err(error) = weak.update(cx, |this, cx| {
+                        this.open_key_editor(provider_id, key_id, window, cx)
+                    }) {
+                        eprintln!("card menu edit failed: {error}");
+                    }
+                }
+            }),
+    )
+    .item(
+        PopupMenuItem::new(if archived { "移出归档" } else { "归档" })
+            .icon(
+                Icon::new(if archived {
+                    IconName::ArchiveRestore
+                } else {
+                    IconName::Archive
+                })
+                .small(),
+            )
+            .on_click({
+                let weak = weak.clone();
+                move |_, _window, cx| {
+                    // Cached menu entity: read the current state at click time
+                    // and write nothing for a key that left the list (as 启用).
+                    let read = weak.read_with(cx, |page, _| page.key_archived(provider_id, key_id));
+                    let Some(target) = toggle_target(read) else {
+                        return;
+                    };
+                    if let Err(error) = weak.update(cx, |this, cx| {
+                        this.set_key_archived(provider_id, key_id, target, cx)
+                    }) {
+                        eprintln!("card menu archive failed: {error}");
+                    }
+                }
+            }),
+    )
+    .item(
+        PopupMenuItem::new("删除")
+            .icon(Icon::new(IconName::Delete).small())
+            .on_click({
+                let weak = weak.clone();
+                move |_, window, cx| {
+                    if let Err(error) = weak.update(cx, |this, cx| {
+                        // A key that left the list has nothing to delete.
+                        if let Some(label) = this.key_label(provider_id, key_id) {
+                            this.confirm_delete_key(provider_id, key_id, label, window, cx)
+                        }
+                    }) {
+                        eprintln!("card menu delete failed: {error}");
+                    }
+                }
+            }),
+    )
+}
+
+/// The 已归档 marker on an account header.
+fn archived_badge(cx: &App) -> Div {
+    gpui::div()
+        .flex_none()
+        .rounded_md()
+        .border_1()
+        .px_1p5()
+        .text_size(px(10.))
+        .border_color(cx.theme().accent)
+        .text_color(cx.theme().muted_foreground)
+        .child("已归档")
+}
+
+/// The quota reading's age, shown on the header row next to the label.
+fn probe_age_label(probed_at: chrono::DateTime<chrono::Utc>, cx: &App) -> Div {
+    gpui::div()
+        .text_size(px(11.))
+        .text_color(cx.theme().muted_foreground)
+        .child(crate::fmt::probe_age(probed_at, chrono::Utc::now()))
 }
 
 /// The key card's model rows: one line per whitelisted model (`KEY_MODEL_ROWS`
@@ -1473,12 +1511,7 @@ pub(super) fn inline_error(message: &str, cx: &App) -> Div {
 /// rows (a manually-added provider) carry no markers. `None` when empty.
 fn tag_row(key_id: i64, provider: &ProviderRow, groups: &[KeyGroupView], cx: &App) -> Option<Div> {
     let mut tags = group_tags(key_id, groups, cx);
-    if let Some((region, coding_plan)) = variant_of_row(&provider.name, &provider.base_url) {
-        tags.push(variant_marker(region.label(), cx));
-        if coding_plan {
-            tags.push(variant_marker("Coding Plan", cx));
-        }
-    }
+    tags.extend(variant_markers(provider, cx));
     if tags.is_empty() {
         return None;
     }
@@ -1492,6 +1525,21 @@ fn tag_row(key_id: i64, provider: &ProviderRow, groups: &[KeyGroupView], cx: &Ap
     )
 }
 
+/// The variant markers of a catalog variant row (kimi/glm only): 区域
+/// (国内/国际), then Coding Plan when it is one. Empty for a non-catalog row
+/// (a manually-added provider). Shared by the per-account tag row and the
+/// pooled card's marker row.
+pub(super) fn variant_markers(provider: &ProviderRow, cx: &App) -> Vec<Div> {
+    let Some((region, coding_plan)) = variant_of_row(&provider.name, &provider.base_url) else {
+        return Vec::new();
+    };
+    let mut markers: Vec<Div> = vec![variant_marker(region.label(), cx)];
+    if coding_plan {
+        markers.push(variant_marker("Coding Plan", cx));
+    }
+    markers
+}
+
 fn variant_marker(text: &'static str, cx: &App) -> Div {
     gpui::div()
         .flex_none()
@@ -1502,4 +1550,79 @@ fn variant_marker(text: &'static str, cx: &App) -> Div {
         .border_color(cx.theme().accent)
         .text_color(cx.theme().muted_foreground)
         .child(text)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use chrono::TimeDelta;
+    use chrono::TimeZone as _;
+
+    fn now() -> chrono::DateTime<chrono::Utc> {
+        chrono::Utc
+            .with_ymd_and_hms(2026, 11, 1, 12, 0, 0)
+            .single()
+            .expect("the test instant is valid")
+    }
+
+    fn rest(key_id: i64, rest_until: chrono::DateTime<chrono::Utc>) -> RestRow {
+        RestRow {
+            key_id,
+            provider_id: 7,
+            model: None,
+            rest_until,
+            reason: Some("429".to_string()),
+            provider_name: "acme".to_string(),
+            key_label: "主用".to_string(),
+        }
+    }
+
+    #[test]
+    fn a_toggle_flips_the_state_read_at_click_time() {
+        assert_eq!(
+            toggle_target::<()>(Ok(Some(true))),
+            Some(false),
+            "an enabled (or archived) key is switched off"
+        );
+        assert_eq!(
+            toggle_target::<()>(Ok(Some(false))),
+            Some(true),
+            "a disabled (or unarchived) key is switched on"
+        );
+    }
+
+    #[test]
+    fn a_vanished_key_toggles_nothing() {
+        assert_eq!(
+            toggle_target::<()>(Ok(None)),
+            None,
+            "a key that left the list must not be written with a stale target"
+        );
+        assert_eq!(
+            toggle_target(Err("page dropped")),
+            None,
+            "an unreadable page writes nothing"
+        );
+    }
+
+    #[test]
+    fn live_rests_drop_cooldowns_that_already_woke() {
+        let now = now();
+        let rests = [
+            rest(1, now - TimeDelta::minutes(1)),
+            rest(1, now),
+            rest(1, now + TimeDelta::hours(1)),
+        ];
+        let live = live_rests(&rests, now);
+        assert_eq!(
+            live.len(),
+            1,
+            "a passed cooldown and one ending exactly now are both over"
+        );
+        assert_eq!(
+            live[0].rest_until,
+            now + TimeDelta::hours(1),
+            "the cooldown still in force is kept"
+        );
+    }
 }

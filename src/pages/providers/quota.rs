@@ -11,6 +11,7 @@
 //! history shapes the curve, never the forecast, so a freshly deployed
 //! gateway shows the full diagonal alone while its series fills in.
 
+use std::fmt;
 use std::rc::Rc;
 
 use chrono::{DateTime, Datelike, Duration, Timelike, Utc};
@@ -425,6 +426,27 @@ fn remaining_amount(total: &str, remaining_pct: f64) -> String {
         return total.to_string();
     };
     format!("{prefix}{:.2}{suffix}", amount * remaining_pct / 100.)
+}
+
+/// An allowance in its window's unit: money (a unit prefix or suffix is
+/// present) with two decimals; a bare count (credits) rounded to an integer.
+/// Shared by the tab-row summary and the pooled provider card, so both render
+/// a summed allowance the same way.
+pub(super) struct Amount<'a> {
+    pub(super) prefix: &'a str,
+    pub(super) value: f64,
+    pub(super) suffix: &'a str,
+}
+
+impl fmt::Display for Amount<'_> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        if self.prefix.is_empty() && self.suffix.is_empty() {
+            write!(f, "{:.0}", self.value.round())
+        } else {
+            let value = (self.value * 100.).round() / 100.;
+            write!(f, "{}{value:.2}{}", self.prefix, self.suffix)
+        }
+    }
 }
 
 /// Split a window total into its unit prefix, number and unit suffix

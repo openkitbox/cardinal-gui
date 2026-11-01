@@ -193,7 +193,7 @@ pub(crate) fn error_card(message: &str, cx: &App) -> Div {
         )
 }
 
-/// Page-level write failure (toggle/delete/reorder/cooldown clear), shown
+/// Page-level write failure (toggle/archive/delete/cooldown clear), shown
 /// above the list; editor-level validation errors stay in their cards.
 pub(crate) fn action_error_card(message: &str, cx: &App) -> Div {
     card(cx)

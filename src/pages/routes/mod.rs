@@ -21,9 +21,10 @@ use gpui_kit::component::{ActiveTheme, Disableable, Icon, Sizable, WindowExt};
 use gateway::admin_ops::Bootstrap;
 use gateway::http_client::GatewayHttpClient;
 use gateway::probe::ProbeModel;
-use gateway::store::{ModelSuccessRow, RequestRow, RestRow, RouteEntry, RouteRow, RouteStrategy};
-
-use std::collections::HashMap;
+use gateway::store::{
+    ModelSuccessRow, ProviderKeyView, ProviderRow, RequestRow, RestRow, RouteEntry, RouteRow,
+    RouteStrategy,
+};
 
 use crate::activity::{ActivityFeed, named_client};
 use crate::pages::{
@@ -49,7 +50,7 @@ const CONTEXT_PRESETS: [(i64, &str); 4] = [
 ];
 
 /// Drag payload of one route-editor item row: source index plus a ghost
-/// label (账号 · 模型). The distinct type keeps stage drags out of here.
+/// label (供应商 · 模型). The distinct type keeps stage drags out of here.
 #[derive(Clone)]
 struct EditorItemDrag {
     from: usize,
@@ -77,33 +78,136 @@ impl Render for DragGhost {
     }
 }
 
-/// One key as the route editor sees it: identity plus display labels.
-struct RouteKey {
+/// One account of a provider, as the routes page sees it: identity, dispatch
+/// readiness and model whitelist. A route entry names its provider and expands
+/// to these accounts, so the page never renders a per-account row.
+struct RouteAccount {
     id: i64,
-    provider_name: String,
+    /// The key's display label (the stage names the serving account with it).
     label: String,
-    position: i32,
-    /// False when disabled or archived on the accounts page — the stage marks
-    /// the entry (dispatch skips such keys just like cooled ones).
+    /// Enabled and not archived on the accounts page: dispatch may pick it.
     active: bool,
-    /// Archived on the accounts page: the picker no longer offers the account.
-    archived: bool,
-    /// The key's model whitelist (None/empty = unrestricted). The picker hides
-    /// chips outside it — a route can only reference models the account serves.
+    /// Model whitelist (None/empty = unrestricted). Dispatch skips an account
+    /// whose whitelist omits the model, so the route page must too.
     allowed_models: Option<Vec<String>>,
 }
 
-/// Loaded page data: routes plus every key in global position order, and the
+impl RouteAccount {
+    /// Does this account serve `model`? Same rule as the relay's
+    /// `serves_model`: an empty whitelist is unrestricted.
+    fn serves(&self, model: &str) -> bool {
+        whitelist_allows(self.allowed_models.as_deref(), model)
+    }
+}
+
+/// One provider as the routes page sees it: identity, dispatch readiness and
+/// its non-archived accounts in (position, id) order.
+///
+/// Derived once per bootstrap and read by both sides of the page — the editor
+/// (picker, model probing) and the stage (per-entry aggregation) — so neither
+/// re-scans the raw key list.
+struct RouteProvider {
+    id: i64,
+    name: String,
+    /// Enabled on the accounts page. A disabled provider dispatches nothing,
+    /// whatever its accounts say.
+    enabled: bool,
+    /// Non-archived accounts in (position, id) order; 总数 counts these.
+    accounts: Vec<RouteAccount>,
+    /// The account whose model label is probed for the picker's chip list: the
+    /// first active account, which is what dispatch would try first (there is
+    /// no per-provider model endpoint). None = no active account.
+    model_source: Option<i64>,
+}
+
+impl RouteProvider {
+    /// Accounts dispatch may pick right now (the 可用 half of the picker label).
+    fn available(&self) -> usize {
+        self.accounts
+            .iter()
+            .filter(|account| account.active)
+            .count()
+    }
+
+    /// Non-archived accounts (the 总数 half).
+    fn total(&self) -> usize {
+        self.accounts.len()
+    }
+
+    /// One account by key id.
+    fn account(&self, key_id: i64) -> Option<&RouteAccount> {
+        self.accounts.iter().find(|account| account.id == key_id)
+    }
+
+    /// Does `key_id` belong to this provider? Entries are per provider, but
+    /// live attempts, rests and successes are per account.
+    fn has_key(&self, key_id: i64) -> bool {
+        self.account(key_id).is_some()
+    }
+
+    /// Is `model` served by at least one active account? The picker offers only
+    /// such models: any other chip could never be dispatched.
+    fn serves(&self, model: &str) -> bool {
+        self.accounts
+            .iter()
+            .any(|account| account.active && account.serves(model))
+    }
+}
+
+/// Project the pushed document into the routes page's provider list: one entry
+/// per provider, its non-archived accounts in (position, id) order, and the
+/// first active account as the model list to probe.
+///
+/// The sort is global, not per provider, because (position, id) is the
+/// accounts page's own global order; it only fixes which account is listed
+/// first and probed, not the dispatch order inside the provider.
+fn project_providers(providers: &[ProviderRow], keys: &[ProviderKeyView]) -> Vec<RouteProvider> {
+    let mut ordered: Vec<&ProviderKeyView> = keys
+        .iter()
+        .filter(|key| key.archived_at.is_none())
+        .collect();
+    ordered.sort_by(|a, b| a.position.cmp(&b.position).then(a.id.cmp(&b.id)));
+    providers
+        .iter()
+        .map(|row| {
+            let accounts: Vec<RouteAccount> = ordered
+                .iter()
+                .filter(|key| key.provider_id == row.id)
+                .map(|key| RouteAccount {
+                    id: key.id,
+                    label: key.label.clone(),
+                    active: key.enabled,
+                    allowed_models: key.allowed_models.clone(),
+                })
+                .collect();
+            RouteProvider {
+                id: row.id,
+                name: row.name.clone(),
+                enabled: row.enabled,
+                model_source: accounts
+                    .iter()
+                    .find(|account| account.active)
+                    .map(|account| account.id),
+                accounts,
+            }
+        })
+        .collect()
+}
+
+/// Loaded page data: routes plus every provider with its accounts, and the
 /// recent requests the route cards'「最近调用」line reads.
 struct RoutesData {
     routes: Vec<RouteRow>,
-    keys: Vec<RouteKey>,
+    providers: Vec<RouteProvider>,
     /// Recent requests, newest first (capped at [`RECENT_LIMIT`]).
     recent: Vec<RequestRow>,
     /// Latest successful request time per (key, served model) — the stage's
     /// "上次成功" markers on idle entries.
     success: Vec<ModelSuccessRow>,
-    /// Active cooldowns — the stage marks cooled (key, model) entries.
+    /// Cooldown rows from the snapshot — the stage marks cooled (key, model)
+    /// entries. The gateway filters `rest_until > now` only when it builds the
+    /// document, so a row here may already be over: readers re-check against
+    /// their own `now`.
     rests: Vec<RestRow>,
 }
 
@@ -116,36 +220,70 @@ impl RoutesData {
         recent: Vec<RequestRow>,
         success: Vec<ModelSuccessRow>,
     ) -> Self {
-        let providers: HashMap<i64, &str> = document
-            .providers
-            .iter()
-            .map(|row| (row.id, row.name.as_str()))
-            .collect();
-        let mut keys: Vec<RouteKey> = document
-            .keys
-            .iter()
-            .filter_map(|key| {
-                let provider_name = providers.get(&key.provider_id)?;
-                Some(RouteKey {
-                    id: key.id,
-                    provider_name: (*provider_name).to_string(),
-                    label: key.label.clone(),
-                    position: key.position,
-                    active: key.enabled && key.archived_at.is_none(),
-                    archived: key.archived_at.is_some(),
-                    allowed_models: key.allowed_models.clone(),
-                })
-            })
-            .collect();
-        keys.sort_by(|a, b| a.position.cmp(&b.position).then(a.id.cmp(&b.id)));
         Self {
             routes: document.routes.clone(),
-            keys,
+            providers: project_providers(&document.providers, &document.keys),
             recent,
             success,
             rests: document.rests.clone(),
         }
     }
+
+    /// The provider of a route entry: None when the id no longer exists (the
+    /// entry is a dangling reference until it is removed or re-pointed).
+    fn provider(&self, provider_id: i64) -> Option<&RouteProvider> {
+        self.providers
+            .iter()
+            .find(|provider| provider.id == provider_id)
+    }
+}
+
+/// The providers the editor offers, in document order. A provider with no
+/// active account (every one disabled or archived) is left out: an entry
+/// pointing at it could never dispatch. Disabled providers are deliberately
+/// still listed even though dispatch skips them: saved entries still point at
+/// them, and re-enabling a provider is one click on the accounts page.
+fn offerable_providers(providers: &[RouteProvider]) -> Vec<&RouteProvider> {
+    providers
+        .iter()
+        .filter(|provider| provider.available() > 0)
+        .collect()
+}
+
+/// The picker line of one provider: its name, 可用/总数 accounts, and 已停用
+/// when dispatch skips it entirely. A disabled provider stays offered so an
+/// entry already pointing at it can still be edited or re-pointed.
+fn provider_choice(provider: &RouteProvider) -> String {
+    let mut line = format!(
+        "{} · {}/{} 账号",
+        provider.name,
+        provider.available(),
+        provider.total()
+    );
+    if !provider.enabled {
+        line.push_str(" · 已停用");
+    }
+    line
+}
+
+/// Display name of an entry's provider; a provider deleted since the entry was
+/// saved keeps its id visible.
+fn provider_name(providers: &[RouteProvider], provider_id: i64) -> String {
+    providers
+        .iter()
+        .find(|provider| provider.id == provider_id)
+        .map(|provider| provider.name.clone())
+        .unwrap_or_else(|| format!("供应商 #{provider_id}（已删除）"))
+}
+
+/// Stage head of an entry: the provider's name, or a bare `供应商 #id` stub when
+/// it dangles — the stage's own 已删除 marker carries the reason, so the head
+/// does not repeat it.
+fn provider_head(provider: Option<&RouteProvider>, provider_id: i64) -> String {
+    provider.map_or_else(
+        || format!("供应商 #{provider_id}"),
+        |provider| provider.name.clone(),
+    )
 }
 
 /// One availability rule being edited: an optional time window + optional
@@ -162,33 +300,36 @@ struct RuleDraft {
     days: Vec<u8>,
 }
 
-/// One route item being edited: a model (via one key) with its optional
+/// One route item being edited: a model (via one provider) with its optional
 /// label, per-item concurrency cap, and an ordered availability-rule list
 /// (first match wins; an empty list = always available). The route is a FLAT
-/// list of these — the same key may appear in several items, one model each.
+/// list of these — the same provider may appear in several items, one model
+/// each.
 struct ItemDraft {
-    key_id: i64,
+    provider_id: i64,
     model: String,
     label: Entity<InputState>,
-    /// Per-item concurrency cap (empty = unlimited at the item level; the
-    /// key-level cap still applies on top).
+    /// Per-item concurrency cap: the provider's total on this route, shared by
+    /// all of its accounts through one (route, provider, model) slot (empty =
+    /// unlimited at the item level; each key's own cap still applies).
     cap: Entity<InputState>,
     /// Ordered availability rules (top = highest priority).
     rules: Vec<RuleDraft>,
 }
 
-/// One picker row in the route editor: an on-demand「账号 → 模型」selector.
-/// Clicking ＋添加模型 appends a row; the account button opens an inline
-/// dropdown of accounts, choosing one fetches its models as toggle chips
+/// One picker row in the route editor: an on-demand「供应商 → 模型」selector.
+/// Clicking ＋添加模型 appends a row; the provider button opens an inline
+/// dropdown of providers, choosing one fetches its models as toggle chips
 /// (click = add/remove an item in the flat list). Rows are throwaway
 /// pickers — they never own route state, the flat `items` list does.
 struct PickerRow {
-    /// The chosen account (None until the dropdown selection is made).
-    key_id: Option<i64>,
-    /// Whether the inline account dropdown is open.
-    account_list_open: bool,
-    /// Fetched models for the chosen account; None until asked, cached
-    /// afterwards (a `Failed` is re-asked via 重试).
+    /// The chosen provider (None until the dropdown selection is made).
+    provider_id: Option<i64>,
+    /// Whether the inline provider dropdown is open.
+    provider_list_open: bool,
+    /// Fetched models for the chosen provider (through its first active
+    /// account); None until asked, cached afterwards (a `Failed` is re-asked
+    /// via 重试).
     models: Option<LoadState<Vec<ProbeModel>>>,
 }
 
@@ -227,7 +368,7 @@ struct RuleSelection {
 
 /// Snapshot of one route item, detached from the input entities.
 struct SelectionDraft {
-    key_id: i64,
+    provider_id: i64,
     model: String,
     label: String,
     cap: String,
@@ -314,7 +455,7 @@ fn route_entries(drafts: &[SelectionDraft]) -> Result<Vec<RouteEntry>, String> {
             Some(draft.label.clone())
         };
         entries.push(RouteEntry {
-            key_id: draft.key_id,
+            provider_id: draft.provider_id,
             model: draft.model.clone(),
             label,
             max_concurrency,
@@ -351,11 +492,11 @@ fn rule_draft(window: &mut Window, cx: &mut App) -> RuleDraft {
 }
 
 /// Fresh inputs for one route item (defaults; editing pre-fills afterwards).
-fn item_draft(key_id: i64, model: String, window: &mut Window, cx: &mut App) -> ItemDraft {
+fn item_draft(provider_id: i64, model: String, window: &mut Window, cx: &mut App) -> ItemDraft {
     let label = cx.new(|cx| InputState::new(window, cx).placeholder("空 = 模型 ID"));
     let cap = cx.new(|cx| InputState::new(window, cx).placeholder("不限"));
     ItemDraft {
-        key_id,
+        provider_id,
         model,
         label,
         cap,
@@ -594,7 +735,8 @@ impl RoutesPage {
                     .entries
                     .iter()
                     .map(|entry| {
-                        let mut draft = item_draft(entry.key_id, entry.model.clone(), window, cx);
+                        let mut draft =
+                            item_draft(entry.provider_id, entry.model.clone(), window, cx);
                         if let Some(text) = &entry.label {
                             draft
                                 .label
@@ -659,8 +801,8 @@ impl RoutesPage {
             return;
         };
         editor.rows.push(PickerRow {
-            key_id: None,
-            account_list_open: true,
+            provider_id: None,
+            provider_list_open: true,
             models: None,
         });
         cx.notify();
@@ -677,21 +819,21 @@ impl RoutesPage {
         cx.notify();
     }
 
-    /// Open/close a row's inline account dropdown.
-    fn toggle_account_list(&mut self, row_index: usize, open: bool, cx: &mut Context<Self>) {
+    /// Open/close a row's inline provider dropdown.
+    fn toggle_provider_list(&mut self, row_index: usize, open: bool, cx: &mut Context<Self>) {
         let Some(editor) = &mut self.editor else {
             return;
         };
         let Some(row) = editor.rows.get_mut(row_index) else {
             return;
         };
-        row.account_list_open = open;
+        row.provider_list_open = open;
         cx.notify();
     }
 
-    /// Pick an account for a row: closes the dropdown and starts the model
-    /// fetch. Re-picking another account refetches.
-    fn select_row_account(&mut self, row_index: usize, key_id: i64, cx: &mut Context<Self>) {
+    /// Pick a provider for a row: closes the dropdown and starts the model
+    /// fetch. Re-picking another provider refetches.
+    fn select_row_provider(&mut self, row_index: usize, provider_id: i64, cx: &mut Context<Self>) {
         {
             let Some(editor) = &mut self.editor else {
                 return;
@@ -699,25 +841,26 @@ impl RoutesPage {
             let Some(row) = editor.rows.get_mut(row_index) else {
                 return;
             };
-            if row.key_id == Some(key_id) {
-                row.account_list_open = false;
+            if row.provider_id == Some(provider_id) {
+                row.provider_list_open = false;
                 cx.notify();
                 return;
             }
-            row.key_id = Some(key_id);
-            row.account_list_open = false;
+            row.provider_id = Some(provider_id);
+            row.provider_list_open = false;
             row.models = None;
         }
         self.fetch_row_models(row_index, cx);
         cx.notify();
     }
 
-    /// Toggle one model chip of a key: a chip corresponds to the (key, model)
-    /// item in the flat route list — clicking adds it, clicking again removes
-    /// it. The same key can supply several items, one model each.
+    /// Toggle one model chip of a provider: a chip corresponds to the
+    /// (provider, model) item in the flat route list — clicking adds it,
+    /// clicking again removes it. The same provider can supply several items,
+    /// one model each.
     fn toggle_model(
         &mut self,
-        key_id: i64,
+        provider_id: i64,
         model: String,
         window: &mut Window,
         cx: &mut Context<Self>,
@@ -728,33 +871,51 @@ impl RoutesPage {
         if let Some(index) = editor
             .items
             .iter()
-            .position(|item| item.key_id == key_id && item.model == model)
+            .position(|item| item.provider_id == provider_id && item.model == model)
         {
             editor.items.remove(index);
         } else {
-            editor.items.push(item_draft(key_id, model, window, cx));
+            editor
+                .items
+                .push(item_draft(provider_id, model, window, cx));
         }
         cx.notify();
     }
 
-    /// Fetch the chosen account's upstream model list into the row (skipped
+    /// Fetch the chosen provider's upstream model list into the row (skipped
     /// while a fetch is in flight or already cached; a failure is re-asked).
+    ///
+    /// The gateway has no per-provider model endpoint, so the list comes from
+    /// one account: the provider's first active account in (position, id)
+    /// order. Dispatch accepts a model served by ANY active account, so a model
+    /// only another account lists (a different plan or upstream) is missing
+    /// from the chips. Such a route entry still works; it just cannot be picked
+    /// here.
     fn fetch_row_models(&mut self, row_index: usize, cx: &mut Context<Self>) {
-        let Some(key_id) = ({
-            let Some(editor) = &mut self.editor else {
-                return;
-            };
-            let Some(row) = editor.rows.get_mut(row_index) else {
-                return;
-            };
-            if matches!(row.models, Some(LoadState::Loading | LoadState::Loaded(_))) {
-                return;
-            }
-            row.models = Some(LoadState::Loading);
-            row.key_id
-        }) else {
+        let LoadState::Loaded(data) = &self.state else {
             return;
         };
+        let Some(editor) = &mut self.editor else {
+            return;
+        };
+        let Some(row) = editor.rows.get_mut(row_index) else {
+            return;
+        };
+        let Some(provider_id) = row.provider_id else {
+            return;
+        };
+        if matches!(row.models, Some(LoadState::Loading | LoadState::Loaded(_))) {
+            return;
+        }
+        let Some(key_id) = data
+            .provider(provider_id)
+            .and_then(|provider| provider.model_source)
+        else {
+            row.models = Some(LoadState::Failed("该供应商没有可用账号".to_string()));
+            cx.notify();
+            return;
+        };
+        row.models = Some(LoadState::Loading);
         cx.notify();
         let call = cx
             .global::<GatewayRuntime>()
@@ -764,7 +925,7 @@ impl RoutesPage {
             this.update(cx, |page, cx| {
                 if let Some(editor) = &mut page.editor
                     && let Some(row) = editor.rows.get_mut(row_index)
-                    && row.key_id == Some(key_id)
+                    && row.provider_id == Some(provider_id)
                 {
                     row.models = Some(match result {
                         Ok(models) => LoadState::Loaded(models),
@@ -778,14 +939,14 @@ impl RoutesPage {
         .detach();
     }
 
-    /// Re-ask the model list for the row currently bound to `key_id`
-    /// (the 重试 button carries the account id, not a row index).
-    fn retry_key_models(&mut self, key_id: i64, cx: &mut Context<Self>) {
+    /// Re-ask the model list for the row currently bound to `provider_id`
+    /// (the 重试 button carries the provider id, not a row index).
+    fn retry_provider_models(&mut self, provider_id: i64, cx: &mut Context<Self>) {
         let row_index = self.editor.as_ref().and_then(|editor| {
             editor
                 .rows
                 .iter()
-                .position(|row| row.key_id == Some(key_id))
+                .position(|row| row.provider_id == Some(provider_id))
         });
         let Some(row_index) = row_index else { return };
         if let Some(editor) = &mut self.editor
@@ -816,7 +977,7 @@ impl RoutesPage {
             .items
             .iter()
             .map(|item| SelectionDraft {
-                key_id: item.key_id,
+                provider_id: item.provider_id,
                 model: item.model.clone(),
                 label: item.label.read(cx).value().trim().to_string(),
                 cap: item.cap.read(cx).value().trim().to_string(),
@@ -1236,8 +1397,9 @@ impl RoutesPage {
             } else {
               chip.border_color(cx.theme().border).text_color(cx.theme().foreground).hover(|this| this.bg(cx.theme().accent))
             };
-            // Single-select: 顺序 dispatches in list order, 智能 picks by the
-            // entries' remaining quota and cooldowns.
+            // Single-select. The strategy orders providers relative to each
+            // other only; inside a provider dispatch always ranks the accounts
+            // by remaining quota.
             chip.on_click(cx.listener(move |this, _, _, cx| {
               if let Some(editor) = &mut this.editor {
                 editor.strategy = strategy;
@@ -1245,10 +1407,10 @@ impl RoutesPage {
               cx.notify();
             }))
           }))
-          .child(gpui::div().text_size(px(12.)).text_color(cx.theme().muted_foreground).child("顺序 = 按列表；智能 = 按剩余额度挑账号；交替 = 不看额度挨个轮")),
+          .child(gpui::div().text_size(px(12.)).text_color(cx.theme().muted_foreground).child("顺序/智能/交替 只决定供应商之间的先后，供应商内部的账号始终按剩余额度排")),
       )
       .when(editor.strategy == RouteStrategy::Ordered, |this| {
-        this.child(gpui::div().text_size(px(12.)).text_color(cx.theme().muted_foreground).child("列表顺序 = 派发顺序（用 ▲▼ 调整）"))
+        this.child(gpui::div().text_size(px(12.)).text_color(cx.theme().muted_foreground).child("列表顺序 = 供应商的派发顺序（用 ▲▼ 调整）"))
       })
       // The route itself: one flat list of model items, each with its key,
       // label input and a remove button.
@@ -1257,13 +1419,8 @@ impl RoutesPage {
         this.child(gpui::div().text_size(px(12.)).text_color(cx.theme().muted_foreground).child("还没有模型"))
       })
       .children(editor.items.iter().enumerate().map(|(index, item)| {
-        let key_label = data
-          .keys
-          .iter()
-          .find(|key| key.id == item.key_id)
-          .map(|key| key.label.clone())
-          .unwrap_or_else(|| format!("账号 #{}", item.key_id));
-        let ghost_label = format!("{key_label} · {}", item.model);
+        let provider_label = provider_name(&data.providers, item.provider_id);
+        let ghost_label = format!("{provider_label} · {}", item.model);
         let field_label = |text: &str, cx: &App| {
           gpui::div().w(px(40.)).flex_shrink_0().text_size(px(12.)).text_color(cx.theme().muted_foreground).child(text.to_string())
         };
@@ -1347,7 +1504,7 @@ impl RoutesPage {
                     cx.notify();
                   })),
               )
-              .child(gpui::div().text_size(px(12.)).text_color(cx.theme().foreground).child(format!("{} · {}", key_label, item.model)))
+              .child(gpui::div().text_size(px(12.)).text_color(cx.theme().foreground).child(format!("{} · {}", provider_label, item.model)))
               .child(gpui::div().flex_1())
               .child(Button::new(("route-item-remove", index as u64)).icon(Icon::new(IconName::Close).small()).ghost().compact().on_click(
                 cx.listener(move |this, _, _, cx| {
@@ -1366,7 +1523,16 @@ impl RoutesPage {
               .child(field_label("标签", cx))
               .child(gpui::div().w(px(200.)).flex_shrink_0().child(Input::new(&item.label)))
               .child(gpui::div().flex_1())
-              .child(field_label("并发", cx))
+              // The cap is the provider's TOTAL on this route: all of its
+              // accounts share one slot keyed by (route, provider, model).
+              .child(
+                gpui::div()
+                  .flex_shrink_0()
+                  .whitespace_nowrap()
+                  .text_size(px(12.))
+                  .text_color(cx.theme().muted_foreground)
+                  .child("并发（该供应商在此路由的总并发）"),
+              )
               .child(gpui::div().w(px(72.)).flex_shrink_0().child(Input::new(&item.cap))),
           )
           .child(
@@ -1586,9 +1752,10 @@ impl RoutesPage {
             )
     }
 
-    /// One picker row: [账号选择按钮 ▾] (dropdown of accounts) then, once an
-    /// account is chosen, its models as toggle chips (filtered by the account's
-    /// whitelist). ✕ removes the row; items already added via it stay.
+    /// One picker row: [供应商选择按钮 ▾] (dropdown of providers) then, once a
+    /// provider is chosen, its models as toggle chips (filtered to models some
+    /// active account of that provider serves). ✕ removes the row; items already
+    /// added via it stay.
     fn picker_row(
         &self,
         row_index: usize,
@@ -1596,17 +1763,15 @@ impl RoutesPage {
         data: &RoutesData,
         cx: &mut Context<Self>,
     ) -> Div {
-        let account_label = match row.key_id {
-            Some(key_id) => data
-                .keys
-                .iter()
-                .find(|key| key.id == key_id)
-                .map(|key| format!("{} · {}", key.provider_name, key.label))
-                .unwrap_or_else(|| format!("账号 #{key_id}（已删除）")),
-            None => "选择账号…".to_string(),
+        let button_label = match row.provider_id {
+            Some(provider_id) => data.provider(provider_id).map_or_else(
+                || provider_name(&data.providers, provider_id),
+                provider_choice,
+            ),
+            None => "选择供应商…".to_string(),
         };
-        let chevron = if row.account_list_open { "▾" } else { "▸" };
-        let account_list_open = row.account_list_open;
+        let chevron = if row.provider_list_open { "▾" } else { "▸" };
+        let provider_list_open = row.provider_list_open;
         gpui::div()
             .flex()
             .flex_col()
@@ -1619,7 +1784,7 @@ impl RoutesPage {
                     .child(
                         gpui::div()
                             .id(ElementId::from(gpui::SharedString::from(format!(
-                                "picker-row-account-{row_index}"
+                                "picker-row-provider-{row_index}"
                             ))))
                             .cursor_pointer()
                             .border_1()
@@ -1629,9 +1794,9 @@ impl RoutesPage {
                             .py_0p5()
                             .text_size(px(12.))
                             .text_color(cx.theme().foreground)
-                            .child(format!("{chevron} {account_label}"))
+                            .child(format!("{chevron} {button_label}"))
                             .on_click(cx.listener(move |this, _, _, cx| {
-                                this.toggle_account_list(row_index, !account_list_open, cx)
+                                this.toggle_provider_list(row_index, !provider_list_open, cx)
                             })),
                     )
                     .child(gpui::div().flex_1())
@@ -1645,23 +1810,20 @@ impl RoutesPage {
                             })),
                     ),
             )
-            .when(row.account_list_open, |this| {
-                this.child(self.account_list(row_index, data, cx))
+            .when(row.provider_list_open, |this| {
+                this.child(self.provider_list(row_index, data, cx))
             })
-            .when_some(row.key_id, |this, key_id| {
-                let whitelist = data
-                    .keys
-                    .iter()
-                    .find(|key| key.id == key_id)
-                    .and_then(|key| key.allowed_models.as_deref());
-                this.child(self.model_chips(key_id, &row.models, whitelist, cx))
+            .when_some(row.provider_id, |this, provider_id| {
+                let provider = data.provider(provider_id);
+                this.child(self.model_chips(provider_id, &row.models, provider, cx))
             })
     }
 
-    /// The inline account dropdown of one picker row: every unarchived account,
-    /// one clickable line each. Choosing one closes the list and fetches models.
+    /// The inline provider dropdown of one picker row: every provider with at
+    /// least one active account, one clickable line each, labelled with its
+    /// 可用/总数 accounts. Choosing one closes the list and fetches models.
     /// The id is needed for scrollability, so this returns a Stateful Div.
-    fn account_list(
+    fn provider_list(
         &self,
         row_index: usize,
         data: &RoutesData,
@@ -1676,25 +1838,25 @@ impl RoutesPage {
             .border_color(cx.theme().border)
             .max_h(px(240.))
             .id(ElementId::from(gpui::SharedString::from(format!(
-                "picker-account-list-{row_index}"
+                "picker-provider-list-{row_index}"
             ))))
             .overflow_y_scroll();
-        let mut offered = data.keys.iter().filter(|key| !key.archived).peekable();
-        if offered.peek().is_none() {
+        let offered = offerable_providers(&data.providers);
+        if offered.is_empty() {
             list = list.child(
                 gpui::div()
                     .p_2()
                     .text_size(px(12.))
                     .text_color(cx.theme().muted_foreground)
-                    .child("没有账号——先在账号页添加"),
+                    .child("没有可用供应商——先在账号页添加账号或启用账号"),
             );
         }
-        for key in offered {
-            let key_id = key.id;
+        for provider in offered {
+            let provider_id = provider.id;
             list = list.child(
                 gpui::div()
                     .id(ElementId::from(gpui::SharedString::from(format!(
-                        "picker-account-{row_index}-{key_id}"
+                        "picker-provider-{row_index}-{provider_id}"
                     ))))
                     .cursor_pointer()
                     .px_2()
@@ -1702,25 +1864,29 @@ impl RoutesPage {
                     .text_size(px(12.))
                     .text_color(cx.theme().foreground)
                     .hover(|this| this.bg(cx.theme().accent))
-                    .child(format!("{} · {}", key.provider_name, key.label))
+                    .child(provider_choice(provider))
                     .on_click(cx.listener(move |this, _, _, cx| {
-                        this.select_row_account(row_index, key_id, cx)
+                        this.select_row_provider(row_index, provider_id, cx)
                     })),
             );
         }
         list
     }
 
-    /// The fetched models of one row's account as toggle chips: click adds the
-    /// (key, model) item to the route's flat list, click again removes it.
-    /// Attributes the list carried show as suffix badges on the chip. Models
-    /// outside the account's whitelist (`allowed_models`) are not shown at all —
-    /// a route can only reference models the account actually serves.
+    /// The fetched models of one row's provider as toggle chips: click adds
+    /// the (provider, model) item to the route's flat list, click again removes
+    /// it. Attributes the list carried show as suffix badges on the chip.
+    ///
+    /// The list itself is probed from one account (`model_source`), so it is
+    /// filtered to models that at least one active account of the provider
+    /// serves — a chip no account serves could never dispatch. The reverse gap
+    /// remains: a model only some other active account lists is not offered,
+    /// even though dispatch would accept it.
     fn model_chips(
         &self,
-        key_id: i64,
+        provider_id: i64,
         models: &Option<LoadState<Vec<ProbeModel>>>,
-        whitelist: Option<&[String]>,
+        provider: Option<&RouteProvider>,
         cx: &mut Context<Self>,
     ) -> Div {
         let row = gpui::div().flex().flex_wrap().items_center().gap_1().pl_6();
@@ -1739,26 +1905,26 @@ impl RoutesPage {
                         .child(format!("模型列表获取失败：{error}")),
                 )
                 .child(
-                    Button::new(("models-retry", key_id as u64))
+                    Button::new(("models-retry", provider_id as u64))
                         .label("重试")
                         .ghost()
                         .compact()
-                        .on_click(
-                            cx.listener(move |this, _, _, cx| this.retry_key_models(key_id, cx)),
-                        ),
+                        .on_click(cx.listener(move |this, _, _, cx| {
+                            this.retry_provider_models(provider_id, cx)
+                        })),
                 ),
             Some(LoadState::Loaded(models)) => {
-                // Whitelist gate: None/empty = every probed model is selectable.
+                // Whitelist gate over the provider's active accounts.
                 let visible: Vec<&ProbeModel> = models
                     .iter()
-                    .filter(|model| whitelist_allows(whitelist, &model.id))
+                    .filter(|model| provider.is_none_or(|provider| provider.serves(&model.id)))
                     .collect();
                 if visible.is_empty() {
                     return row.child(
                         gpui::div()
                             .text_size(px(12.))
                             .text_color(cx.theme().muted_foreground)
-                            .child("该账号无可用模型（白名单已限制）"),
+                            .child("该供应商无可用模型（白名单已限制）"),
                     );
                 }
                 row.children(visible.into_iter().map(|model| {
@@ -1767,7 +1933,7 @@ impl RoutesPage {
                         editor
                             .items
                             .iter()
-                            .any(|item| item.key_id == key_id && item.model == model.id)
+                            .any(|item| item.provider_id == provider_id && item.model == model.id)
                     });
                     // Attributes the list carried, as suffix badges on the chip:
                     // id · 上下文 · 输出上限 · 模态 · 推理级别.
@@ -1798,7 +1964,7 @@ impl RoutesPage {
                     }
                     let chip = gpui::div()
                         .id(ElementId::from(gpui::SharedString::from(format!(
-                            "model-chip-{key_id}-{model_id}"
+                            "model-chip-{provider_id}-{model_id}"
                         ))))
                         .cursor_pointer()
                         .border_1()
@@ -1817,7 +1983,7 @@ impl RoutesPage {
                             .hover(|this| this.bg(cx.theme().accent))
                     };
                     chip.on_click(cx.listener(move |this, _, window, cx| {
-                        this.toggle_model(key_id, model_id.clone(), window, cx)
+                        this.toggle_model(provider_id, model_id.clone(), window, cx)
                     }))
                 }))
             }
@@ -1860,7 +2026,7 @@ impl Render for RoutesPage {
                     .when(data.routes.is_empty(), |this| {
                         this.child(empty_card(
                             "尚无路由",
-                            "路由把一组账号暴露为一个模型 ID；先在账号页添加账号。",
+                            "路由把一个供应商的模型暴露为一个模型 ID；先在账号页添加供应商与账号。",
                             cx,
                         ))
                     })
@@ -1882,3 +2048,186 @@ fn whitelist_allows(whitelist: Option<&[String]>, model_id: &str) -> bool {
 // are constants, so the wire endpoints are computed arithmetically and the
 // overlay canvas needs no prepaint. Column widths and gaps match the CSS
 // (.rt-stage: 124px 124px 1fr, column-gap 56px, padding 22px 2px).
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn provider_row(id: i64, name: &str, enabled: bool) -> ProviderRow {
+        ProviderRow {
+            id,
+            name: name.to_string(),
+            protocol: "openai_chat".to_string(),
+            base_url: "https://example.test/v1".to_string(),
+            auth_scheme: "bearer".to_string(),
+            enabled,
+        }
+    }
+
+    fn key_view(
+        id: i64,
+        provider_id: i64,
+        position: i32,
+        enabled: bool,
+        archived: bool,
+        allowed: Option<&[&str]>,
+    ) -> ProviderKeyView {
+        ProviderKeyView {
+            id,
+            provider_id,
+            label: format!("acct-{id}"),
+            enabled,
+            position,
+            max_concurrency: None,
+            inflight: None,
+            models: None,
+            allowed_models: allowed.map(|ids| ids.iter().map(|id| id.to_string()).collect()),
+            archived_at: archived.then(|| {
+                chrono::DateTime::from_timestamp(1_800_000_000, 0)
+                    .expect("fixed timestamp is in range")
+            }),
+        }
+    }
+
+    fn account(id: i64, active: bool, allowed: Option<&[&str]>) -> RouteAccount {
+        RouteAccount {
+            id,
+            label: format!("acct-{id}"),
+            active,
+            allowed_models: allowed.map(|ids| ids.iter().map(|id| id.to_string()).collect()),
+        }
+    }
+
+    fn provider(id: i64, name: &str, accounts: Vec<RouteAccount>) -> RouteProvider {
+        let model_source = accounts
+            .iter()
+            .find(|account| account.active)
+            .map(|account| account.id);
+        RouteProvider {
+            id,
+            name: name.to_string(),
+            enabled: true,
+            accounts,
+            model_source,
+        }
+    }
+
+    #[test]
+    fn projection_sorts_accounts_skips_archived_and_probes_the_first_active_one() {
+        let providers = [provider_row(1, "opencode-go", true)];
+        // Out of document order on purpose; `position` ties break on id.
+        let keys = [
+            key_view(30, 1, 2, true, false, None),
+            key_view(5, 1, 0, true, true, None),
+            key_view(10, 1, 1, false, false, None),
+            key_view(20, 1, 1, true, false, Some(&["glm-5"])),
+        ];
+        let projected = project_providers(&providers, &keys);
+        assert_eq!(projected.len(), 1, "one route provider per provider row");
+        let only = &projected[0];
+        let ids: Vec<i64> = only.accounts.iter().map(|account| account.id).collect();
+        assert_eq!(ids, vec![10, 20, 30], "非归档账号按 (position, id) 排序");
+        assert_eq!(
+            only.model_source,
+            Some(20),
+            "10 is disabled, so 20 is the first account dispatch would try"
+        );
+        assert_eq!(only.available(), 2, "可用 counts the enabled accounts");
+        assert_eq!(only.total(), 3, "总数 excludes only archived accounts");
+        assert_eq!(
+            only.account(20).map(|account| account.label.as_str()),
+            Some("acct-20"),
+            "the serving account label comes from the key"
+        );
+    }
+
+    #[test]
+    fn picker_line_offers_every_servable_model_and_marks_a_disabled_provider() {
+        // Two active accounts with different whitelists: a model only the
+        // second one serves must still be offered — dispatch would use it.
+        let opencode = provider(
+            1,
+            "opencode-go",
+            vec![
+                account(1, true, Some(&["glm-5"])),
+                account(2, true, Some(&["kimi-k2"])),
+                account(3, false, Some(&["never"])),
+            ],
+        );
+        assert_eq!(provider_choice(&opencode), "opencode-go · 2/3 账号");
+        assert!(opencode.serves("glm-5"), "first active account serves it");
+        assert!(
+            opencode.serves("kimi-k2"),
+            "second active account serves it"
+        );
+        assert!(
+            !opencode.serves("never"),
+            "a disabled account's whitelist proves nothing"
+        );
+
+        let mut off = provider(2, "deepseek", vec![account(4, true, None)]);
+        off.enabled = false;
+        assert_eq!(
+            provider_choice(&off),
+            "deepseek · 1/1 账号 · 已停用",
+            "dispatch skips it, so the line says so"
+        );
+    }
+
+    #[test]
+    fn picker_offers_providers_in_document_order_and_leaves_out_the_unusable() {
+        let providers = vec![
+            provider(
+                7,
+                "opencode-go",
+                vec![account(1, true, None), account(2, false, None)],
+            ),
+            provider(3, "archived-only", vec![]),
+            provider(4, "disabled-only", vec![account(5, false, None)]),
+            provider(9, "deepseek", vec![account(6, true, None)]),
+        ];
+        let offered: Vec<i64> = offerable_providers(&providers)
+            .into_iter()
+            .map(|provider| provider.id)
+            .collect();
+        assert_eq!(
+            offered,
+            vec![7, 9],
+            "document order, only providers with an active account"
+        );
+    }
+
+    #[test]
+    fn deleted_provider_keeps_its_id_visible() {
+        let providers = vec![provider(1, "deepseek", vec![account(1, true, None)])];
+        assert_eq!(provider_name(&providers, 1), "deepseek");
+        assert_eq!(provider_name(&providers, 9), "供应商 #9（已删除）");
+        assert_eq!(
+            provider_head(None, 9),
+            "供应商 #9",
+            "the stage's marker already says 已删除"
+        );
+    }
+
+    #[test]
+    fn route_entries_carry_each_drafts_provider_and_model() {
+        let draft = |provider_id: i64, model: &str| SelectionDraft {
+            provider_id,
+            model: model.to_string(),
+            label: String::new(),
+            cap: String::new(),
+            rules: Vec::new(),
+        };
+        let drafts = vec![draft(42, "glm-5"), draft(7, "kimi-k2")];
+        let entries = route_entries(&drafts).expect("valid drafts must convert");
+        let pairs: Vec<(i64, &str)> = entries
+            .iter()
+            .map(|entry| (entry.provider_id, entry.model.as_str()))
+            .collect();
+        assert_eq!(
+            pairs,
+            vec![(42, "glm-5"), (7, "kimi-k2")],
+            "each entry keeps its own provider and model in list order"
+        );
+    }
+}

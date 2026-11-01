@@ -25,6 +25,8 @@ mod chip;
 mod group_editor;
 mod groups;
 pub mod kiro_import;
+mod pool;
+mod pool_card;
 mod quota;
 mod summary;
 mod trend;
@@ -33,8 +35,8 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use gpui::{
-    App, AppContext as _, Context, Entity, Focusable as _, InteractiveElement, IntoElement,
-    ParentElement, Render, Styled, Window, prelude::FluentBuilder as _,
+    App, AppContext as _, Context, Entity, Focusable as _, IntoElement, ParentElement, Render,
+    Styled, Window, prelude::FluentBuilder as _,
 };
 use gpui_kit::assets::IconName;
 use gpui_kit::component::button::{Button, ButtonVariant};
@@ -53,6 +55,7 @@ use catalog::{
 };
 use group_editor::{GroupCreate, GroupManager};
 use groups::{GroupFilter, KeyFacts, Visibility};
+use pool::PoolAccount;
 use quota::KeyQuotaView;
 
 use crate::pages::{
@@ -73,14 +76,12 @@ struct KeyCardData {
     quota: Option<KeyQuotaView>,
 }
 
-/// Live card-drag state: which key is being dragged and over which card it
-/// currently hovers (target id + whether the drop lands after it). Cards
-/// reorder by drag and drop; there is no drag-end notification in gpui, so a
-/// cancelled drag is healed by the page-level mouse-move handler, which
-/// clears this once `App::has_active_drag()` reports false.
-pub(super) struct KeyDrag {
-    dragged: i64,
-    target: Option<(i64, bool)>,
+/// One provider's pooled card input: the provider row and its visible
+/// accounts in (position, id) order. Borrows the loaded cards; built per
+/// render.
+struct ProviderGroup<'a> {
+    provider: &'a ProviderRow,
+    cards: Vec<&'a KeyCardData>,
 }
 
 /// Loaded page data: every key across all providers in global position order,
@@ -443,10 +444,8 @@ pub struct ProvidersPage {
     form_generation: u64,
     key_form: Option<KeyForm>,
     key_editor: Option<KeyEditor>,
-    /// Failure of a row-level write (toggle/delete/reorder); shown above the list.
+    /// Failure of a row-level write (toggle/archive/delete); shown above the list.
     action_error: Option<String>,
-    /// Live card drag-and-drop state (see `KeyDrag`).
-    drag: Option<KeyDrag>,
     /// Which accounts the 分组 dropdown admits (local view state).
     group_filter: GroupFilter,
     /// The 分组 dropdown list is open.
@@ -475,7 +474,6 @@ impl ProvidersPage {
             key_form: None,
             key_editor: None,
             action_error: None,
-            drag: None,
             group_filter: GroupFilter::All,
             group_list_open: false,
             group_create: None,
@@ -559,9 +557,10 @@ impl ProvidersPage {
                 // A running import owns the form; replacing it would drop the
                 // run's result.
                 let saving = self.key_form.as_ref().is_some_and(|form| form.saving);
+                let (filter, visibility) = self.view_filter(data);
                 let mut actions: Vec<gpui::AnyElement> = Vec::with_capacity(4);
                 actions.extend(
-                    self.quota_summary(data, cx)
+                    Self::quota_summary(data, &visibility, chrono::Utc::now(), cx)
                         .map(IntoElement::into_any_element),
                 );
                 actions.push(
@@ -574,7 +573,7 @@ impl ProvidersPage {
                         .on_click(cx.listener(|this, _, window, cx| this.open_key_form(window, cx)))
                         .into_any_element(),
                 );
-                actions.push(self.group_dropdown(data, cx));
+                actions.push(self.group_dropdown(data, filter, cx));
                 actions.push(refresh.into_any_element());
                 actions
             }
@@ -582,21 +581,41 @@ impl ProvidersPage {
         }
     }
 
-    /// The tab-row quota summary over the cards the page currently shows
-    /// (same group filter and archive rule as [`Render::render`]), limited
-    /// to enabled, unarchived accounts with a quota reading. Derived per
-    /// render; `None` when nothing sums.
-    fn quota_summary(&self, data: &ProvidersData, cx: &App) -> Option<gpui::Div> {
+    /// The group filter resolved against the loaded data, and the visibility it
+    /// gives. Derived per call, never cached: the tab-row actions and the page
+    /// body are separate entry points (the Status container calls
+    /// [`Self::actions`] on its own), so each resolves once and passes the pair
+    /// down.
+    fn view_filter(&self, data: &ProvidersData) -> (GroupFilter, Visibility) {
         let filter = self.group_filter.effective(&data.groups, data.key_facts());
         let visibility = Visibility::new(filter, &data.groups, data.key_facts());
-        let cards = data.keys.iter().filter_map(|card| {
-            let visible = visibility.admits(card.key.id)
-                && card.key.enabled
-                && card.key.archived_at.is_none();
+        (filter, visibility)
+    }
+
+    /// The tab-row quota summary over the cards the page currently shows
+    /// (`visibility` is the one [`Render::render`] uses), limited to accounts
+    /// that can spend quota ([`PoolAccount::spends_quota`]: enabled,
+    /// unarchived, on an enabled provider) with a quota reading. Derived per
+    /// render; `None` when nothing sums. Amounts and balances only: the
+    /// amount rule is shared with the pooled cards, but percent-only windows
+    /// appear on the pooled card alone and are not summed here.
+    fn quota_summary(
+        data: &ProvidersData,
+        visibility: &Visibility,
+        now: chrono::DateTime<chrono::Utc>,
+        cx: &App,
+    ) -> Option<gpui::Div> {
+        let readings = data.keys.iter().filter_map(|card| {
+            // The pool card's rule: only quota the gateway can still spend.
+            let visible = visibility.admits(card.key.id) && PoolAccount::from(card).spends_quota();
             let quota = card.quota.as_ref().filter(|_| visible)?;
-            Some((card.provider.name.as_str(), quota))
+            Some(summary::Reading {
+                provider_id: card.provider.id,
+                provider_name: card.provider.name.as_str(),
+                quota,
+            })
         });
-        let totals = summary::summarize(cards, chrono::Utc::now());
+        let totals = summary::summarize(readings, now);
         summary::render(&totals, cx)
     }
 
@@ -685,30 +704,37 @@ impl ProvidersPage {
         crate::pages::run_write(cx, f);
     }
 
+    /// One key's loaded card (`None` if unknown, or once it left the list).
+    /// Menus capture ids only and resolve through this at click time, because
+    /// their entities are cached between opens and a captured row goes stale.
+    fn key_row(&self, provider_id: i64, key_id: i64) -> Option<&KeyCardData> {
+        let LoadState::Loaded(data) = &self.state else {
+            return None;
+        };
+        data.keys
+            .iter()
+            .find(|card| card.provider.id == provider_id && card.key.id == key_id)
+    }
+
     /// The key's enabled state as the page last loaded it (`None` if unknown).
-    /// Menus read this at click time — their entities are cached between opens.
     fn key_enabled(&self, provider_id: i64, key_id: i64) -> Option<bool> {
-        match &self.state {
-            LoadState::Loaded(data) => data
-                .keys
-                .iter()
-                .find(|c| c.provider.id == provider_id && c.key.id == key_id)
-                .map(|c| c.key.enabled),
-            _ => None,
-        }
+        self.key_row(provider_id, key_id)
+            .map(|card| card.key.enabled)
     }
 
     /// Whether the key is archived as the page last loaded it (`None` if
     /// unknown). Read at click time like [`Self::key_enabled`].
     fn key_archived(&self, provider_id: i64, key_id: i64) -> Option<bool> {
-        match &self.state {
-            LoadState::Loaded(data) => data
-                .keys
-                .iter()
-                .find(|c| c.provider.id == provider_id && c.key.id == key_id)
-                .map(|c| c.key.archived_at.is_some()),
-            _ => None,
-        }
+        self.key_row(provider_id, key_id)
+            .map(|card| card.key.archived_at.is_some())
+    }
+
+    /// The key's label as the page last loaded it (`None` if unknown): the
+    /// delete confirmation names the account, so it reads the current label
+    /// rather than one captured at render time.
+    fn key_label(&self, provider_id: i64, key_id: i64) -> Option<String> {
+        self.key_row(provider_id, key_id)
+            .map(|card| card.key.label.clone())
     }
 
     /// Archive or unarchive one key. Same success/failure handling as
@@ -1522,27 +1548,37 @@ impl ProvidersPage {
     /// Open the inline edit form for one existing key, prefilled from the
     /// credential-free view, and fetch the plaintext credential once (the only
     /// credential read: the list shapes deliberately carry none).
+    ///
+    /// The ⋯ menu captures only the ids (its entity is cached between opens),
+    /// so the row is resolved here; a key that left the list since then has
+    /// nothing to edit and the call does nothing.
     fn open_key_editor(
         &mut self,
         provider_id: i64,
-        key: &ProviderKeyView,
+        key_id: i64,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        let Some(card) = self.key_row(provider_id, key_id) else {
+            return;
+        };
+        let key_label = card.key.label.clone();
+        let limit = card.key.max_concurrency;
+        let selected_models = card.key.allowed_models.clone().unwrap_or_default();
+        let probed_models = card.key.models.clone();
         let label = cx.new(|cx| InputState::new(window, cx).placeholder("label（如 主用）"));
         label.update(cx, |input, cx| {
-            input.set_value(key.label.clone(), window, cx)
+            input.set_value(key_label.clone(), window, cx)
         });
         let max_concurrency =
             cx.new(|cx| InputState::new(window, cx).placeholder("并发上限（空 = 不限）"));
-        if let Some(limit) = key.max_concurrency {
+        if let Some(limit) = limit {
             max_concurrency.update(cx, |input, cx| {
                 input.set_value(limit.to_string(), window, cx)
             });
         }
         let focus = label.read(cx).focus_handle(cx);
         window.focus(&focus, cx);
-        let key_id = key.id;
         let initial_groups = match &self.state {
             LoadState::Loaded(data) => groups::memberships(&data.groups, key_id),
             _ => Vec::new(),
@@ -1553,7 +1589,7 @@ impl ProvidersPage {
         // concurrency editor and its provider is never renamed.
         let custom = self
             .provider_row(provider_id)
-            .filter(|row| is_custom(&row.name, &row.protocol) && row.name == key.label)
+            .filter(|row| is_custom(&row.name, &row.protocol) && row.name == key_label)
             .and_then(|row| {
                 let protocol = protocol_choice(&row.protocol)?;
                 let base_url = cx.new(|cx| {
@@ -1575,10 +1611,10 @@ impl ProvidersPage {
             key_id,
             label,
             max_concurrency,
-            selected_models: key.allowed_models.clone().unwrap_or_default(),
+            selected_models,
             selected_groups: initial_groups.clone(),
             initial_groups,
-            probed_models: key.models.clone(),
+            probed_models,
             api_key: None,
             probing: false,
             saving: false,
@@ -2031,26 +2067,16 @@ impl Render for ProvidersPage {
         self.sync_group_manager(window, cx);
         // No page title/subtitle (the tab bar names the view) and no action row:
         // the actions live in the tab row, so the content starts immediately.
-        // Self-heal for a cancelled card drag (gpui has no drag-end event): once
-        // the OS reports no active drag, any leftover drag state is stale.
-        let frame_weak = cx.weak_entity();
-        let frame = page_frame("", "", cx).on_mouse_move(move |_, _, cx| {
-            frame_weak
-                .update(cx, |this, cx| {
-                    if this.drag.is_some() && !cx.has_active_drag() {
-                        this.drag = None;
-                        cx.notify();
-                    }
-                })
-                .ok();
-        });
+        let frame = page_frame("", "", cx);
         match &self.state {
             LoadState::Loading => frame.child(loading_card(cx)),
             LoadState::Failed(error) => frame.child(error_card(error, cx)),
             LoadState::Loaded(data) => {
                 // Derived per render from the loaded groups: nothing cached.
-                let filter = self.group_filter.effective(&data.groups, data.key_facts());
-                let visibility = Visibility::new(filter, &data.groups, data.key_facts());
+                let (filter, visibility) = self.view_filter(data);
+                // One clock reading for the whole render: every card judges
+                // expired cooldowns and renewed windows against the same instant.
+                let now = chrono::Utc::now();
                 let any_visible = data.keys.iter().any(|card| visibility.admits(card.key.id));
                 frame
                     .when_some(self.action_error.as_ref(), |this, error| {
@@ -2072,24 +2098,44 @@ impl Render for ProvidersPage {
                             this.child(empty_card(title, hint, cx))
                         },
                     )
-                    .child(
-                        gpui::div().flex().flex_wrap().gap_5().children(
-                            data.keys
-                                .iter()
-                                .filter(|card_data| visibility.admits(card_data.key.id))
-                                .map(|card_data| {
-                                    self.key_card(
-                                        card_data,
-                                        data.rests
-                                            .get(&card_data.key.id)
-                                            .map(Vec::as_slice)
-                                            .unwrap_or(&[]),
-                                        &data.groups,
-                                        cx,
-                                    )
-                                }),
-                        ),
-                    )
+                    .child({
+                        let visible = data
+                            .keys
+                            .iter()
+                            .filter(|card_data| visibility.admits(card_data.key.id));
+                        let grid = gpui::div().flex().flex_wrap().gap_5();
+                        if filter.pooled() {
+                            // One pooled card per provider (全部 / a provider).
+                            let groups: Vec<ProviderGroup<'_>> =
+                                group_by_provider(visible, |card| card.provider.id)
+                                    .into_iter()
+                                    .filter_map(|cards| {
+                                        // A run is never empty; skip one rather
+                                        // than index into it.
+                                        let provider = &cards.first()?.provider;
+                                        Some(ProviderGroup { provider, cards })
+                                    })
+                                    .collect();
+                            grid.children(
+                                groups
+                                    .iter()
+                                    .map(|group| self.provider_card(group, data, now, cx)),
+                            )
+                        } else {
+                            grid.children(visible.map(|card_data| {
+                                self.key_card(
+                                    card_data,
+                                    data.rests
+                                        .get(&card_data.key.id)
+                                        .map(Vec::as_slice)
+                                        .unwrap_or(&[]),
+                                    &data.groups,
+                                    now,
+                                    cx,
+                                )
+                            }))
+                        }
+                    })
             }
         }
     }
@@ -2104,24 +2150,37 @@ fn toggle_selection<T: PartialEq + Clone>(selected: &mut Vec<T>, item: &T) {
     }
 }
 
-/// Move `dragged` to just before (`after` = false) or after `target` in the
-/// global order, returning the new full id order. Dropping on itself or an
-/// unknown id leaves the order unchanged.
-fn reordered(all_ids: &[i64], dragged: i64, target: i64, after: bool) -> Vec<i64> {
-    let mut order: Vec<i64> = all_ids
-        .iter()
-        .copied()
-        .filter(|id| *id != dragged)
-        .collect();
-    if order.len() == all_ids.len() {
-        return all_ids.to_vec(); // dragged not in the order
+/// Split `items` (already in (position, id) order) into one run per
+/// provider: providers come in the order of their first item — i.e. of their
+/// smallest account (position, id) — and each run keeps the input order.
+fn group_by_provider<T>(
+    items: impl Iterator<Item = T>,
+    provider_of: impl Fn(&T) -> i64,
+) -> Vec<Vec<T>> {
+    let mut runs: Vec<(i64, Vec<T>)> = Vec::new();
+    for item in items {
+        let provider = provider_of(&item);
+        match runs.iter_mut().find(|(id, _)| *id == provider) {
+            Some((_, run)) => run.push(item),
+            None => runs.push((provider, vec![item])),
+        }
     }
-    let Some(mut position) = order.iter().position(|id| *id == target) else {
-        return all_ids.to_vec();
-    };
-    if after {
-        position += 1;
+    runs.into_iter().map(|(_, run)| run).collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn providers_group_in_first_appearance_order() {
+        // (provider id, account id), already in (position, id) card order.
+        let cards = [(7_i64, 1_i64), (3, 2), (7, 3), (9, 4), (3, 5)];
+        let runs = group_by_provider(cards.into_iter(), |card| card.0);
+        assert_eq!(
+            runs,
+            [vec![(7, 1), (7, 3)], vec![(3, 2), (3, 5)], vec![(9, 4)]],
+            "one run per provider, ordered by its smallest account, accounts in card order"
+        );
     }
-    order.insert(position, dragged);
-    order
 }

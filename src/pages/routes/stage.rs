@@ -15,9 +15,11 @@ use gpui_kit::component::button::{Button, ButtonVariants};
 use gpui_kit::component::tag::Tag;
 use gpui_kit::component::{ActiveTheme, Disableable, Icon, Sizable};
 
-use gateway::store::{ActiveWindow, RouteRow, RouteStrategy};
+use gateway::store::{ActiveWindow, ModelSuccessRow, RestRow, RouteRow, RouteStrategy};
 
-use super::{RoutesData, RoutesPage};
+use std::fmt::Write;
+
+use super::{RouteProvider, RoutesData, RoutesPage};
 use crate::activity::{client_hue, named_client};
 use crate::pages::{LoadState, card};
 
@@ -287,9 +289,9 @@ struct StageSource {
     hue: Option<Hsla>,
 }
 
-/// One account row of the stage: a route entry in dispatch order.
+/// One row of the stage: a route entry, i.e. one provider on one model.
 struct StageAccount {
-    /// `provider · key label`.
+    /// Provider name, or the deleted stub when the entry dangles.
     head: String,
     /// Display name of the served model (entry label or model id), as a chip.
     model: String,
@@ -299,15 +301,235 @@ struct StageAccount {
     caption: Option<&'static str>,
     /// This entry is serving a live call right now (row on, wire flows).
     live: bool,
-    /// Cooldown recovery caption (冷却至 10-19 08:00); Some = the (key, model)
-    /// pair rests — the row renders dimmed with a warning dot.
+    /// Cooldown recovery caption (冷却至 10-19 08:00); Some = the entry rests —
+    /// the row renders dimmed with a warning dot.
     cool_until: Option<String>,
-    /// The key was manually disabled on the accounts page — dispatch skips it
-    /// like a cooled one; the row renders dimmed with a muted filled dot.
-    disabled: bool,
-    /// Latest successful request time for this (key, model) — shown in the
+    /// The provider cannot dispatch (deleted, disabled, or no active account):
+    /// the row renders dimmed with a muted filled dot and the reason.
+    stopped: Option<Stopped>,
+    /// Latest successful request time for this entry — shown in the
     /// serving-caption slot once the entry goes idle.
     last_success: Option<chrono::DateTime<chrono::Utc>>,
+    /// Compact account-pool hint (2/3 账号): how many of the provider's
+    /// non-archived accounts dispatch may use right now.
+    pool: String,
+}
+
+/// One in-flight call of this route, as the entry aggregation reads it. The
+/// live feed's attempt type carries display strings and private fields; the
+/// aggregation only needs identity plus the phase caption.
+struct LiveCall<'call> {
+    /// The provider account serving the call (None = not yet routed to one).
+    key_id: Option<i64>,
+    /// The upstream model, in its clipped wire form.
+    model: &'call str,
+    /// Phase caption (连接中/传输中/接收中).
+    phase: &'static str,
+    /// The call has seen its first byte, so it outranks one still connecting.
+    /// Kept apart from the caption: the caption is copy, this is the ordering.
+    progressed: bool,
+}
+
+/// Why one route entry cannot dispatch anything right now.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Stopped {
+    /// The entry points at a provider the document no longer carries.
+    Deleted,
+    /// The provider is disabled on the accounts page.
+    Disabled,
+    /// Every account of the provider is disabled or archived.
+    NoAccounts,
+    /// The provider has active accounts, but none of the active ones serves
+    /// this model (whitelist-restricted, or only disabled accounts serve it):
+    /// dispatch would refuse every account.
+    NoModel,
+}
+
+impl Stopped {
+    /// The stage's marker text for this reason.
+    fn label(self) -> &'static str {
+        match self {
+            Stopped::Deleted => "已删除",
+            Stopped::Disabled => "已停用",
+            Stopped::NoAccounts => "无可用账号",
+            Stopped::NoModel => "无账号支持该模型",
+        }
+    }
+}
+
+/// One entry's stage state, aggregated over the accounts of its provider that
+/// serve the entry's model.
+///
+/// An entry names a provider; dispatch expands it to all of that provider's
+/// active accounts that serve the model, so "serving", "resting", "last
+/// success" and the in-flight count are all provider-level facts. Pure: every
+/// input is a read the caller already has.
+#[derive(Debug, Default, PartialEq)]
+struct EntryState {
+    /// Phase caption of the call serving this entry (None = idle).
+    serving: Option<&'static str>,
+    /// The account that call belongs to (None = idle), so the row can name the
+    /// account doing the work.
+    serving_key: Option<i64>,
+    /// Serving accounts not cooling on this model: dispatch can use them now.
+    ready: usize,
+    /// Serving accounts cooling on this model.
+    resting: usize,
+    /// Non-archived accounts of the provider that serve this model (the 总数
+    /// half of the hint).
+    total: usize,
+    /// The entry cannot dispatch (deleted provider, disabled provider, no
+    /// active account, or no active account serving this model).
+    stopped: Option<Stopped>,
+    /// Set only when EVERY serving account rests and the entry is not stopped
+    /// for another reason: the earliest recovery, i.e. the moment the entry can
+    /// dispatch again. A partly resting provider still dispatches, so it is not
+    /// shown as cooling.
+    cool_until: Option<chrono::DateTime<chrono::Utc>>,
+    /// Newest success among the provider's accounts for this model.
+    last_success: Option<chrono::DateTime<chrono::Utc>>,
+    /// In-flight calls of this route over the provider's accounts on this model.
+    inflight: usize,
+}
+
+impl EntryState {
+    /// The compact pool hint: 可用/总数 accounts, then how many rest while
+    /// others still serve, then the in-flight count when the entry is busy.
+    fn pool(&self) -> String {
+        let mut hint = String::new();
+        write!(hint, "{}/{} 账号", self.ready, self.total)
+            .expect("writing to a String cannot fail");
+        if self.resting > 0 && self.ready > 0 {
+            write!(hint, " · {} 冷却", self.resting).expect("writing to a String cannot fail");
+        }
+        if self.inflight > 0 {
+            write!(hint, " · 进行中 {}", self.inflight).expect("writing to a String cannot fail");
+        }
+        hint
+    }
+}
+
+/// Aggregate one entry's stage state over the provider's accounts that serve
+/// the entry's model (whitelist-restricted accounts are not dispatchable for it).
+///
+/// * serving — the most advanced in-flight call of this route over those
+///   accounts on this model (compared in the model's clipped wire form), so the
+///   caption shows the phase that actually moved furthest;
+/// * resting — those accounts cooling on this model at `now` (a rest with a
+///   NULL model cools the whole account, so it covers every model; a rest whose
+///   `rest_until` is not after `now` is over);
+/// * stopped — the provider is gone, disabled, has no active account, or has no
+///   active account serving this model;
+/// * last success — the newest success among those accounts;
+/// * inflight — this route's calls over those accounts on this model.
+fn entry_state(
+    provider: Option<&RouteProvider>,
+    model: &str,
+    calls: &[LiveCall<'_>],
+    rests: &[RestRow],
+    success: &[ModelSuccessRow],
+    now: chrono::DateTime<chrono::Utc>,
+) -> EntryState {
+    let Some(provider) = provider else {
+        // The entry dangles: no accounts to aggregate over.
+        return EntryState {
+            stopped: Some(Stopped::Deleted),
+            ..EntryState::default()
+        };
+    };
+    let mut state = EntryState::default();
+    let mut earliest: Option<chrono::DateTime<chrono::Utc>> = None;
+    for account in provider
+        .accounts
+        .iter()
+        .filter(|account| account.serves(model))
+    {
+        state.total += 1;
+        if !account.active {
+            continue;
+        }
+        // Only cooldowns still in force at `now`: the gateway drops expired
+        // rows only when it builds the document, and nothing refreshes the page
+        // when a cooldown ends, so an expired row must not read as resting.
+        let recovery = rests
+            .iter()
+            .filter(|rest| {
+                rest.key_id == account.id
+                    && rest.rest_until > now
+                    && rest
+                        .model
+                        .as_deref()
+                        .is_none_or(|rest_model| rest_model == model)
+            })
+            .map(|rest| rest.rest_until)
+            .max();
+        match recovery {
+            Some(until) => {
+                state.resting += 1;
+                earliest = Some(earliest.map_or(until, |best| best.min(until)));
+            }
+            None => state.ready += 1,
+        }
+    }
+    state.stopped = if !provider.enabled {
+        Some(Stopped::Disabled)
+    } else if provider.available() == 0 {
+        Some(Stopped::NoAccounts)
+    } else if state.ready + state.resting == 0 {
+        // The provider has active accounts, but none of them serves the model:
+        // either no account serves it at all, or only disabled ones do.
+        // `total` still counts the latter for the hint's 总数.
+        Some(Stopped::NoModel)
+    } else {
+        None
+    };
+    if state.stopped.is_none() && state.ready == 0 {
+        state.cool_until = earliest;
+    }
+    // One pass over this route's calls: the entry's calls are those on its
+    // model over the provider's accounts. Track the most advanced one (ties
+    // keep feed order, so the choice is stable across renders) and the count.
+    let clipped = crate::activity::clipped(model);
+    let mut serving: Option<&LiveCall<'_>> = None;
+    for call in calls {
+        if call.model != clipped || !call.key_id.is_some_and(|id| provider.has_key(id)) {
+            continue;
+        }
+        state.inflight += 1;
+        // Ties keep feed order, so the choice is stable across renders: only a
+        // call that has seen its first byte displaces one that has not.
+        if serving.is_none_or(|best| call.progressed && !best.progressed) {
+            serving = Some(call);
+        }
+    }
+    if let Some(serving) = serving {
+        state.serving = Some(serving.phase);
+        state.serving_key = serving.key_id;
+    }
+    state.last_success = success
+        .iter()
+        .filter(|row| row.served_model == model && provider.has_key(row.key_id))
+        .map(|row| row.last_ok)
+        .max();
+    state
+}
+
+/// The 冷却至 marker of a cooling entry: the time alone when `until` falls on
+/// the same day as `now` in the display offset `tz`, otherwise with its date.
+/// `now` is the render's single clock read, the same one the cooldown-expiry
+/// check in [`entry_state`] used, so the two always agree.
+#[must_use]
+fn cool_until_label(
+    until: chrono::DateTime<chrono::Utc>,
+    now: chrono::DateTime<chrono::Utc>,
+    tz: chrono::FixedOffset,
+) -> String {
+    let local = until.with_timezone(&tz);
+    if local.date_naive() == now.with_timezone(&tz).date_naive() {
+        format!("冷却至 {}", local.format("%H:%M"))
+    } else {
+        format!("冷却至 {}", local.format("%m-%d %H:%M"))
+    }
 }
 
 /// Drag payload of one stage entry row: source route alias + index plus a
@@ -335,8 +557,7 @@ struct StageSection {
 pub(super) struct StageModel {
     sources: Vec<StageSource>,
     sections: Vec<StageSection>,
-    /// False before any traffic ever: the skeleton shows nodes without wires
-    ///.
+    /// False before any traffic ever: the skeleton shows nodes without wires.
     wired: bool,
 }
 
@@ -364,6 +585,11 @@ impl RoutesPage {
         if data.routes.is_empty() {
             return None;
         }
+        // One clock read for the whole render: cooldown expiry and the 冷却至
+        // date comparison must agree with each other. The display offset is
+        // read once alongside it for the same reason.
+        let now = chrono::Utc::now();
+        let tz = crate::ui_tz::display_tz();
         let feed = self.feed.read(cx);
         // Every routed in-flight attempt. Wire routes are clipped to 64 bytes;
         // compare aliases in the clipped form so a long alias still matches. Two
@@ -405,24 +631,40 @@ impl RoutesPage {
             .iter()
             .map(|route| {
                 let alias = crate::activity::clipped(&route.alias);
+                // This route's in-flight calls, as the per-entry aggregation
+                // reads them (identity only: key id, clipped model, phase).
+                let calls: Vec<LiveCall<'_>> = live
+                    .iter()
+                    .filter(|attempt| attempt.route.as_deref() == Some(alias))
+                    .map(|attempt| LiveCall {
+                        key_id: attempt.key_id,
+                        model: &attempt.served_model,
+                        phase: attempt.phase(),
+                        progressed: attempt.streaming,
+                    })
+                    .collect();
                 let accounts = route
                     .entries
                     .iter()
                     .map(|entry| {
-                        let key = data.keys.iter().find(|key| key.id == entry.key_id);
-                        let head = match key {
-                            Some(key) => format!("{} · {}", key.provider_name, key.label),
-                            None => format!("账号 #{}（已删除）", entry.key_id),
-                        };
-                        // Serving match is by identity, not display strings: key_id pins
-                        // the account (labels are clipped on the wire and can repeat
-                        // across providers), the model compares against its clipped wire
-                        // form, and the attempt must be running over THIS route.
-                        let serving = live.iter().find(|attempt| {
-                            attempt.route.as_deref() == Some(alias)
-                                && attempt.key_id == Some(entry.key_id)
-                                && attempt.served_model == crate::activity::clipped(&entry.model)
-                        });
+                        let provider = data.provider(entry.provider_id);
+                        let mut head = super::provider_head(provider, entry.provider_id);
+                        let state = entry_state(
+                            provider,
+                            &entry.model,
+                            &calls,
+                            &data.rests,
+                            &data.success,
+                            now,
+                        );
+                        // While serving, name the account doing the work.
+                        if let Some(account) = provider
+                            .zip(state.serving_key)
+                            .and_then(|(provider, key_id)| provider.account(key_id))
+                        {
+                            write!(head, " · {}", account.label)
+                                .expect("writing to a String cannot fail");
+                        }
                         let extras = [entry.max_concurrency.map(|cap| format!("并发 {cap}")), {
                             let rules = entry.rules();
                             if rules.is_empty() {
@@ -447,48 +689,19 @@ impl RoutesPage {
                         .flatten()
                         .collect::<Vec<_>>()
                         .join(" · ");
-                        // A whole-key rest (model NULL) cools every entry of the key; a
-                        // per-model rest only the exact (key, model) pair. Latest
-                        // recovery wins when several rows match.
-                        let cool_until = data
-                            .rests
-                            .iter()
-                            .filter(|rest| {
-                                rest.key_id == entry.key_id
-                                    && rest.model.as_deref().is_none_or(|m| m == entry.model)
-                            })
-                            .map(|rest| rest.rest_until)
-                            .max()
-                            .map(|until| {
-                                let local = until.with_timezone(&crate::ui_tz::display_tz());
-                                let today = chrono::Utc::now()
-                                    .with_timezone(&crate::ui_tz::display_tz())
-                                    .date_naive();
-                                if local.date_naive() == today {
-                                    format!("冷却至 {}", local.format("%H:%M"))
-                                } else {
-                                    format!("冷却至 {}", local.format("%m-%d %H:%M"))
-                                }
-                            });
+                        let cool_until = state
+                            .cool_until
+                            .map(|until| cool_until_label(until, now, tz));
                         StageAccount {
                             head,
                             model: entry.label.clone().unwrap_or_else(|| entry.model.clone()),
                             extras,
-                            caption: serving.map(|attempt| attempt.phase()),
-                            live: serving.is_some(),
+                            caption: state.serving,
+                            live: state.serving.is_some(),
                             cool_until,
-                            disabled: data
-                                .keys
-                                .iter()
-                                .find(|key| key.id == entry.key_id)
-                                .is_some_and(|key| !key.active),
-                            last_success: data
-                                .success
-                                .iter()
-                                .find(|row| {
-                                    row.key_id == entry.key_id && row.served_model == entry.model
-                                })
-                                .map(|row| row.last_ok),
+                            stopped: state.stopped,
+                            last_success: state.last_success,
+                            pool: state.pool(),
                         }
                     })
                     .collect();
@@ -752,7 +965,7 @@ impl RoutesPage {
                     .text_color(theme.foreground)
                     .child(section.alias.clone()),
             )
-            .child(Tag::secondary().child(format!("{} 个账号", section.accounts.len())))
+            .child(Tag::secondary().child(format!("{} 项", section.accounts.len())))
             .when_some(section.context_window, |this, window| {
                 this.child(
                     Tag::secondary()
@@ -882,7 +1095,7 @@ impl RoutesPage {
         let manage = self.manage;
         let busy = self.manage_write_in_flight;
         let cooling = account.cool_until.is_some();
-        let disabled = account.disabled;
+        let disabled = account.stopped.is_some();
         let mut dot_color = if account.live {
             theme.foreground
         } else if cooling {
@@ -915,7 +1128,7 @@ impl RoutesPage {
             })
             .rounded(px(10.))
             .overflow_hidden()
-            // A rested or manually-disabled entry is skipped by dispatch — dim it
+            // A fully rested or stopped entry is skipped by dispatch — dim it
             // so the stage reads as "present but out of rotation".
             .opacity(if (cooling || disabled) && !account.live {
                 0.55
@@ -1057,15 +1270,31 @@ impl RoutesPage {
                         .child(until.clone()),
                 )
             })
-            .when(disabled && !account.live, |row| {
+            .when_some(account.stopped.filter(|_| !account.live), |row, stopped| {
                 row.child(
                     gpui::div()
                         .flex_shrink_0()
                         .text_size(px(11.))
                         .text_color(theme.muted_foreground)
-                        .child("已停用"),
+                        .child(stopped.label()),
                 )
             })
+            // Provider-level pool hint (2/3 账号): the entry is a pool of
+            // accounts, not one, and this says how much of it can serve.
+            // A deleted provider or one with no account on this model has no
+            // pool to describe; its marker says why.
+            .when(
+                !matches!(account.stopped, Some(Stopped::Deleted | Stopped::NoModel)),
+                |row| {
+                    row.child(
+                        gpui::div()
+                            .flex_shrink_0()
+                            .text_size(px(11.))
+                            .text_color(theme.muted_foreground)
+                            .child(account.pool.clone()),
+                    )
+                },
+            )
             .child(gpui::div().flex_1())
             .when_some(account.caption, |row, caption| {
                 row.child(
@@ -1211,5 +1440,400 @@ fn paint_wires(
             run.push(point(origin.x + px(ex), origin.y + px(ey)));
         }
         flush(&mut run, window);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::pages::routes::RouteAccount;
+
+    fn at(minutes: i64) -> chrono::DateTime<chrono::Utc> {
+        chrono::DateTime::from_timestamp(1_800_000_000 + minutes * 60, 0)
+            .expect("fixed timestamp is in range")
+    }
+
+    fn account(id: i64, active: bool, allowed: Option<&[&str]>) -> RouteAccount {
+        RouteAccount {
+            id,
+            label: format!("acct-{id}"),
+            active,
+            allowed_models: allowed.map(|ids| ids.iter().map(|id| id.to_string()).collect()),
+        }
+    }
+
+    /// Provider 1 with accounts 10, 11 (active) and 12 (disabled), none
+    /// whitelist-restricted.
+    fn pool() -> RouteProvider {
+        RouteProvider {
+            id: 1,
+            name: "opencode-go".to_string(),
+            enabled: true,
+            accounts: vec![
+                account(10, true, None),
+                account(11, true, None),
+                account(12, false, None),
+            ],
+            model_source: Some(10),
+        }
+    }
+
+    fn rest(key_id: i64, model: Option<&str>, until: i64) -> RestRow {
+        RestRow {
+            key_id,
+            provider_id: 1,
+            model: model.map(str::to_string),
+            rest_until: at(until),
+            reason: None,
+            provider_name: "opencode-go".to_string(),
+            key_label: format!("acct-{key_id}"),
+        }
+    }
+
+    fn ok(key_id: i64, model: &str, minutes: i64) -> ModelSuccessRow {
+        ModelSuccessRow {
+            key_id,
+            served_model: model.to_string(),
+            last_ok: at(minutes),
+        }
+    }
+
+    /// An in-flight call; 连接中 is the only caption before the first byte.
+    fn call(key_id: i64, model: &'static str, phase: &'static str) -> LiveCall<'static> {
+        LiveCall {
+            key_id: Some(key_id),
+            model,
+            phase,
+            progressed: phase != "连接中",
+        }
+    }
+
+    /// The render boundary every test aggregation takes `now` from, so rest
+    /// rows written as `at(-5)` / `at(0)` / `at(20)` read as past / now / future.
+    fn now() -> chrono::DateTime<chrono::Utc> {
+        at(0)
+    }
+
+    fn aggregate(
+        provider: Option<&RouteProvider>,
+        model: &str,
+        calls: &[LiveCall<'_>],
+        rests: &[RestRow],
+    ) -> EntryState {
+        entry_state(provider, model, calls, rests, &[], now())
+    }
+
+    #[test]
+    fn cool_until_shows_the_time_alone_on_the_same_local_day() {
+        let tz = chrono::FixedOffset::east_opt(8 * 3600).expect("+08:00 is a valid offset");
+        // now() is 2027-01-15 16:00 at +08:00.
+        assert_eq!(
+            cool_until_label(at(20), now(), tz),
+            "冷却至 16:20",
+            "a recovery later today needs no date"
+        );
+        assert_eq!(
+            cool_until_label(at(7 * 60 + 59), now(), tz),
+            "冷却至 23:59",
+            "the last minute of the local day is still today"
+        );
+    }
+
+    #[test]
+    fn cool_until_adds_the_date_once_the_local_day_changes() {
+        let tz = chrono::FixedOffset::east_opt(8 * 3600).expect("+08:00 is a valid offset");
+        assert_eq!(
+            cool_until_label(at(8 * 60), now(), tz),
+            "冷却至 01-16 00:00",
+            "local midnight starts another day"
+        );
+        // 23:00 UTC is still today in UTC but tomorrow at +08:00: both sides
+        // of the comparison use the display offset.
+        let utc = chrono::FixedOffset::east_opt(0).expect("UTC is a valid offset");
+        assert_eq!(
+            cool_until_label(at(15 * 60), now(), utc),
+            "冷却至 23:00",
+            "in UTC the recovery is still today"
+        );
+        assert_eq!(
+            cool_until_label(at(15 * 60), now(), tz),
+            "冷却至 01-16 07:00",
+            "at +08:00 the same instant is tomorrow"
+        );
+    }
+
+    #[test]
+    fn expired_cooldowns_do_not_rest_the_entry() {
+        let provider = pool();
+        // 10's cooldown is over; 11's ends exactly at now. Neither still holds:
+        // the gateway filters rests only when it builds the document, so the
+        // stage has to re-check at render time.
+        let rests = [rest(10, None, -5), rest(11, Some("glm-5"), 0)];
+        let state = aggregate(Some(&provider), "glm-5", &[], &rests);
+        assert_eq!(
+            (state.ready, state.resting),
+            (2, 0),
+            "both accounts dispatch again: {state:?}"
+        );
+        assert_eq!(
+            state.cool_until, None,
+            "an expired cooldown is not a recovery time"
+        );
+        // A cooldown still in force keeps its account resting.
+        let rests = [rest(10, None, -5), rest(11, None, 15)];
+        let state = aggregate(Some(&provider), "glm-5", &[], &rests);
+        assert_eq!(
+            (state.ready, state.resting),
+            (1, 1),
+            "only the cooldown in force rests: {state:?}"
+        );
+        assert_eq!(
+            state.cool_until, None,
+            "one ready account keeps the entry dispatchable"
+        );
+    }
+
+    #[test]
+    fn one_live_call_serves_the_entry_and_counts_once() {
+        let provider = pool();
+        let calls = [call(10, "glm-5", "传输中")];
+        let state = aggregate(Some(&provider), "glm-5", &calls, &[]);
+        assert_eq!(state.serving, Some("传输中"), "the call serves the row");
+        assert_eq!(
+            state.inflight, 1,
+            "and is counted exactly once, got {state:?}"
+        );
+    }
+
+    #[test]
+    fn one_account_serving_marks_the_entry_serving() {
+        let provider = pool();
+        let calls = [call(99, "glm-5", "连接中"), call(11, "glm-5", "传输中")];
+        let state = aggregate(Some(&provider), "glm-5", &calls, &[]);
+        assert_eq!(
+            state.serving,
+            Some("传输中"),
+            "account 11 belongs to the provider"
+        );
+        assert_eq!(state.serving_key, Some(11), "the caption names the account");
+        assert_eq!(
+            (state.ready, state.total),
+            (2, 3),
+            "pool counts, got {state:?}"
+        );
+        assert_eq!(state.stopped, None, "an active provider is not stopped");
+    }
+
+    #[test]
+    fn a_call_on_another_model_does_not_serve_the_entry() {
+        let provider = pool();
+        let calls = [call(10, "kimi-k2", "传输中")];
+        assert_eq!(
+            aggregate(Some(&provider), "glm-5", &calls, &[]).serving,
+            None,
+            "model must match"
+        );
+    }
+
+    #[test]
+    fn serving_picks_the_most_advanced_phase() {
+        let provider = pool();
+        // Connecting listed first: a plain `find` would stop at it.
+        let calls = [call(10, "glm-5", "连接中"), call(11, "glm-5", "接收中")];
+        let state = aggregate(Some(&provider), "glm-5", &calls, &[]);
+        assert_eq!(state.serving, Some("接收中"), "receiving beats connecting");
+        assert_eq!(
+            state.serving_key,
+            Some(11),
+            "the advanced call names the account"
+        );
+        // Equal rank: the earliest call in feed order wins, deterministically.
+        let calls = [call(10, "glm-5", "接收中"), call(11, "glm-5", "传输中")];
+        let state = aggregate(Some(&provider), "glm-5", &calls, &[]);
+        assert_eq!(
+            state.serving,
+            Some("接收中"),
+            "first ranked call wins a tie"
+        );
+        assert_eq!(state.serving_key, Some(10), "tie keeps feed order");
+    }
+
+    #[test]
+    fn all_active_accounts_resting_cools_the_entry_until_the_first_recovery() {
+        let provider = pool();
+        // A whole-account rest covers every model; 12 is disabled and ignored.
+        let rests = [
+            rest(10, Some("glm-5"), 30),
+            rest(11, None, 20),
+            rest(12, None, 5),
+        ];
+        let state = aggregate(Some(&provider), "glm-5", &[], &rests);
+        assert_eq!((state.ready, state.resting), (0, 2), "got {state:?}");
+        assert_eq!(state.cool_until, Some(at(20)), "earliest recovery wins");
+        assert_eq!(
+            state.pool(),
+            "0/3 账号",
+            "no partial-rest suffix when none is ready"
+        );
+    }
+
+    #[test]
+    fn one_resting_one_serving_keeps_the_entry_dispatchable() {
+        let provider = pool();
+        let calls = [call(11, "glm-5", "接收中")];
+        // A rest on another model does not cool this entry.
+        let rests = [rest(10, Some("glm-5"), 30), rest(11, Some("kimi-k2"), 30)];
+        let state = aggregate(Some(&provider), "glm-5", &calls, &rests);
+        assert_eq!(state.serving, Some("接收中"), "account 11 still serves");
+        assert_eq!((state.ready, state.resting), (1, 1), "got {state:?}");
+        assert_eq!(
+            state.cool_until, None,
+            "a partly resting provider is not cooling"
+        );
+        assert_eq!(
+            state.pool(),
+            "1/3 账号 · 1 冷却 · 进行中 1",
+            "hint shows the resting share and the call in flight"
+        );
+    }
+
+    #[test]
+    fn no_active_account_or_disabled_provider_is_stopped() {
+        let mut provider = pool();
+        for account in &mut provider.accounts {
+            account.active = false;
+        }
+        assert_eq!(
+            aggregate(Some(&provider), "glm-5", &[], &[]).stopped,
+            Some(Stopped::NoAccounts),
+            "every account disabled"
+        );
+        let mut provider = pool();
+        provider.enabled = false;
+        assert_eq!(
+            aggregate(Some(&provider), "glm-5", &[], &[]).stopped,
+            Some(Stopped::Disabled),
+            "provider switched off"
+        );
+        assert_eq!(
+            aggregate(None, "glm-5", &[], &[]).stopped,
+            Some(Stopped::Deleted),
+            "dangling entry"
+        );
+    }
+
+    #[test]
+    fn accounts_that_do_not_serve_the_model_leave_the_pool() {
+        let provider = RouteProvider {
+            id: 1,
+            name: "opencode-go".to_string(),
+            enabled: true,
+            accounts: vec![
+                account(10, true, Some(&["glm-5"])),
+                account(11, true, Some(&["kimi-k2"])),
+                account(12, true, None),
+            ],
+            model_source: Some(10),
+        };
+        let state = aggregate(Some(&provider), "glm-5", &[], &[]);
+        assert_eq!(
+            (state.ready, state.total),
+            (2, 2),
+            "11 does not serve glm-5, so it leaves the pool: {state:?}"
+        );
+        assert_eq!(state.stopped, None, "10 and 12 still dispatch");
+
+        // No account serves the entry's model at all: the entry is dead.
+        let provider = RouteProvider {
+            accounts: vec![account(10, true, Some(&["kimi-k2"]))],
+            model_source: Some(10),
+            ..provider
+        };
+        let state = aggregate(Some(&provider), "glm-5", &[], &[]);
+        assert_eq!(
+            state.stopped,
+            Some(Stopped::NoModel),
+            "whitelist refuses glm-5"
+        );
+        assert_eq!(state.stopped.map(Stopped::label), Some("无账号支持该模型"));
+        assert_eq!((state.ready, state.total), (0, 0), "pool is empty, not 0/1");
+    }
+
+    #[test]
+    fn a_model_served_only_by_disabled_accounts_is_stopped() {
+        let provider = RouteProvider {
+            id: 1,
+            name: "opencode-go".to_string(),
+            enabled: true,
+            accounts: vec![
+                account(10, false, Some(&["glm-5"])),
+                account(11, true, Some(&["kimi-k2"])),
+            ],
+            model_source: Some(11),
+        };
+        let state = aggregate(Some(&provider), "glm-5", &[], &[]);
+        // 10 serves glm-5 but is disabled, so dispatch has no account for this
+        // model — 无账号支持该模型, not 无可用账号: accounts are available, just
+        // none of them for this model.
+        assert_eq!(
+            state.stopped,
+            Some(Stopped::NoModel),
+            "no active account serves glm-5: {state:?}"
+        );
+        assert_eq!(state.stopped.map(Stopped::label), Some("无账号支持该模型"));
+        assert_eq!(
+            (state.ready, state.total),
+            (0, 1),
+            "pool counts the serving account even though it is disabled"
+        );
+    }
+
+    #[test]
+    fn a_stopped_entry_shows_no_cooldown() {
+        let mut provider = pool();
+        provider.enabled = false;
+        let rests = [rest(10, None, 30), rest(11, None, 20)];
+        let state = aggregate(Some(&provider), "glm-5", &[], &rests);
+        assert_eq!(state.stopped, Some(Stopped::Disabled));
+        assert_eq!(
+            state.cool_until, None,
+            "a disabled provider recovers by no clock, so no 冷却至 caption"
+        );
+    }
+
+    #[test]
+    fn inflight_counts_only_this_entrys_calls() {
+        let provider = pool();
+        let calls = [
+            call(10, "glm-5", "传输中"),
+            call(11, "glm-5", "连接中"),
+            call(11, "kimi-k2", "传输中"),
+            call(99, "glm-5", "传输中"),
+        ];
+        let state = aggregate(Some(&provider), "glm-5", &calls, &[]);
+        assert_eq!(state.inflight, 2, "accounts 10 and 11, model glm-5 only");
+        assert_eq!(
+            state.pool(),
+            "2/3 账号 · 进行中 2",
+            "hint carries the count"
+        );
+    }
+
+    #[test]
+    fn last_success_is_the_newest_across_the_providers_accounts() {
+        let provider = pool();
+        let success = [
+            ok(10, "glm-5", 5),
+            ok(11, "glm-5", 40),
+            ok(12, "glm-5", 25),
+            ok(99, "glm-5", 90),
+            ok(10, "kimi-k2", 80),
+        ];
+        let state = entry_state(Some(&provider), "glm-5", &[], &[], &success, now());
+        assert_eq!(
+            state.last_success,
+            Some(at(40)),
+            "other providers and models excluded"
+        );
     }
 }

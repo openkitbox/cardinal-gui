@@ -58,6 +58,13 @@ impl GroupFilter {
         }
     }
 
+    /// Whether the page shows one POOLED card per provider instead of one card
+    /// per account. 全部 and a single provider show providers; 未分组, a named
+    /// group and 归档 are groupings of accounts, so they keep per-account cards.
+    pub(super) fn pooled(self) -> bool {
+        matches!(self, Self::All | Self::Provider(_))
+    }
+
     /// Empty-state copy (title, hint) for a filter that admits no account.
     pub(super) fn empty_copy(self) -> (&'static str, &'static str) {
         match self {
@@ -271,13 +278,14 @@ pub(super) fn group_tags(key_id: i64, groups: &[KeyGroupView], cx: &App) -> Vec<
 impl ProvidersPage {
     /// The 分组 filter dropdown: the trigger names the current selection; the
     /// opened list floats above page content via `deferred` (never stretches
-    /// the tab row). Only called once data has loaded.
+    /// the tab row). `filter` is the effective filter the caller resolved.
+    /// Only called once data has loaded.
     pub(super) fn group_dropdown(
         &self,
         data: &super::ProvidersData,
+        filter: GroupFilter,
         cx: &mut Context<Self>,
     ) -> gpui::AnyElement {
-        let filter = self.group_filter.effective(&data.groups, data.key_facts());
         let current = match filter {
             GroupFilter::All => "全部",
             GroupFilter::Ungrouped => "未分组",
@@ -495,6 +503,30 @@ mod tests {
         assert!(
             kept == GroupFilter::Provider(10),
             "provider 10 has an account"
+        );
+    }
+
+    #[test]
+    fn only_the_all_and_provider_filters_pool_per_provider() {
+        assert!(
+            GroupFilter::All.pooled(),
+            "全部 shows one card per provider"
+        );
+        assert!(
+            GroupFilter::Provider(7).pooled(),
+            "a provider filter shows that provider's pooled card"
+        );
+        assert!(
+            !GroupFilter::Ungrouped.pooled(),
+            "未分组 groups accounts, not providers"
+        );
+        assert!(
+            !GroupFilter::Named(1).pooled(),
+            "a named group groups accounts, not providers"
+        );
+        assert!(
+            !GroupFilter::Archived.pooled(),
+            "归档 lists archived accounts one by one"
         );
     }
 
