@@ -659,7 +659,7 @@ impl ProvidersPage {
       })
       .relative()
       .w(px(KEY_CARD_WIDTH))
-      .when(!key.enabled || !provider.enabled || archived, |this| this.opacity(0.6))
+      .when(!key.enabled || !provider.enabled, |this| this.opacity(0.6))
       .when(dim_source, |this| this.opacity(0.4))
       // Insert indicator: a 2px accent line in the gap on the side where the
       // dragged card would land (left = before this card, right = after).
@@ -772,7 +772,9 @@ impl ProvidersPage {
                         }
                       }
                     }))
-                    .item(PopupMenuItem::new(if archived { "移出归档" } else { "归档" }).on_click({
+                    .item(PopupMenuItem::new(if archived { "移出归档" } else { "归档" })
+                      .icon(Icon::new(if archived { IconName::ArchiveRestore } else { IconName::Archive }).small())
+                      .on_click({
                       let weak = weak_menu.clone();
                       move |_, _window, cx| {
                         // Cached menu entity: read the current state at click time,
