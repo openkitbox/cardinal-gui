@@ -159,7 +159,7 @@ pub fn run(configs: Configs) {
             // exact size, so edge-drag resizing and the zoom button are disabled.
             let options = gpui::WindowOptions {
                 window_bounds: Some(WindowBounds::Windowed(bounds)),
-                is_resizable: false,
+                is_resizable: true,
                 ..Default::default()
             };
             open_window(options, cx, |window, cx| {
