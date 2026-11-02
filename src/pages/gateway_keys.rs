@@ -25,7 +25,7 @@ use gpui_kit::component::input::{Input, InputEvent, InputState};
 use gpui_kit::component::{ActiveTheme, Disableable as _, Icon, Sizable as _};
 
 use gateway::http_client::GatewayKeyUpdate;
-use gateway::store::{GatewayKeyRow, UserRow};
+use gateway::store::{GatewayKeyRow, OWNER_LOGIN, UserRow};
 
 use crate::pages::{
     ActionPage, LoadState, action_error_card, begin_load, card, empty_card, error_card,
@@ -163,7 +163,7 @@ impl GatewayKeysPage {
         let owner = self.users().and_then(|users| {
             users
                 .iter()
-                .find(|user| user.login == "owner")
+                .find(|user| user.login == OWNER_LOGIN)
                 .or_else(|| users.first())
                 .map(|user| user.id)
         });

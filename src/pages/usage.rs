@@ -21,7 +21,7 @@ use gpui_kit::component::date_picker::{
 };
 
 use gateway::http_client::UsageScope;
-use gateway::store::{GatewayKeyRow, TrendRow, TrendSplit, UsageWindow, UserRow};
+use gateway::store::{GatewayKeyRow, OWNER_LOGIN, TrendRow, TrendSplit, UsageWindow, UserRow};
 
 use crate::fmt::{humanize_count, usd_microus};
 use crate::pages::usage_trend::{TrendData, TrendGeometryCell, TrendMetric};
@@ -112,17 +112,15 @@ fn local_midnight(tz: chrono::FixedOffset, date: NaiveDate) -> DateTime<Utc> {
 type TrendCache =
     std::cell::RefCell<Option<((u64, TrendMetric, TrendSplit), std::rc::Rc<TrendData>)>>;
 
-/// The 客户端 filter over the overview's aggregates: every caller, one
-/// gateway key, the unidentified 本机 rows, or every key one user owns. The
-/// wire spelling of a selection is its [`UsageScope`]: `Key` sends `key_id`
-/// (labels are only unique per user, so a key is named by id and displayed
-/// as `login/label`), `Local` sends the reserved `caller=null`, `User` sends
+/// The 客户端 filter over the overview's aggregates: every caller, one gateway
+/// key that has no user, or every key one user owns. The wire spelling of a
+/// selection is its [`UsageScope`]: `Key` sends `key_id` (labels are only unique
+/// per user, so a key is named by id and displayed by its label), `User` sends
 /// `user_id`.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(super) enum ClientFilter {
     All,
-    Local,
-    Key { id: i64, name: String },
+    Key { id: i64, label: String },
     User { id: i64, login: String },
 }
 
@@ -131,7 +129,6 @@ impl ClientFilter {
     fn scope(&self) -> UsageScope {
         match self {
             Self::All => UsageScope::All,
-            Self::Local => UsageScope::Local,
             Self::Key { id, .. } => UsageScope::Key(*id),
             Self::User { id, .. } => UsageScope::User(*id),
         }
@@ -142,17 +139,29 @@ impl ClientFilter {
     fn label(&self) -> String {
         match self {
             Self::All => "全部".to_string(),
-            Self::Local => "本机".to_string(),
-            Self::Key { name, .. } => name.clone(),
+            Self::Key { label, .. } => label.clone(),
             Self::User { login, .. } => format!("用户 {login}"),
         }
     }
 }
 
-/// The 客户端 dropdown's key entries: (id, `login/label`).
-fn key_options(keys: &[GatewayKeyRow]) -> Vec<(i64, String)> {
+/// The 客户端 dropdown's key entries: (id, label) of the built-in `owner`
+/// user's keys only. Owner keys have no user identity, so they are the keys the
+/// filter can offer one by one; every other key is reached through its user.
+fn owner_key_options(keys: &[GatewayKeyRow]) -> Vec<(i64, String)> {
     keys.iter()
-        .map(|key| (key.id, format!("{}/{}", key.login, key.label)))
+        .filter(|key| key.login == OWNER_LOGIN)
+        .map(|key| (key.id, key.label.clone()))
+        .collect()
+}
+
+/// The 客户端 dropdown's 按用户 group: (id, login) of the real users. The
+/// built-in `owner` is left out — its keys appear as bare labels above instead.
+fn real_users(users: &[UserRow]) -> Vec<(i64, String)> {
+    users
+        .iter()
+        .filter(|user| user.login != OWNER_LOGIN)
+        .map(|user| (user.id, user.login.clone()))
         .collect()
 }
 
@@ -181,16 +190,16 @@ pub struct UsagePage {
     pub(super) trend_metric: TrendMetric,
     /// Trend split dimension; switching refetches.
     pub(super) trend_split: TrendSplit,
-    /// 客户端 dropdown's selection (全部 / 本机 / one key / one user);
+    /// 客户端 dropdown's selection (全部 / one unowned key / one user);
     /// switching refetches.
     pub(super) client_filter: ClientFilter,
-    /// Dropdown options: the registered gateway keys as (id, `login/label`) —
-    /// seeded from the pushed bootstrap document, refetched on a `resync` gap.
-    /// A failure degrades to just the fixed 全部/本机 entries.
+    /// Dropdown key entries: the built-in `owner`'s gateway keys as (id, label)
+    /// — seeded from the pushed bootstrap document, refetched on a `resync` gap.
+    /// A failure degrades to just the fixed 全部 entry.
     keys: Vec<(i64, String)>,
-    /// Dropdown 按用户 group: the users' (id, login), loaded from
-    /// `/api/users` (not in the bootstrap document). A failure degrades to an
-    /// empty group.
+    /// Dropdown 按用户 group: the real users' (id, login), loaded from
+    /// `/api/users` (not in the bootstrap document) with the built-in `owner`
+    /// filtered out. A failure degrades to an empty group.
     users: Vec<(i64, String)>,
     /// Last seen activity-feed revisions: `bootstrap_rev` seeds the key list
     /// from the pushed document; `resync` (a stream-continuity gap) falls back
@@ -271,7 +280,7 @@ impl UsagePage {
             if bootstrap_rev != page.seen_bootstrap {
                 page.seen_bootstrap = bootstrap_rev;
                 if let Some(document) = feed.read(cx).bootstrap() {
-                    page.keys = key_options(&document.gateway_keys);
+                    page.keys = owner_key_options(&document.gateway_keys);
                 }
                 page.reload_users(cx);
                 page.reload(cx);
@@ -312,16 +321,16 @@ impl UsagePage {
             && landed > 0
             && let Some(document) = this.feed.read(cx).bootstrap()
         {
-            this.keys = key_options(&document.gateway_keys);
+            this.keys = owner_key_options(&document.gateway_keys);
             this.reload_users(cx);
             this.reload(cx);
         }
         this
     }
 
-    /// (Re)load the 客户端 dropdown's key list (every registered gateway key,
-    /// enabled or not, as `login/label`). A failure degrades silently to the fixed
-    /// 全部/本机 entries; a reload is harmless to re-run.
+    /// (Re)load the 客户端 dropdown's key list: the built-in `owner`'s keys,
+    /// enabled or not, by label. A failure degrades silently to the fixed 全部
+    /// entry; a reload is harmless to re-run.
     fn reload_keys(&mut self, cx: &mut Context<Self>) {
         let load = cx
             .global::<GatewayRuntime>()
@@ -330,7 +339,7 @@ impl UsagePage {
             let result = load.await;
             this.update(cx, |page, cx| {
                 if let Ok(keys) = result {
-                    page.keys = key_options(&keys);
+                    page.keys = owner_key_options(&keys);
                     cx.notify();
                 }
             })
@@ -349,10 +358,7 @@ impl UsagePage {
             let result = load.await;
             this.update(cx, |page, cx| {
                 if let Ok(users) = result {
-                    page.users = users
-                        .into_iter()
-                        .map(|user: UserRow| (user.id, user.login))
-                        .collect();
+                    page.users = real_users(&users);
                     cx.notify();
                 }
             })
@@ -421,10 +427,6 @@ impl UsagePage {
         if !self.client_list_open {
             return trigger.into_any_element();
         }
-        let fixed = [
-            ("usage-client-all", ClientFilter::All),
-            ("usage-client-local", ClientFilter::Local),
-        ];
         let mut options = gpui::div()
             .id("usage-client-list")
             .flex()
@@ -435,17 +437,15 @@ impl UsagePage {
             .bg(cx.theme().popover)
             .shadow_lg()
             .max_h(px(240.))
-            .overflow_y_scroll();
-        for (id, option) in fixed {
-            options = options.child(self.client_option(id, option, cx));
-        }
-        for (key_id, name) in &self.keys {
+            .overflow_y_scroll()
+            .child(self.client_option("usage-client-all", ClientFilter::All, cx));
+        for (key_id, key_label) in &self.keys {
             let id = ElementId::from(gpui::SharedString::from(format!(
                 "usage-client-key-{key_id}"
             )));
             let option = ClientFilter::Key {
                 id: *key_id,
-                name: name.clone(),
+                label: key_label.clone(),
             };
             options = options.child(self.client_option(id, option, cx));
         }
@@ -778,5 +778,111 @@ fn speed_sub(window: &UsageWindow) -> String {
         )
     } else {
         "无计时数据".to_string()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The instant handed to rows whose timestamp the dropdown never reads: a
+    /// fixed value keeps the fixtures deterministic.
+    fn epoch() -> DateTime<Utc> {
+        DateTime::from_timestamp(0, 0).expect("the unix epoch is a valid instant")
+    }
+
+    /// A key row carrying only what the dropdown derivation reads; everything
+    /// else gets a fixed value, so a test states just the field it is about.
+    fn key_row(id: i64, label: &str, login: &str) -> GatewayKeyRow {
+        GatewayKeyRow {
+            id,
+            key: format!("sk-test-{id}"),
+            label: label.to_string(),
+            enabled: true,
+            user_id: if login == OWNER_LOGIN { 1 } else { 2 },
+            login: login.to_string(),
+            created_at: epoch(),
+            created_by: None,
+            last_used_at: None,
+            disabled_at: None,
+            expires_at: None,
+            quota_microus: None,
+            spent_microus: 0,
+        }
+    }
+
+    /// A user row carrying only the identity the dropdown reads.
+    fn user_row(id: i64, login: &str) -> UserRow {
+        UserRow {
+            id,
+            login: login.to_string(),
+            display_name: login.to_string(),
+            enabled: true,
+            group_id: 1,
+            group_name: "internal".to_string(),
+            rate_bp: None,
+            group_rate_bp: 0,
+            balance_microus: 0,
+            max_concurrent: 1,
+            rpm: None,
+            created_at: epoch(),
+        }
+    }
+
+    #[test]
+    fn owner_keys_are_offered_by_label() {
+        let keys = [
+            key_row(1, "default", OWNER_LOGIN),
+            key_row(2, "alice-1", "alice"),
+            key_row(3, "antb", OWNER_LOGIN),
+        ];
+        assert_eq!(
+            owner_key_options(&keys),
+            vec![(1, "default".to_string()), (3, "antb".to_string())],
+            "only the owner's keys are listed, by bare label and in input order"
+        );
+    }
+
+    #[test]
+    fn real_users_drop_the_builtin_owner() {
+        let users = [user_row(1, OWNER_LOGIN), user_row(2, "alice")];
+        assert_eq!(
+            real_users(&users),
+            vec![(2, "alice".to_string())],
+            "the built-in owner is not a user scope; its keys are listed by label"
+        );
+    }
+
+    #[test]
+    fn filter_labels_and_scopes_name_the_selection() {
+        let key = ClientFilter::Key {
+            id: 7,
+            label: "default".to_string(),
+        };
+        assert_eq!(
+            key.label(),
+            "default",
+            "a key shows its label; only users carry the 用户 prefix"
+        );
+        assert_eq!(
+            key.scope(),
+            UsageScope::Key(7),
+            "a key selection filters that one key id on the wire"
+        );
+        let user = ClientFilter::User {
+            id: 2,
+            login: "alice".to_string(),
+        };
+        assert_eq!(user.label(), "用户 alice", "a user scope names the user");
+        assert_eq!(
+            user.scope(),
+            UsageScope::User(2),
+            "a user selection filters that user's keys on the wire"
+        );
+        assert_eq!(
+            ClientFilter::All.scope(),
+            UsageScope::All,
+            "全部 counts every caller"
+        );
     }
 }
