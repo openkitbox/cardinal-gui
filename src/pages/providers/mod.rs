@@ -25,6 +25,7 @@ mod chip;
 mod group_editor;
 mod groups;
 pub mod kiro_import;
+mod order;
 mod quota;
 mod trend;
 
@@ -32,8 +33,8 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use gpui::{
-    AppContext as _, Context, Entity, Focusable as _, IntoElement, ParentElement, Render, Styled,
-    Window, prelude::FluentBuilder as _,
+    AppContext as _, Context, Entity, Focusable as _, InteractiveElement, IntoElement,
+    ParentElement, Render, Styled, Window, prelude::FluentBuilder as _,
 };
 use gpui_kit::assets::IconName;
 use gpui_kit::component::button::{Button, ButtonVariant};
@@ -47,6 +48,7 @@ use gateway::probe::ProbeModel;
 use gateway::quota::KeyQuota;
 use gateway::store::{KeyGroupView, ProviderInput, ProviderKeyView, ProviderRow, RestRow};
 
+use cards::CardDrag;
 use catalog::{
     PROTOCOL_CHOICES, PROVIDER_SPECS, ProtocolChoice, Region, is_custom, protocol_choice, resolve,
 };
@@ -424,6 +426,19 @@ impl CustomEdit {
     }
 }
 
+/// Live card-drag state: which account is being dragged and over which card it
+/// currently sits. Local view state only: a finished drop or a cancelled drag
+/// clears it, and a stale leftover is healed by the page-level mouse-move
+/// handler once `App::has_active_drag()` reports false (gpui has no drag-end
+/// notification). `dragged` alone decides the faded source; the target pair
+/// decides where the insert line shows.
+pub(super) struct KeyDrag {
+    dragged: i64,
+    /// The drop target card and the side of it the card would land on
+    /// ([`order::DropSide`]). `None` until the pointer is over a card.
+    target: Option<(i64, order::DropSide)>,
+}
+
 /// Upstream API keys, one card each.
 pub struct ProvidersPage {
     state: LoadState<ProvidersData>,
@@ -451,6 +466,13 @@ pub struct ProvidersPage {
     seen_bootstrap: u64,
     /// Last seen `quota_rev`: a finished probe round re-reads the document.
     seen_quota: u64,
+    /// Live card drag-and-drop state (see [`KeyDrag`]).
+    drag: Option<KeyDrag>,
+    /// A `PUT /api/keys/order` is in flight. While it is, a further drop is
+    /// ignored: its rollback target would be an optimistic order the server
+    /// never stored, so two overlapping drops could both fail and leave the
+    /// grid on neither the served nor the requested order.
+    order_write_in_flight: bool,
 }
 
 impl ProvidersPage {
@@ -470,6 +492,8 @@ impl ProvidersPage {
             seen_resync: feed.read(cx).resync(),
             seen_bootstrap: feed.read(cx).bootstrap_rev(),
             seen_quota: feed.read(cx).quota_rev(),
+            drag: None,
+            order_write_in_flight: false,
         };
         // The page renders from the PUSHED bootstrap document — providers,
         // every key (with its model snapshot), the stored quota readings and
@@ -658,6 +682,153 @@ impl ProvidersPage {
         crate::pages::run_write(cx, f);
     }
 
+    /// Begin dragging one account's card: its grip was grabbed. The card is a
+    /// drag source and every card is a drop target, so this only records the
+    /// source; the target follows the pointer ([`Self::aim_card_drop`]). The
+    /// card's label comes back for the drag ghost, looked up once here rather
+    /// than cloned on every render of every card.
+    fn start_card_drag(&mut self, provider_id: i64, key_id: i64, cx: &mut Context<Self>) -> String {
+        self.drag = Some(KeyDrag {
+            dragged: key_id,
+            target: None,
+        });
+        cx.notify();
+        self.key_label(provider_id, key_id).unwrap_or_default()
+    }
+
+    /// The pointer moved over card `target` during a drag: remember which side
+    /// of that card the drop would land on. Repaint only when the aimed pair
+    /// actually changes — the listener fires on every mouse move.
+    fn aim_card_drop(&mut self, target: i64, side: order::DropSide, cx: &mut Context<Self>) {
+        let Some(drag) = self.drag.as_mut() else {
+            return;
+        };
+        let aimed = Some((target, side));
+        if drag.target == aimed {
+            return;
+        }
+        drag.target = aimed;
+        cx.notify();
+    }
+
+    /// The card carrying `dragged` was dropped: move it to the aimed slot, then
+    /// write the resulting global order back to the gateway. The cards move
+    /// first (optimistic), so a failed write restores the order loaded before
+    /// the drop — see [`Self::submit_key_order`].
+    fn finish_card_drop(&mut self, dragged: i64, cx: &mut Context<Self>) {
+        let Some(drag) = self.drag.take() else {
+            return;
+        };
+        // The drop is over: the faded source and the insert line go whatever
+        // happens next.
+        cx.notify();
+        // One reorder write at a time: `submit_key_order`'s rollback restores
+        // the order the server had when the drop was made, so a second drop
+        // taken while the first is still in flight could roll back onto an
+        // order the server never stored. The drop is refused and the refusal
+        // is stated, so the drag does not just appear to do nothing.
+        if self.order_write_in_flight {
+            self.action_error = Some("上一步排序仍在保存，请稍后再拖".to_string());
+            cx.notify();
+            return;
+        }
+        if drag.dragged != dragged {
+            return; // a stale payload, not the card this page is dragging
+        }
+        let Some((target, side)) = drag.target else {
+            return;
+        };
+        let LoadState::Loaded(data) = &self.state else {
+            return;
+        };
+        // Only 全部 allows reordering (its cards are the only ones wired to
+        // drag at all); a drop arriving under any other filter is refused
+        // rather than turned into a write.
+        let (filter, _) = self.view_filter(data);
+        if !filter.allows_reorder() {
+            return;
+        }
+        let all: Vec<i64> = data.keys.iter().map(|card| card.key.id).collect();
+        let visible = self.visible_ids(data);
+        let order = order::reorder_visible(&all, &visible, dragged, target, side);
+        // Dropped on itself or somewhere the move cannot be expressed: the
+        // global order is unchanged, so no write is fired.
+        if order == all {
+            return;
+        }
+        let previous = all;
+        self.apply_key_order(&order);
+        cx.notify();
+        self.submit_key_order(cx, order, previous);
+    }
+
+    /// The account ids the current filter shows, in the global (position, id)
+    /// order the grid renders them — the same [`Visibility::admits`] predicate
+    /// the render uses, so a drop moves exactly the cards the user sees.
+    fn visible_ids(&self, data: &ProvidersData) -> Vec<i64> {
+        let (_, visibility) = self.view_filter(data);
+        data.keys
+            .iter()
+            .map(|card| card.key.id)
+            .filter(|id| visibility.admits(*id))
+            .collect()
+    }
+
+    /// Re-seat the loaded cards in `order` — a permutation of their ids — so
+    /// the grid immediately shows the new sequence. The cards are moved into
+    /// their slots (a sort by target rank), never copied; the same call runs
+    /// the optimistic move and its rollback.
+    fn apply_key_order(&mut self, order: &[i64]) {
+        let LoadState::Loaded(data) = &mut self.state else {
+            return;
+        };
+        let rank: HashMap<i64, usize> = order
+            .iter()
+            .enumerate()
+            .map(|(slot, id)| (*id, slot))
+            .collect();
+        // An id outside `order` cannot happen (`reorder_visible` returns a
+        // permutation or the input unchanged); it would sort last.
+        data.keys
+            .sort_by_key(|card| rank.get(&card.key.id).copied().unwrap_or(usize::MAX));
+    }
+
+    /// Write a dropped order back as the gateway's global key order. This is
+    /// the one write that cannot go through
+    /// [`crate::pages::run_write`]: the cards already moved, so a failure has
+    /// to restore `previous` (the order loaded before the drop) or the page
+    /// would keep showing an order the server never stored. Failures still
+    /// surface in the page's action-error slot; success clears it and reloads,
+    /// and the bootstrap brings the new `position` values back.
+    fn submit_key_order(&mut self, cx: &mut Context<Self>, order: Vec<i64>, previous: Vec<i64>) {
+        self.order_write_in_flight = true;
+        let call = cx
+            .global::<GatewayRuntime>()
+            .admin_call(move |admin| async move { admin.reorder_keys(&order).await });
+        cx.spawn(async move |this, cx| {
+            let result = call.await;
+            this.update(cx, |page, cx| match result {
+                Ok(()) => {
+                    page.order_write_in_flight = false;
+                    page.action_error = None;
+                    page.reload(cx);
+                }
+                Err(error) => {
+                    page.order_write_in_flight = false;
+                    page.apply_key_order(&previous);
+                    page.action_error = Some(error);
+                    // Re-read once as well: the rollback restores the order the
+                    // page had at drop time, and a pushed bootstrap may have
+                    // landed since. The reload is the authority; the error
+                    // stays on screen either way.
+                    page.reload(cx);
+                }
+            })
+            .ok();
+        })
+        .detach();
+    }
+
     /// One key's loaded card (`None` if unknown, or once it left the list).
     /// Menus capture ids only and resolve through this at click time, because
     /// their entities are cached between opens and a captured row goes stale.
@@ -684,8 +855,9 @@ impl ProvidersPage {
     }
 
     /// The key's label as the page last loaded it (`None` if unknown): the
-    /// delete confirmation names the account, so it reads the current label
-    /// rather than one captured at render time.
+    /// delete confirmation names the account and the drag ghost shows it, both
+    /// read at the moment they are needed rather than capturing one at render
+    /// time.
     fn key_label(&self, provider_id: i64, key_id: i64) -> Option<String> {
         self.key_row(provider_id, key_id)
             .map(|card| card.key.label.clone())
@@ -2021,13 +2193,32 @@ impl Render for ProvidersPage {
         self.sync_group_manager(window, cx);
         // No page title/subtitle (the tab bar names the view) and no action row:
         // the actions live in the tab row, so the content starts immediately.
-        let frame = page_frame("", "", cx);
+        // Self-heal for a cancelled card drag (gpui has no drag-end event): once
+        // the OS reports no active drag, any leftover drag state is stale.
+        let frame_weak = cx.weak_entity();
+        let frame = page_frame("", "", cx).on_mouse_move(move |_, _, cx| {
+            frame_weak
+                .update(cx, |this, cx| {
+                    if this.drag.is_some() && !cx.has_active_drag() {
+                        this.drag = None;
+                        cx.notify();
+                    }
+                })
+                .ok();
+        });
         match &self.state {
             LoadState::Loading => frame.child(loading_card(cx)),
             LoadState::Failed(error) => frame.child(error_card(error, cx)),
             LoadState::Loaded(data) => {
                 // Derived per render from the loaded groups: nothing cached.
                 let (filter, visibility) = self.view_filter(data);
+                // Only 全部 reorders accounts: every other view is a filtered
+                // subset of the global order and stays read-only.
+                let drag = if filter.allows_reorder() {
+                    CardDrag::Enabled
+                } else {
+                    CardDrag::Disabled
+                };
                 // One clock reading for the whole render: every card judges
                 // expired cooldowns and renewed windows against the same instant.
                 let now = chrono::Utc::now();
@@ -2067,6 +2258,7 @@ impl Render for ProvidersPage {
                                     .unwrap_or(&[]),
                                 &data.groups,
                                 now,
+                                drag,
                                 cx,
                             )
                         }))

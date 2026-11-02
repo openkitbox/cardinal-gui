@@ -63,6 +63,15 @@ impl GroupFilter {
         }
     }
 
+    /// Whether the cards of this view can be reordered by dragging. Only 全部
+    /// can: the other views show a filtered subset (or only the archived
+    /// accounts), and a drop there would have to move accounts the user cannot
+    /// see. Those views keep the global (position, id) order — read-only.
+    #[must_use]
+    pub(super) fn allows_reorder(self) -> bool {
+        matches!(self, Self::All)
+    }
+
     /// Empty-state copy (title, hint) for a filter that admits no account.
     pub(super) fn empty_copy(self) -> (&'static str, &'static str) {
         match self {
@@ -570,5 +579,29 @@ mod tests {
         assert_eq!(counts.all, 3, "archived key 4 is excluded");
         assert_eq!(counts.ungrouped, 2, "only key 1 is grouped");
         assert_eq!(counts.archived, 1, "key 4 is archived");
+    }
+
+    #[test]
+    fn only_the_all_view_allows_reordering() {
+        assert!(
+            GroupFilter::All.allows_reorder(),
+            "全部 shows every unarchived account, so a drop moves exactly the cards the user sees"
+        );
+        assert!(
+            !GroupFilter::Ungrouped.allows_reorder(),
+            "未分组 hides the grouped accounts, so a drop could not be expressed without moving them"
+        );
+        assert!(
+            !GroupFilter::Named(1).allows_reorder(),
+            "a named group shows a subset of the global order"
+        );
+        assert!(
+            !GroupFilter::Provider(10).allows_reorder(),
+            "one provider's accounts are a subset of the global order"
+        );
+        assert!(
+            !GroupFilter::Archived.allows_reorder(),
+            "归档 shows only archived accounts, which keep their global slots"
+        );
     }
 }

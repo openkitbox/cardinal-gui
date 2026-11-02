@@ -8,8 +8,8 @@ use std::sync::Arc;
 
 use gpui::{
     Anchor, App, AppContext as _, Context, Div, ElementId, Entity, Image, ImageFormat,
-    InteractiveElement, IntoElement, ParentElement, StatefulInteractiveElement, Styled, WeakEntity,
-    img, prelude::FluentBuilder as _, px, relative,
+    InteractiveElement, IntoElement, ParentElement, Render, StatefulInteractiveElement, Styled,
+    WeakEntity, Window, img, prelude::FluentBuilder as _, px, relative,
 };
 use gpui_kit::assets::IconName;
 use gpui_kit::component::button::{Button, ButtonVariants};
@@ -31,6 +31,7 @@ use super::catalog::{
 use super::chip::selectable_chip;
 use super::groups::{group_chips, group_tags};
 use super::kiro_import;
+use super::order::DropSide;
 use super::quota::quota_row;
 use super::{FormSource, KeyCardData, KeyEditor, KeyForm, KiroImportForm, ProvidersPage};
 use crate::app::StatusTip;
@@ -590,12 +591,18 @@ impl ProvidersPage {
     /// One per-account key card: provider logo + label header, quota meters,
     /// model rows, status tags and row actions. `rests` are the key's active
     /// cooldowns (health info): one tag per row with a shared clear action.
+    /// With [`CardDrag::Enabled`] the card is both a drag source (only from the
+    /// grip dots in its top-left corner, so the card body keeps its own
+    /// clicks) and a drop target — dropping on the left/right half of another
+    /// card inserts before/after it. [`CardDrag::Disabled`] renders the very
+    /// same card with no drag wiring at all.
     pub(super) fn key_card(
         &self,
         card_data: &KeyCardData,
         rests: &[RestRow],
         groups: &[KeyGroupView],
         now: chrono::DateTime<chrono::Utc>,
+        drag: CardDrag,
         cx: &mut Context<Self>,
     ) -> Div {
         let provider = &card_data.provider;
@@ -608,12 +615,120 @@ impl ProvidersPage {
             return self.key_editor_card(editor, card_data, groups, cx);
         }
         let key_id = key.id;
+        let provider_id = provider.id;
         let archived = key.archived_at.is_some();
         let spec = spec_for(&provider.name);
         let rests = live_rests(rests, now);
-        card(cx)
+        let base = card(cx)
             .w(px(KEY_CARD_WIDTH))
-            .when(!key.enabled || !provider.enabled, |this| this.opacity(0.6))
+            .when(!key.enabled || !provider.enabled, |this| this.opacity(0.6));
+        // Drag visuals exist only while a drag is actually active (gpui-fast is
+        // retained-mode: gating on `has_active_drag` also clears a stale
+        // leftover). Both are derived from the page's single drag state, so
+        // exactly one card is faded and exactly one insert line shows.
+        let (dim_source, insert_side) = match (drag, &self.drag) {
+            (CardDrag::Enabled, Some(state)) if cx.has_active_drag() => (
+                state.dragged == key_id,
+                match state.target {
+                    Some((target, side)) if target == key_id && state.dragged != key_id => {
+                        Some(side)
+                    }
+                    _ => None,
+                },
+            ),
+            _ => (false, None),
+        };
+        let (surface, grip) = match drag {
+            CardDrag::Disabled => (base, None),
+            CardDrag::Enabled => {
+                let weak_move = cx.weak_entity();
+                let weak_drop = cx.weak_entity();
+                let weak_grip = cx.weak_entity();
+                let surface = base
+                    .group("key-card")
+                    .on_drag_move::<DraggedKey>(move |event, _window, cx| {
+                        // The drag *origin* card's move listener fires wherever
+                        // the pointer is ("as long as the drag started on this
+                        // element"); only a card whose bounds actually contain
+                        // the pointer may claim target status.
+                        if !event.bounds.contains(&event.event.position) {
+                            return;
+                        }
+                        // The card to the right of the halfway line lands after
+                        // this one; the left half lands before it.
+                        let side = if event.event.position.x >= event.bounds.center().x {
+                            DropSide::After
+                        } else {
+                            DropSide::Before
+                        };
+                        weak_move
+                            .update(cx, |this, cx| this.aim_card_drop(key_id, side, cx))
+                            .ok();
+                    })
+                    .on_drop::<DraggedKey>(move |dropped, _window, cx| {
+                        weak_drop
+                            .update(cx, |this, cx| this.finish_card_drop(dropped.id, cx))
+                            .ok();
+                    })
+                    .relative()
+                    .when_some(insert_side, |this, side| {
+                        // 2px accent line in the gap on the side the dragged
+                        // card would land on (left = before, right = after).
+                        let line = gpui::div()
+                            .absolute()
+                            .top_0()
+                            .bottom_0()
+                            .w(px(2.))
+                            .bg(cx.theme().primary);
+                        let line = match side {
+                            DropSide::Before => line.left(px(-11.)),
+                            DropSide::After => line.right(px(-11.)),
+                        };
+                        this.child(line)
+                    })
+                    .when(dim_source, |this| this.opacity(0.4));
+                // The grip sits in the card's left padding, aligned with the
+                // header logo (whose position never shifts) and hidden until
+                // the card is hovered: the only grab surface on the card.
+                let grip = gpui::div()
+                    .id(("key-grip", key_id as u64))
+                    .absolute()
+                    .top(px(14.))
+                    .left(px(3.5))
+                    .w(px(12.))
+                    .p_1()
+                    .opacity(0.)
+                    .group_hover("key-card", |this| this.opacity(0.5))
+                    .cursor_grab()
+                    .on_drag(
+                        DraggedKey { id: key_id },
+                        move |_dragged, _offset, _window, cx| {
+                            // The label is read once, when the drag starts: the
+                            // ghost needs text, but cloning it per card on every
+                            // render would be a copy the drag rarely needs.
+                            let label = weak_grip
+                                .update(cx, |this, cx| {
+                                    this.start_card_drag(provider_id, key_id, cx)
+                                })
+                                .unwrap_or_default();
+                            cx.new(|_| DragGhost { label })
+                        },
+                    )
+                    .flex()
+                    .flex_col()
+                    .gap(px(3.))
+                    .children((0..3).map(|_| {
+                        gpui::div()
+                            .w(px(2.))
+                            .h(px(2.))
+                            .rounded_full()
+                            .bg(cx.theme().muted_foreground)
+                            .opacity(0.5)
+                    }));
+                (surface, Some(grip))
+            }
+        };
+        surface
             // Header: provider icon, key label, probe age and the ⋯ menu
             // holding enable/edit/archive/delete.
             .child(
@@ -684,6 +799,7 @@ impl ProvidersPage {
                     this.child(rest_tags(key_id, &rests, now, cx))
                 }
             })
+            .when_some(grip, |this, grip| this.child(grip))
     }
 
     /// The card's edit mode: label and model inputs, save/cancel. The
@@ -982,6 +1098,43 @@ impl ProvidersPage {
                             .on_click(cx.listener(|this, _, _, cx| this.save_key_editor(cx))),
                     ),
             )
+    }
+}
+
+/// Whether a card may be dragged to reorder the accounts. A two-variant enum
+/// rather than a `bool`, because the call site reads `key_card(.., drag, cx)`
+/// and the decision itself is [`super::groups::GroupFilter::allows_reorder`].
+/// `Disabled` leaves the card a plain element: no bindings, no grip, no
+/// insert line.
+#[derive(Clone, Copy)]
+pub(super) enum CardDrag {
+    Enabled,
+    Disabled,
+}
+
+/// Drag payload carried by an active card drag (the dragged account's id).
+struct DraggedKey {
+    id: i64,
+}
+
+/// The little chip following the cursor while a card is dragged.
+struct DragGhost {
+    label: String,
+}
+
+impl Render for DragGhost {
+    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        gpui::div()
+            .px_3()
+            .py_1()
+            .rounded_md()
+            .border_1()
+            .border_color(cx.theme().primary)
+            .bg(cx.theme().accent)
+            .text_size(px(12.))
+            .text_color(cx.theme().foreground)
+            .opacity(0.9)
+            .child(self.label.clone())
     }
 }
 
