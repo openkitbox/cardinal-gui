@@ -1,9 +1,8 @@
 //! The account cards: add-form, display and edit modes are one card swapping
 //! contents — they share [`KEY_CARD_WIDTH`] (an edit card narrower than the
-//! card it replaced reads as a layout jump). Two display shapes: one card per
-//! account (未分组 / a named group / 归档) and one POOLED card per provider
-//! (全部 / a provider filter), whose pooled numbers come from the `pool`
-//! module. Pure rendering; all behavior lives in `super` (the page impl).
+//! card it replaced reads as a layout jump). One display shape: one card per
+//! account, whatever the filter. Pure rendering; all behavior lives in
+//! `super` (the page impl).
 
 use std::sync::Arc;
 
@@ -32,14 +31,8 @@ use super::catalog::{
 use super::chip::selectable_chip;
 use super::groups::{group_chips, group_tags};
 use super::kiro_import;
-use super::pool;
-use super::pool::PoolAccount;
-use super::pool_card::{pool_counts, pool_quota, pooled_account_row, variant_row};
 use super::quota::quota_row;
-use super::{
-    FormSource, KeyCardData, KeyEditor, KeyForm, KiroImportForm, ProviderGroup, ProvidersData,
-    ProvidersPage,
-};
+use super::{FormSource, KeyCardData, KeyEditor, KeyForm, KiroImportForm, ProvidersPage};
 use crate::app::StatusTip;
 use crate::fmt::mask_api_key;
 use crate::pages::{LoadState, card};
@@ -693,77 +686,12 @@ impl ProvidersPage {
             })
     }
 
-    /// One provider's pooled card (全部 and per-provider filters): header with
-    /// the provider's account counts, the pooled quota of its available
-    /// accounts, then one compact row per unarchived account. Trend charts,
-    /// model rows and group tags stay on the per-account cards — a pool has no
-    /// single account to chart or tag.
-    pub(super) fn provider_card(
-        &self,
-        group: &ProviderGroup<'_>,
-        data: &ProvidersData,
-        now: chrono::DateTime<chrono::Utc>,
-        cx: &mut Context<Self>,
-    ) -> Div {
-        let provider = group.provider;
-        // An open editor replaces the card it belongs to, as on the
-        // per-account cards.
-        if let Some(editor) = self.key_editor.as_ref()
-            && let Some(card_data) = group.cards.iter().find(|card| card.key.id == editor.key_id)
-        {
-            return self.key_editor_card(editor, card_data, &data.groups, cx);
-        }
-        // The group's cards are the provider's unarchived accounts (the
-        // pooled filters never admit an archived one). An archived account is
-        // in no count and spends nothing, so the pool reads the same as over
-        // every account the provider has (pinned in pool.rs's tests), without
-        // rescanning the whole key list per card.
-        let accounts: Vec<PoolAccount<'_>> =
-            group.cards.iter().copied().map(PoolAccount::from).collect();
-        let pooled = pool::pool(&accounts, now, crate::ui_tz::display_tz());
-        let spec = spec_for(&provider.name);
-        card(cx)
-            .w(px(KEY_CARD_WIDTH))
-            .when(!provider.enabled, |this| this.opacity(0.6))
-            .child(
-                gpui::div()
-                    .flex()
-                    .items_center()
-                    .gap_2()
-                    .child(provider_icon_for(provider, spec, 18., cx))
-                    .child(
-                        gpui::div()
-                            .flex_1()
-                            .overflow_hidden()
-                            .font_weight(gpui::FontWeight::MEDIUM)
-                            .text_color(cx.theme().foreground)
-                            .child(provider.name.clone()),
-                    )
-                    // Dimming alone is easy to miss: say why the pool spends
-                    // nothing.
-                    .when(!provider.enabled, |this| {
-                        this.child(Tag::danger().child("已停用"))
-                    })
-                    .child(pool_counts(pooled.counts, cx)),
-            )
-            .when_some(variant_row(provider, cx), |this, row| this.child(row))
-            .when_some(pool_quota(&pooled, cx), |this, block| this.child(block))
-            .children(group.cards.iter().map(|card_data| {
-                let rests = data
-                    .rests
-                    .get(&card_data.key.id)
-                    .map(Vec::as_slice)
-                    .unwrap_or(&[]);
-                pooled_account_row(card_data, rests, now, cx)
-            }))
-    }
-
     /// The card's edit mode: label and model inputs, save/cancel. The
     /// API key itself is read-only (rotate = delete + re-add): masked by default,
     /// with a reveal toggle and a copy button. Its plaintext is fetched when the
     /// editor opens (the list shapes carry none): until that lands, or if it
     /// fails, the row shows a placeholder and the copy button is disabled.
-    pub(super) fn key_editor_card(
+    fn key_editor_card(
         &self,
         editor: &KeyEditor,
         card_data: &KeyCardData,
@@ -1061,7 +989,7 @@ impl ProvidersPage {
 /// rows only when it builds the snapshot, and the page keeps rendering that
 /// snapshot, so a cooldown that ended since must not show as resting.
 #[must_use]
-pub(super) fn live_rests(rests: &[RestRow], now: chrono::DateTime<chrono::Utc>) -> Vec<&RestRow> {
+fn live_rests(rests: &[RestRow], now: chrono::DateTime<chrono::Utc>) -> Vec<&RestRow> {
     rests.iter().filter(|rest| rest.rest_until > now).collect()
 }
 
@@ -1070,7 +998,7 @@ pub(super) fn live_rests(rests: &[RestRow], now: chrono::DateTime<chrono::Utc>) 
 /// long upstream message would be truncated into noise) plus the 清除 action
 /// that wakes the whole key. `rests` are the [`live_rests`] at `now`; callers
 /// render the footer only when there is one.
-pub(super) fn rest_tags(
+fn rest_tags(
     key_id: i64,
     rests: &[&RestRow],
     now: chrono::DateTime<chrono::Utc>,
@@ -1124,11 +1052,10 @@ pub(super) fn rest_tags(
     )
 }
 
-/// The ⋯ menu button of one account — the per-account card's header and the
-/// pooled card's rows share it. Only the ids and the two flags the items
-/// display are captured (the menu entity is cached between opens and cannot
-/// borrow the card); every click resolves the key through the page.
-pub(super) fn key_menu_button(
+/// The ⋯ menu button of one account card. Only the ids and the two flags the
+/// items display are captured (the menu entity is cached between opens and
+/// cannot borrow the card); every click resolves the key through the page.
+fn key_menu_button(
     provider_id: i64,
     key: &ProviderKeyView,
     weak: WeakEntity<ProvidersPage>,
@@ -1527,9 +1454,8 @@ fn tag_row(key_id: i64, provider: &ProviderRow, groups: &[KeyGroupView], cx: &Ap
 
 /// The variant markers of a catalog variant row (kimi/glm only): 区域
 /// (国内/国际), then Coding Plan when it is one. Empty for a non-catalog row
-/// (a manually-added provider). Shared by the per-account tag row and the
-/// pooled card's marker row.
-pub(super) fn variant_markers(provider: &ProviderRow, cx: &App) -> Vec<Div> {
+/// (a manually-added provider). Rendered on the account card's tag row.
+fn variant_markers(provider: &ProviderRow, cx: &App) -> Vec<Div> {
     let Some((region, coding_plan)) = variant_of_row(&provider.name, &provider.base_url) else {
         return Vec::new();
     };

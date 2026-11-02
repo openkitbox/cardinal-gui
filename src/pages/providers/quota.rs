@@ -11,7 +11,6 @@
 //! history shapes the curve, never the forecast, so a freshly deployed
 //! gateway shows the full diagonal alone while its series fills in.
 
-use std::fmt;
 use std::rc::Rc;
 
 use chrono::{DateTime, Datelike, Duration, Timelike, Utc};
@@ -75,27 +74,6 @@ pub(super) struct QuotaWindowView {
 impl QuotaWindowView {
     fn band(&self) -> QuotaBand {
         QuotaBand::from_pct(self.used_pct)
-    }
-
-    /// Display name from the probe ("5 小时", "本周").
-    pub(super) fn name(&self) -> &str {
-        &self.name
-    }
-
-    /// Share of the window already used, 0–100.
-    pub(super) fn used_pct(&self) -> f64 {
-        self.used_pct
-    }
-
-    /// When the window resets, when the vendor says so.
-    pub(super) fn resets_at(&self) -> Option<DateTime<Utc>> {
-        self.resets_at
-    }
-
-    /// The window's full allowance ("$70.00", "10000") when the vendor
-    /// reports an absolute one; `None` for percent-only windows.
-    pub(super) fn total(&self) -> Option<&str> {
-        self.total.as_deref()
     }
 
     fn new(window: QuotaWindow, history: Vec<(chrono::DateTime<chrono::Utc>, f64)>) -> Self {
@@ -428,31 +406,10 @@ fn remaining_amount(total: &str, remaining_pct: f64) -> String {
     format!("{prefix}{:.2}{suffix}", amount * remaining_pct / 100.)
 }
 
-/// An allowance in its window's unit: money (a unit prefix or suffix is
-/// present) with two decimals; a bare count (credits) rounded to an integer.
-/// Shared by the tab-row summary and the pooled provider card, so both render
-/// a summed allowance the same way.
-pub(super) struct Amount<'a> {
-    pub(super) prefix: &'a str,
-    pub(super) value: f64,
-    pub(super) suffix: &'a str,
-}
-
-impl fmt::Display for Amount<'_> {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        if self.prefix.is_empty() && self.suffix.is_empty() {
-            write!(f, "{:.0}", self.value.round())
-        } else {
-            let value = (self.value * 100.).round() / 100.;
-            write!(f, "{}{value:.2}{}", self.prefix, self.suffix)
-        }
-    }
-}
-
 /// Split a window total into its unit prefix, number and unit suffix
 /// (`"$70.00"` → `("$", 70.0, "")`, `"10000"` → `("", 10000.0, "")`).
 /// `None` when the digits do not form a number.
-pub(super) fn parse_amount(total: &str) -> Option<(&str, f64, &str)> {
+fn parse_amount(total: &str) -> Option<(&str, f64, &str)> {
     let (prefix, digits) = total.split_at(total.find(|c: char| c.is_ascii_digit()).unwrap_or(0));
     let (num, suffix) = digits.split_at(
         digits
@@ -495,5 +452,48 @@ fn until_label(until: chrono::Duration) -> String {
         format!("{} 小时后", (until.num_minutes() + 59) / 60)
     } else {
         format!("{} 天后", (until.num_hours() + 23) / 24)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parse_amount_splits_a_unit_prefix_or_leaves_a_bare_count() {
+        assert_eq!(
+            parse_amount("$70.00"),
+            Some(("$", 70.0, "")),
+            "a money window carries a unit prefix"
+        );
+        assert_eq!(
+            parse_amount("10000"),
+            Some(("", 10000.0, "")),
+            "a credit window is a bare count"
+        );
+        assert_eq!(
+            parse_amount("N/A"),
+            None,
+            "a total without digits is not a readable amount"
+        );
+    }
+
+    #[test]
+    fn remaining_amount_keeps_an_unparseable_total_verbatim() {
+        assert_eq!(
+            remaining_amount("$70.00", 100.),
+            "$70.00",
+            "an untouched window shows its whole allowance as remaining"
+        );
+        assert_eq!(
+            remaining_amount("$70.00", 50.),
+            "$35.00",
+            "half the window left renders half the money"
+        );
+        assert_eq!(
+            remaining_amount("N/A", 50.),
+            "N/A",
+            "a total that is not a number renders unchanged rather than as a bogus amount"
+        );
     }
 }

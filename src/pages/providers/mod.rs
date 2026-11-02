@@ -25,18 +25,15 @@ mod chip;
 mod group_editor;
 mod groups;
 pub mod kiro_import;
-mod pool;
-mod pool_card;
 mod quota;
-mod summary;
 mod trend;
 
 use std::collections::HashMap;
 use std::sync::Arc;
 
 use gpui::{
-    App, AppContext as _, Context, Entity, Focusable as _, IntoElement, ParentElement, Render,
-    Styled, Window, prelude::FluentBuilder as _,
+    AppContext as _, Context, Entity, Focusable as _, IntoElement, ParentElement, Render, Styled,
+    Window, prelude::FluentBuilder as _,
 };
 use gpui_kit::assets::IconName;
 use gpui_kit::component::button::{Button, ButtonVariant};
@@ -55,7 +52,6 @@ use catalog::{
 };
 use group_editor::{GroupCreate, GroupManager};
 use groups::{GroupFilter, KeyFacts, Visibility};
-use pool::PoolAccount;
 use quota::KeyQuotaView;
 
 use crate::pages::{
@@ -74,14 +70,6 @@ struct KeyCardData {
     /// editor opens ([`ProvidersPage::open_key_editor`]).
     key: ProviderKeyView,
     quota: Option<KeyQuotaView>,
-}
-
-/// One provider's pooled card input: the provider row and its visible
-/// accounts in (position, id) order. Borrows the loaded cards; built per
-/// render.
-struct ProviderGroup<'a> {
-    provider: &'a ProviderRow,
-    cards: Vec<&'a KeyCardData>,
 }
 
 /// Loaded page data: every key across all providers in global position order,
@@ -541,9 +529,7 @@ impl ProvidersPage {
     /// Tab-row actions (the Status container renders them right-aligned next to
     /// the tabs): refresh reloads the list AND re-probes vendor quotas; 添加
     /// 账号 and 分组 only once data has loaded, since the form needs the
-    /// provider list and the dropdown needs the groups. Once loaded, the
-    /// available-quota summary of the visible, enabled accounts leads the
-    /// row and fills the gap before the buttons.
+    /// provider list and the dropdown needs the groups.
     pub(crate) fn actions(&mut self, cx: &mut Context<Self>) -> Vec<gpui::AnyElement> {
         let refresh = refresh_button(
             "providers-refresh",
@@ -557,13 +543,9 @@ impl ProvidersPage {
                 // A running import owns the form; replacing it would drop the
                 // run's result.
                 let saving = self.key_form.as_ref().is_some_and(|form| form.saving);
-                let (filter, visibility) = self.view_filter(data);
-                let mut actions: Vec<gpui::AnyElement> = Vec::with_capacity(4);
-                actions.extend(
-                    Self::quota_summary(data, &visibility, chrono::Utc::now(), cx)
-                        .map(IntoElement::into_any_element),
-                );
-                actions.push(
+                // The dropdown only names the selection; it needs no visibility set.
+                let filter = self.group_filter.effective(&data.groups, data.key_facts());
+                vec![
                     Button::new("key-add")
                         .icon(Icon::new(IconName::Plus).small())
                         .label("添加账号")
@@ -572,51 +554,23 @@ impl ProvidersPage {
                         .disabled(saving)
                         .on_click(cx.listener(|this, _, window, cx| this.open_key_form(window, cx)))
                         .into_any_element(),
-                );
-                actions.push(self.group_dropdown(data, filter, cx));
-                actions.push(refresh.into_any_element());
-                actions
+                    self.group_dropdown(data, filter, cx),
+                    refresh.into_any_element(),
+                ]
             }
             _ => vec![refresh.into_any_element()],
         }
     }
 
     /// The group filter resolved against the loaded data, and the visibility it
-    /// gives. Derived per call, never cached: the tab-row actions and the page
-    /// body are separate entry points (the Status container calls
-    /// [`Self::actions`] on its own), so each resolves once and passes the pair
-    /// down.
+    /// gives — the render boundary's single resolution. Derived per call, never
+    /// cached: the page body and the tab-row actions are separate entry points
+    /// (the Status container calls [`Self::actions`] on its own), so each
+    /// resolves the part it needs.
     fn view_filter(&self, data: &ProvidersData) -> (GroupFilter, Visibility) {
         let filter = self.group_filter.effective(&data.groups, data.key_facts());
         let visibility = Visibility::new(filter, &data.groups, data.key_facts());
         (filter, visibility)
-    }
-
-    /// The tab-row quota summary over the cards the page currently shows
-    /// (`visibility` is the one [`Render::render`] uses), limited to accounts
-    /// that can spend quota ([`PoolAccount::spends_quota`]: enabled,
-    /// unarchived, on an enabled provider) with a quota reading. Derived per
-    /// render; `None` when nothing sums. Amounts and balances only: the
-    /// amount rule is shared with the pooled cards, but percent-only windows
-    /// appear on the pooled card alone and are not summed here.
-    fn quota_summary(
-        data: &ProvidersData,
-        visibility: &Visibility,
-        now: chrono::DateTime<chrono::Utc>,
-        cx: &App,
-    ) -> Option<gpui::Div> {
-        let readings = data.keys.iter().filter_map(|card| {
-            // The pool card's rule: only quota the gateway can still spend.
-            let visible = visibility.admits(card.key.id) && PoolAccount::from(card).spends_quota();
-            let quota = card.quota.as_ref().filter(|_| visible)?;
-            Some(summary::Reading {
-                provider_id: card.provider.id,
-                provider_name: card.provider.name.as_str(),
-                quota,
-            })
-        });
-        let totals = summary::summarize(readings, now);
-        summary::render(&totals, cx)
     }
 
     /// (Re)load the page snapshot over the admin API: ONE
@@ -2104,37 +2058,18 @@ impl Render for ProvidersPage {
                             .iter()
                             .filter(|card_data| visibility.admits(card_data.key.id));
                         let grid = gpui::div().flex().flex_wrap().gap_5();
-                        if filter.pooled() {
-                            // One pooled card per provider (全部 / a provider).
-                            let groups: Vec<ProviderGroup<'_>> =
-                                group_by_provider(visible, |card| card.provider.id)
-                                    .into_iter()
-                                    .filter_map(|cards| {
-                                        // A run is never empty; skip one rather
-                                        // than index into it.
-                                        let provider = &cards.first()?.provider;
-                                        Some(ProviderGroup { provider, cards })
-                                    })
-                                    .collect();
-                            grid.children(
-                                groups
-                                    .iter()
-                                    .map(|group| self.provider_card(group, data, now, cx)),
+                        grid.children(visible.map(|card_data| {
+                            self.key_card(
+                                card_data,
+                                data.rests
+                                    .get(&card_data.key.id)
+                                    .map(Vec::as_slice)
+                                    .unwrap_or(&[]),
+                                &data.groups,
+                                now,
+                                cx,
                             )
-                        } else {
-                            grid.children(visible.map(|card_data| {
-                                self.key_card(
-                                    card_data,
-                                    data.rests
-                                        .get(&card_data.key.id)
-                                        .map(Vec::as_slice)
-                                        .unwrap_or(&[]),
-                                    &data.groups,
-                                    now,
-                                    cx,
-                                )
-                            }))
-                        }
+                        }))
                     })
             }
         }
@@ -2147,40 +2082,5 @@ fn toggle_selection<T: PartialEq + Clone>(selected: &mut Vec<T>, item: &T) {
         selected.remove(index);
     } else {
         selected.push(item.clone());
-    }
-}
-
-/// Split `items` (already in (position, id) order) into one run per
-/// provider: providers come in the order of their first item — i.e. of their
-/// smallest account (position, id) — and each run keeps the input order.
-fn group_by_provider<T>(
-    items: impl Iterator<Item = T>,
-    provider_of: impl Fn(&T) -> i64,
-) -> Vec<Vec<T>> {
-    let mut runs: Vec<(i64, Vec<T>)> = Vec::new();
-    for item in items {
-        let provider = provider_of(&item);
-        match runs.iter_mut().find(|(id, _)| *id == provider) {
-            Some((_, run)) => run.push(item),
-            None => runs.push((provider, vec![item])),
-        }
-    }
-    runs.into_iter().map(|(_, run)| run).collect()
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn providers_group_in_first_appearance_order() {
-        // (provider id, account id), already in (position, id) card order.
-        let cards = [(7_i64, 1_i64), (3, 2), (7, 3), (9, 4), (3, 5)];
-        let runs = group_by_provider(cards.into_iter(), |card| card.0);
-        assert_eq!(
-            runs,
-            [vec![(7, 1), (7, 3)], vec![(3, 2), (3, 5)], vec![(9, 4)]],
-            "one run per provider, ordered by its smallest account, accounts in card order"
-        );
     }
 }

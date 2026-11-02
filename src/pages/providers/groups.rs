@@ -44,8 +44,11 @@ pub(super) struct KeyFacts {
 impl GroupFilter {
     /// The filter to apply to `groups` and `keys`: a named group that no
     /// longer exists (deleted here or elsewhere), or a provider with no
-    /// account left, counts as 全部. Ids are never reused, so a stale id left
-    /// in the page state is harmless and needs no cleanup.
+    /// unarchived account left, counts as 全部. The provider rule matches the
+    /// dropdown option rule in [`counts`] — an option is listed only while it
+    /// has an unarchived account — so the filter never rests on an option the
+    /// menu no longer shows. Ids are never reused, so a stale id left in the
+    /// page state is harmless and needs no cleanup.
     pub(super) fn effective(
         self,
         groups: &[KeyGroupView],
@@ -53,16 +56,11 @@ impl GroupFilter {
     ) -> Self {
         match self {
             Self::Named(id) if !groups.iter().any(|group| group.id == id) => Self::All,
-            Self::Provider(id) if !keys.any(|key| key.provider_id == id) => Self::All,
+            Self::Provider(id) if !keys.any(|key| key.provider_id == id && !key.archived) => {
+                Self::All
+            }
             other => other,
         }
-    }
-
-    /// Whether the page shows one POOLED card per provider instead of one card
-    /// per account. 全部 and a single provider show providers; 未分组, a named
-    /// group and 归档 are groupings of accounts, so they keep per-account cards.
-    pub(super) fn pooled(self) -> bool {
-        matches!(self, Self::All | Self::Provider(_))
     }
 
     /// Empty-state copy (title, hint) for a filter that admits no account.
@@ -142,13 +140,16 @@ pub(super) struct Counts {
     pub(super) all: usize,
     pub(super) ungrouped: usize,
     pub(super) per_group: Vec<usize>,
-    /// Every provider that has an account (archived ones included, so the
-    /// option stays listed), in provider id order.
+    /// One entry per provider that has at least one unarchived account, in
+    /// provider id order. A provider whose accounts are all archived is
+    /// dropped: an option that would read `供应商 (0)` is noise, and
+    /// [`GroupFilter::effective`] uses the same rule so the filter cannot rest
+    /// on an option this list no longer shows.
     pub(super) per_provider: Vec<ProviderCount>,
     pub(super) archived: usize,
 }
 
-/// One provider line of the dropdown: its unarchived account count.
+/// One provider line of the dropdown: its unarchived account count, never 0.
 #[derive(Debug, PartialEq, Eq)]
 pub(super) struct ProviderCount {
     pub(super) provider_id: i64,
@@ -160,13 +161,14 @@ pub(super) fn counts(keys: impl Iterator<Item = KeyFacts>, groups: &[KeyGroupVie
     let mut archived = 0;
     let mut providers: BTreeMap<i64, usize> = BTreeMap::new();
     for key in keys {
-        let count = providers.entry(key.provider_id).or_default();
         if key.archived {
             archived += 1;
-        } else {
-            existing.insert(key.id);
-            *count += 1;
+            continue;
         }
+        existing.insert(key.id);
+        // The entry exists only for an unarchived account, so a provider whose
+        // accounts are all archived never reaches `per_provider`.
+        *providers.entry(key.provider_id).or_default() += 1;
     }
     let mut grouped: HashSet<i64> = HashSet::new();
     let mut per_group = Vec::with_capacity(groups.len());
@@ -461,8 +463,16 @@ fn option_row(id: impl Into<ElementId>, cx: &mut Context<ProvidersPage>) -> gpui
         .hover(|this| this.bg(cx.theme().accent))
 }
 
+/// A 1px rule between dropdown sections. `flex_none` is required: the list is a
+/// flex column capped at `max_h`, and a fixed-height child keeps its default
+/// `flex-shrink: 1` / `min-height: 0`, so once the rows exceed the cap the rule
+/// is squeezed to 0 and the sections silently merge.
 fn separator(cx: &mut Context<ProvidersPage>) -> Div {
-    gpui::div().h(px(1.)).my_1().bg(cx.theme().border)
+    gpui::div()
+        .h(px(1.))
+        .flex_none()
+        .my_1()
+        .bg(cx.theme().border)
 }
 
 #[cfg(test)]
@@ -507,31 +517,39 @@ mod tests {
     }
 
     #[test]
-    fn only_the_all_and_provider_filters_pool_per_provider() {
-        assert!(
-            GroupFilter::All.pooled(),
-            "全部 shows one card per provider"
-        );
-        assert!(
-            GroupFilter::Provider(7).pooled(),
-            "a provider filter shows that provider's pooled card"
-        );
-        assert!(
-            !GroupFilter::Ungrouped.pooled(),
-            "未分组 groups accounts, not providers"
-        );
-        assert!(
-            !GroupFilter::Named(1).pooled(),
-            "a named group groups accounts, not providers"
-        );
-        assert!(
-            !GroupFilter::Archived.pooled(),
-            "归档 lists archived accounts one by one"
+    fn counts_omit_providers_without_unarchived_accounts() {
+        let keys = [key(1, 20, false), key(2, 10, false), key(4, 30, true)];
+        let counts = counts(keys.iter().copied(), &[]);
+        let per_provider: Vec<(i64, usize)> = counts
+            .per_provider
+            .iter()
+            .map(|entry| (entry.provider_id, entry.count))
+            .collect();
+        assert_eq!(
+            per_provider,
+            [(10, 1), (20, 1)],
+            "provider 30 has only an archived account, so it gets no dropdown option"
         );
     }
 
     #[test]
-    fn counts_per_provider_skip_archived_but_list_the_provider() {
+    fn effective_drops_a_provider_whose_accounts_are_all_archived() {
+        let archived_only = [key(4, 30, true)];
+        let dropped = GroupFilter::Provider(30).effective(&[], archived_only.iter().copied());
+        assert!(
+            dropped == GroupFilter::All,
+            "provider 30 is not in the dropdown once all its accounts are archived"
+        );
+        let live = [key(4, 30, true), key(2, 30, false)];
+        let kept = GroupFilter::Provider(30).effective(&[], live.iter().copied());
+        assert!(
+            kept == GroupFilter::Provider(30),
+            "provider 30 keeps its option while one account stays unarchived"
+        );
+    }
+
+    #[test]
+    fn counts_per_provider_skip_archived_and_omit_providers_left_without_them() {
         let keys = [
             key(1, 20, false),
             key(2, 10, false),
@@ -546,8 +564,8 @@ mod tests {
             .collect();
         assert_eq!(
             per_provider,
-            [(10, 1), (20, 2), (30, 0)],
-            "provider id order"
+            [(10, 1), (20, 2)],
+            "provider id order, and provider 30 is omitted because its only account is archived"
         );
         assert_eq!(counts.all, 3, "archived key 4 is excluded");
         assert_eq!(counts.ungrouped, 2, "only key 1 is grouped");

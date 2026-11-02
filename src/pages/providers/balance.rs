@@ -58,16 +58,6 @@ enum Depletion {
 }
 
 impl BalanceView {
-    /// The current balance amount.
-    pub(super) fn amount(&self) -> f64 {
-        self.balance.amount
-    }
-
-    /// The currency symbol the vendor reports the balance in ("¥", "$").
-    pub(super) fn symbol(&self) -> &str {
-        &self.balance.symbol
-    }
-
     /// Build from a reading and this key's recorded segment (oldest first,
     /// opener first; an empty slice starts a segment at this reading).
     pub(super) fn new(
