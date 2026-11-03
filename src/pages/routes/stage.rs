@@ -17,9 +17,7 @@ use gpui_kit::component::{ActiveTheme, Disableable, Icon, Sizable};
 
 use gateway::store::{ActiveWindow, ModelSuccessRow, RestRow, RouteRow, RouteStrategy};
 
-use std::fmt::Write;
-
-use super::{RouteProvider, RoutesData, RoutesPage};
+use super::{RouteAccount, RoutesData, RoutesPage};
 use crate::activity::{client_hue, named_client};
 use crate::pages::{LoadState, card};
 
@@ -289,9 +287,10 @@ struct StageSource {
     hue: Option<Hsla>,
 }
 
-/// One row of the stage: a route entry, i.e. one provider on one model.
+/// One row of the stage: a route entry, i.e. one account on one model.
 struct StageAccount {
-    /// Provider name, or the deleted stub when the entry dangles.
+    /// The account's display name (label · provider), or the deleted stub when
+    /// the entry dangles.
     head: String,
     /// Display name of the served model (entry label or model id), as a chip.
     model: String,
@@ -304,22 +303,20 @@ struct StageAccount {
     /// Cooldown recovery caption (冷却至 10-19 08:00); Some = the entry rests —
     /// the row renders dimmed with a warning dot.
     cool_until: Option<String>,
-    /// The provider cannot dispatch (deleted, disabled, or no active account):
-    /// the row renders dimmed with a muted filled dot and the reason.
+    /// This entry cannot dispatch: its account was deleted, is disabled or
+    /// archived, its provider is disabled, or its whitelist omits the entry's
+    /// model. The row renders dimmed with a muted filled dot and the reason.
     stopped: Option<Stopped>,
-    /// Latest successful request time for this entry — shown in the
-    /// serving-caption slot once the entry goes idle.
+    /// Latest successful request time for this account on this model — shown in
+    /// the serving-caption slot once the entry goes idle.
     last_success: Option<chrono::DateTime<chrono::Utc>>,
-    /// Compact account-pool hint (2/3 账号): how many of the provider's
-    /// non-archived accounts dispatch may use right now.
-    pool: String,
 }
 
 /// One in-flight call of this route, as the entry aggregation reads it. The
 /// live feed's attempt type carries display strings and private fields; the
 /// aggregation only needs identity plus the phase caption.
 struct LiveCall<'call> {
-    /// The provider account serving the call (None = not yet routed to one).
+    /// The account serving the call (None = not yet routed to one).
     key_id: Option<i64>,
     /// The upstream model, in its clipped wire form.
     model: &'call str,
@@ -331,130 +328,140 @@ struct LiveCall<'call> {
 }
 
 /// Why one route entry cannot dispatch anything right now.
+///
+/// `pub(super)` so the routes page renders the same reasons on its stage rows,
+/// its editor item rows, its picker lines and its model-chip guard; the stage is
+/// where they are computed.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum Stopped {
-    /// The entry points at a provider the document no longer carries.
+pub(super) enum Stopped {
+    /// The entry points at an account the document no longer carries.
     Deleted,
-    /// The provider is disabled on the accounts page.
-    Disabled,
-    /// Every account of the provider is disabled or archived.
-    NoAccounts,
-    /// The provider has active accounts, but none of the active ones serves
-    /// this model (whitelist-restricted, or only disabled accounts serve it):
-    /// dispatch would refuse every account.
+    /// The account is disabled on the accounts page — a reversible state.
+    AccountDisabled,
+    /// The account is archived: kept for history. Dispatch skips it while the
+    /// archive stands, whatever its own enabled flag says; 移出归档 on the
+    /// accounts page is what restores it.
+    Archived,
+    /// The account is fine but its provider is disabled, so dispatch builds no
+    /// candidate from it.
+    ProviderDisabled,
+    /// The account is dispatchable but does not serve this entry's model: its
+    /// whitelist omits it, so dispatch would refuse the only candidate.
     NoModel,
 }
 
 impl Stopped {
-    /// The stage's marker text for this reason.
-    fn label(self) -> &'static str {
+    /// The marker text for this reason — shared by the stage rows, the picker
+    /// lines, the editor's item rows and the chip guard, so one state cannot be
+    /// described two ways.
+    pub(super) fn label(self) -> &'static str {
         match self {
-            Stopped::Deleted => "已删除",
-            Stopped::Disabled => "已停用",
-            Stopped::NoAccounts => "无可用账号",
-            Stopped::NoModel => "无账号支持该模型",
+            Stopped::Deleted => "账号已删除",
+            Stopped::AccountDisabled => "账号已停用",
+            Stopped::Archived => "账号已归档",
+            Stopped::ProviderDisabled => "供应商已停用",
+            Stopped::NoModel => "该账号不支持此模型",
         }
     }
 }
 
-/// One entry's stage state, aggregated over the accounts of its provider that
-/// serve the entry's model.
+/// Why this account cannot dispatch. The three conditions are conjunctive on
+/// the wire (dispatch asks for an enabled provider, an enabled account and no
+/// archive), so the order here only decides which one to show: an archived
+/// account cannot be restored by flipping its own flag, so its own state is the
+/// useful answer before its provider's.
 ///
-/// An entry names a provider; dispatch expands it to all of that provider's
-/// active accounts that serve the model, so "serving", "resting", "last
-/// success" and the in-flight count are all provider-level facts. Pure: every
-/// input is a read the caller already has.
+/// The single owner of the account-level half of the rule: [`entry_stopped`]
+/// adds the whitelist, and every surface renders [`Stopped::label`] from these
+/// two instead of re-deriving the conditions. The chip guard asks only about
+/// archiving on purpose — a disabled account stays addable, since flipping the
+/// flag back restores it.
+pub(super) fn stopped_of(account: &RouteAccount) -> Option<Stopped> {
+    if account.archived {
+        Some(Stopped::Archived)
+    } else if !account.enabled {
+        Some(Stopped::AccountDisabled)
+    } else if !account.provider_enabled {
+        Some(Stopped::ProviderDisabled)
+    } else {
+        None
+    }
+}
+
+/// Why this route entry as a whole cannot dispatch: the account's own state
+/// first (deleted / archived / disabled / provider disabled), then its model
+/// whitelist. The stage row and the editor's item row both read this one
+/// function, so the two surfaces cannot drift apart.
+pub(super) fn entry_stopped(account: Option<&RouteAccount>, model: &str) -> Option<Stopped> {
+    match account {
+        None => Some(Stopped::Deleted),
+        Some(account) => {
+            stopped_of(account).or_else(|| (!account.serves(model)).then_some(Stopped::NoModel))
+        }
+    }
+}
+
+/// One entry's stage state: the account it names, on the entry's model.
+///
+/// An entry IS one account on one model, so every fact here is that single
+/// account's — serving, the cooldown and the last success are (key, model)
+/// lookups, never a spread over several accounts. Pure: every input is a read
+/// the caller already has.
 #[derive(Debug, Default, PartialEq)]
 struct EntryState {
     /// Phase caption of the call serving this entry (None = idle).
     serving: Option<&'static str>,
-    /// The account that call belongs to (None = idle), so the row can name the
-    /// account doing the work.
-    serving_key: Option<i64>,
-    /// Serving accounts not cooling on this model: dispatch can use them now.
-    ready: usize,
-    /// Serving accounts cooling on this model.
-    resting: usize,
-    /// Non-archived accounts of the provider that serve this model (the 总数
-    /// half of the hint).
-    total: usize,
-    /// The entry cannot dispatch (deleted provider, disabled provider, no
-    /// active account, or no active account serving this model).
+    /// The entry cannot dispatch (deleted account, disabled account or
+    /// provider, or a model the account does not serve).
     stopped: Option<Stopped>,
-    /// Set only when EVERY serving account rests and the entry is not stopped
-    /// for another reason: the earliest recovery, i.e. the moment the entry can
-    /// dispatch again. A partly resting provider still dispatches, so it is not
-    /// shown as cooling.
+    /// The moment dispatch may use this entry again: set only while the account
+    /// is cooling on this model and the entry is not stopped for another
+    /// reason.
     cool_until: Option<chrono::DateTime<chrono::Utc>>,
-    /// Newest success among the provider's accounts for this model.
+    /// Newest success of this account on this model.
     last_success: Option<chrono::DateTime<chrono::Utc>>,
-    /// In-flight calls of this route over the provider's accounts on this model.
-    inflight: usize,
 }
 
-impl EntryState {
-    /// The compact pool hint: 可用/总数 accounts, then how many rest while
-    /// others still serve, then the in-flight count when the entry is busy.
-    fn pool(&self) -> String {
-        let mut hint = String::new();
-        write!(hint, "{}/{} 账号", self.ready, self.total)
-            .expect("writing to a String cannot fail");
-        if self.resting > 0 && self.ready > 0 {
-            write!(hint, " · {} 冷却", self.resting).expect("writing to a String cannot fail");
-        }
-        if self.inflight > 0 {
-            write!(hint, " · 进行中 {}", self.inflight).expect("writing to a String cannot fail");
-        }
-        hint
-    }
-}
-
-/// Aggregate one entry's stage state over the provider's accounts that serve
-/// the entry's model (whitelist-restricted accounts are not dispatchable for it).
+/// Aggregate one entry's stage state over the single account it names.
 ///
-/// * serving — the most advanced in-flight call of this route over those
-///   accounts on this model (compared in the model's clipped wire form), so the
-///   caption shows the phase that actually moved furthest;
-/// * resting — those accounts cooling on this model at `now` (a rest with a
-///   NULL model cools the whole account, so it covers every model; a rest whose
+/// * serving — the most advanced in-flight call of this route on this account
+///   and this model (compared in the model's clipped wire form), so the caption
+///   shows the phase that actually moved furthest;
+/// * cooling — this account cooling on this model at `now` (a rest with a NULL
+///   model cools the whole account, so it covers every model; a rest whose
 ///   `rest_until` is not after `now` is over);
-/// * stopped — the provider is gone, disabled, has no active account, or has no
-///   active account serving this model;
-/// * last success — the newest success among those accounts;
-/// * inflight — this route's calls over those accounts on this model.
+/// * stopped — the account is gone, cannot dispatch, or does not serve the
+///   entry's model;
+/// * last success — the newest success of this account on this model.
 fn entry_state(
-    provider: Option<&RouteProvider>,
+    account: Option<&RouteAccount>,
     model: &str,
     calls: &[LiveCall<'_>],
     rests: &[RestRow],
     success: &[ModelSuccessRow],
     now: chrono::DateTime<chrono::Utc>,
 ) -> EntryState {
-    let Some(provider) = provider else {
-        // The entry dangles: no accounts to aggregate over.
+    let stopped = entry_stopped(account, model);
+    let Some(account) = account else {
+        // The entry dangles: no account to aggregate over.
         return EntryState {
-            stopped: Some(Stopped::Deleted),
+            stopped,
             ..EntryState::default()
         };
     };
-    let mut state = EntryState::default();
-    let mut earliest: Option<chrono::DateTime<chrono::Utc>> = None;
-    for account in provider
-        .accounts
-        .iter()
-        .filter(|account| account.serves(model))
-    {
-        state.total += 1;
-        if !account.active {
-            continue;
-        }
-        // Only cooldowns still in force at `now`: the gateway drops expired
+    let key_id = account.key_id;
+    let mut state = EntryState {
+        stopped,
+        ..EntryState::default()
+    };
+    if state.stopped.is_none() {
+        // Only a cooldown still in force at `now`: the gateway drops expired
         // rows only when it builds the document, and nothing refreshes the page
         // when a cooldown ends, so an expired row must not read as resting.
-        let recovery = rests
+        state.cool_until = rests
             .iter()
             .filter(|rest| {
-                rest.key_id == account.id
+                rest.key_id == key_id
                     && rest.rest_until > now
                     && rest
                         .model
@@ -463,52 +470,24 @@ fn entry_state(
             })
             .map(|rest| rest.rest_until)
             .max();
-        match recovery {
-            Some(until) => {
-                state.resting += 1;
-                earliest = Some(earliest.map_or(until, |best| best.min(until)));
-            }
-            None => state.ready += 1,
-        }
     }
-    state.stopped = if !provider.enabled {
-        Some(Stopped::Disabled)
-    } else if provider.available() == 0 {
-        Some(Stopped::NoAccounts)
-    } else if state.ready + state.resting == 0 {
-        // The provider has active accounts, but none of them serves the model:
-        // either no account serves it at all, or only disabled ones do.
-        // `total` still counts the latter for the hint's 总数.
-        Some(Stopped::NoModel)
-    } else {
-        None
-    };
-    if state.stopped.is_none() && state.ready == 0 {
-        state.cool_until = earliest;
-    }
-    // One pass over this route's calls: the entry's calls are those on its
-    // model over the provider's accounts. Track the most advanced one (ties
-    // keep feed order, so the choice is stable across renders) and the count.
+    // The entry's calls are this route's, on this account and this model.
+    // Ties keep feed order, so the choice is stable across renders: only a call
+    // that has seen its first byte displaces one that has not.
     let clipped = crate::activity::clipped(model);
     let mut serving: Option<&LiveCall<'_>> = None;
     for call in calls {
-        if call.model != clipped || !call.key_id.is_some_and(|id| provider.has_key(id)) {
+        if call.model != clipped || call.key_id != Some(key_id) {
             continue;
         }
-        state.inflight += 1;
-        // Ties keep feed order, so the choice is stable across renders: only a
-        // call that has seen its first byte displaces one that has not.
         if serving.is_none_or(|best| call.progressed && !best.progressed) {
             serving = Some(call);
         }
     }
-    if let Some(serving) = serving {
-        state.serving = Some(serving.phase);
-        state.serving_key = serving.key_id;
-    }
+    state.serving = serving.map(|serving| serving.phase);
     state.last_success = success
         .iter()
-        .filter(|row| row.served_model == model && provider.has_key(row.key_id))
+        .filter(|row| row.served_model == model && row.key_id == key_id)
         .map(|row| row.last_ok)
         .max();
     state
@@ -647,24 +626,18 @@ impl RoutesPage {
                     .entries
                     .iter()
                     .map(|entry| {
-                        let provider = data.provider(entry.provider_id);
-                        let mut head = super::provider_head(provider, entry.provider_id);
+                        // An entry names one account on one model: the row is
+                        // that account's own state on that model.
+                        let account = data.account(entry.key_id);
+                        let head = super::account_head(account, entry.key_id);
                         let state = entry_state(
-                            provider,
+                            account,
                             &entry.model,
                             &calls,
                             &data.rests,
                             &data.success,
                             now,
                         );
-                        // While serving, name the account doing the work.
-                        if let Some(account) = provider
-                            .zip(state.serving_key)
-                            .and_then(|(provider, key_id)| provider.account(key_id))
-                        {
-                            write!(head, " · {}", account.label)
-                                .expect("writing to a String cannot fail");
-                        }
                         let extras = [entry.max_concurrency.map(|cap| format!("并发 {cap}")), {
                             let rules = entry.rules();
                             if rules.is_empty() {
@@ -701,7 +674,6 @@ impl RoutesPage {
                             cool_until,
                             stopped: state.stopped,
                             last_success: state.last_success,
-                            pool: state.pool(),
                         }
                     })
                     .collect();
@@ -1279,22 +1251,9 @@ impl RoutesPage {
                         .child(stopped.label()),
                 )
             })
-            // Provider-level pool hint (2/3 账号): the entry is a pool of
-            // accounts, not one, and this says how much of it can serve.
-            // A deleted provider or one with no account on this model has no
-            // pool to describe; its marker says why.
-            .when(
-                !matches!(account.stopped, Some(Stopped::Deleted | Stopped::NoModel)),
-                |row| {
-                    row.child(
-                        gpui::div()
-                            .flex_shrink_0()
-                            .text_size(px(11.))
-                            .text_color(theme.muted_foreground)
-                            .child(account.pool.clone()),
-                    )
-                },
-            )
+            // Nothing extra here: an entry is one account on one model, so the
+            // row carries no tally — its own marker says why it cannot
+            // dispatch, and the cooling marker says when it can again.
             .child(gpui::div().flex_1())
             .when_some(account.caption, |row, caption| {
                 row.child(
