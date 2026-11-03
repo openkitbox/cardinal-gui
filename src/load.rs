@@ -12,6 +12,9 @@ use std::path::{Path, PathBuf};
 pub struct GuiSection {
     /// Display timezone, `±HH:MM`; omitted/empty = follow the system.
     pub timezone: Option<String>,
+    /// 销售模式: whether this deployment sells usage (概览 shows 营收 and says
+    /// 标准价). Omitted = not selling.
+    pub sales_mode: Option<bool>,
 }
 
 /// Load the `[gui]` section of `path`. A missing file or section yields the
@@ -59,4 +62,38 @@ pub(crate) fn set_config_path(path: PathBuf) {
 /// unreachable).
 pub(crate) fn config_path() -> Option<PathBuf> {
     CONFIG_PATH.read().ok().and_then(|slot| slot.clone())
+}
+
+/// Edit the `[gui]` section of `path` in place — the settings page's
+/// write-back, shared by every GUI setting so each one only has to describe its
+/// own key. The rest of the document is preserved; a missing file or section is
+/// created, and an `[gui]` table left empty is dropped rather than written as a
+/// bare header. Errors are strings for the caller to show in place.
+pub(crate) fn write_gui_section(
+    path: &Path,
+    edit: impl FnOnce(&mut toml_edit::Table),
+) -> Result<(), String> {
+    use std::fmt::Write as _;
+
+    let raw = std::fs::read_to_string(path)
+        .map_err(|error| format!("读取配置 {} 失败: {error}", path.display()))?;
+    let mut document = raw
+        .parse::<toml_edit::DocumentMut>()
+        .map_err(|error| format!("解析配置 {} 失败: {error}", path.display()))?;
+    let gui = document
+        .entry("gui")
+        .or_insert_with(|| toml_edit::Item::Table(toml_edit::Table::new()));
+    let table = gui
+        .as_table_mut()
+        .ok_or_else(|| "配置的 [gui] 不是表".to_string())?;
+    edit(table);
+    // Keep the section tidy: a table emptied by removing its last key writes as
+    // `[gui]` with no body — harmless, but drop it entirely.
+    if table.is_empty() {
+        document.remove("gui");
+    }
+    let mut output = String::new();
+    write!(output, "{document}").map_err(|error| format!("序列化配置失败: {error}"))?;
+    std::fs::write(path, output)
+        .map_err(|error| format!("写入配置 {} 失败: {error}", path.display()))
 }

@@ -101,39 +101,20 @@ pub(crate) fn parse_timezone_input(raw: &str) -> Result<Option<FixedOffset>, Str
 /// the rest of the document byte-for-byte where possible. A missing file or
 /// `[gui]` section is created; an empty value removes the key. Returns an
 /// error string on any IO/parse failure — the caller shows it in place.
+/// Write the `[gui].timezone` value back to the open config file, preserving
+/// the rest of the document byte-for-byte where possible. A missing file or
+/// `[gui]` section is created; an empty value removes the key. Returns an
+/// error string on any IO/parse failure — the caller shows it in place.
 pub(crate) fn save_timezone(
     config_path: &std::path::Path,
     value: Option<&str>,
 ) -> Result<(), String> {
-    use std::fmt::Write as _;
-
-    let raw = std::fs::read_to_string(config_path)
-        .map_err(|error| format!("读取配置 {} 失败: {error}", config_path.display()))?;
-    let mut document = raw
-        .parse::<toml_edit::DocumentMut>()
-        .map_err(|error| format!("解析配置 {} 失败: {error}", config_path.display()))?;
-    let gui = document
-        .entry("gui")
-        .or_insert_with(|| toml_edit::Item::Table(toml_edit::Table::new()));
-    let table = gui
-        .as_table_mut()
-        .ok_or_else(|| "配置的 [gui] 不是表".to_string())?;
-    match value {
+    crate::load::write_gui_section(config_path, |table| match value {
         Some(value) => {
             table["timezone"] = toml_edit::value(value);
         }
         None => {
             table.remove("timezone");
         }
-    }
-    // Keep the section tidy: an empty [gui] table after removing the key
-    // writes as `[gui]` with no body — harmless, but drop it entirely when it
-    // was only carrying this key.
-    if table.is_empty() {
-        document.remove("gui");
-    }
-    let mut output = String::new();
-    write!(output, "{document}").map_err(|error| format!("序列化配置失败: {error}"))?;
-    std::fs::write(config_path, output)
-        .map_err(|error| format!("写入配置 {} 失败: {error}", config_path.display()))
+    })
 }

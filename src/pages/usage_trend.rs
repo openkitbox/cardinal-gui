@@ -5,6 +5,9 @@
 //! into 其他. Geometry and paint happen in a `canvas` element; the tooltip
 //! and the ranking are regular divs positioned from the geometry the last
 //! prepaint stored.
+//!
+//! 营收 and 标准价 are sales-mode vocabulary: with [`crate::sales_mode`] off the
+//! switch drops 营收 entirely and the cost metric reads 金额.
 
 use std::cell::RefCell;
 use std::collections::HashMap;
@@ -49,9 +52,10 @@ fn palette(index: usize) -> Hsla {
 }
 
 /// Trend metric of the chart and the ranking (speed is window-level only, so
-/// the trend offers the additive metrics). 标准价 is the catalog cost
-/// (`cost_usd`), 营收 the amount debited to users (`charged_microus`); the
-/// two are shown side by side, never subtracted.
+/// the trend offers the additive metrics). [`Self::Cost`] is the catalog cost
+/// (`cost_usd`), [`Self::Revenue`] the amount debited to users
+/// (`charged_microus`); the two are shown side by side, never subtracted. A
+/// non-selling deployment only has the former, phrased as 金额.
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub(crate) enum TrendMetric {
     Tokens,
@@ -64,10 +68,29 @@ impl TrendMetric {
     pub(crate) const ALL: [TrendMetric; 4] =
         [Self::Tokens, Self::Cost, Self::Revenue, Self::Requests];
 
-    fn label(self) -> &'static str {
+    /// The metrics the switch offers: 营收 is a sales-mode reading, so a
+    /// deployment that does not sell usage never sees it.
+    fn offered(sales: bool) -> impl Iterator<Item = TrendMetric> {
+        Self::ALL
+            .into_iter()
+            .filter(move |metric| sales || *metric != Self::Revenue)
+    }
+
+    /// The metric to render for a stored choice: a 营收 selection falls back to
+    /// Token once the mode switches to non-selling, rather than charting a
+    /// reading the page no longer shows.
+    fn available(self, sales: bool) -> Self {
+        if !sales && self == Self::Revenue {
+            Self::Tokens
+        } else {
+            self
+        }
+    }
+
+    fn label(self, sales: bool) -> &'static str {
         match self {
             Self::Tokens => "Token",
-            Self::Cost => "标准价",
+            Self::Cost => crate::sales_mode::cost_word(sales),
             Self::Revenue => "营收",
             Self::Requests => "请求",
         }
@@ -114,6 +137,15 @@ impl TrendMetric {
             _ => self.format(value),
         }
     }
+}
+
+/// What the trend reads: the metric, under the deployment's sales mode. One
+/// value because every figure and every word in the card depends on both.
+#[derive(Clone, Copy)]
+struct Reading {
+    metric: TrendMetric,
+    /// Whether the deployment sells usage: gates 营收 and the 标准价/金额 word.
+    sales: bool,
 }
 
 /// Fallback display name of a NULL category (alias NULL = 直连).
@@ -440,7 +472,15 @@ impl UsagePage {
         range: ResolvedRange,
         cx: &mut Context<Self>,
     ) -> impl IntoElement {
-        let metric = self.trend_metric;
+        // The 概览 page's reading of the mode: a non-selling deployment offers no
+        // 营收 metric and calls the catalogue cost 金额. Read it once per render;
+        // everything below takes it by value.
+        let sales = crate::sales_mode::enabled();
+        let reading = Reading {
+            metric: self.trend_metric.available(sales),
+            sales,
+        };
+        let metric = reading.metric;
         let split = self.trend_split;
         // Hover/emphasize frames re-render with identical inputs; only new rows
         // (data_version, bumped when a load lands) or a metric/split switch
@@ -467,7 +507,7 @@ impl UsagePage {
                     .gap_2()
                     .child(segs(
                         "trend-metric",
-                        TrendMetric::ALL.iter().map(|m| (*m, m.label())),
+                        TrendMetric::offered(reading.sales).map(|m| (m, m.label(reading.sales))),
                         metric,
                         cx,
                         |page, m, cx| {
@@ -499,17 +539,22 @@ impl UsagePage {
                     .flex()
                     .gap_4()
                     .mt_2()
-                    .child(self.trend_chart(Rc::clone(&data), cx))
-                    .child(self.trend_rank(Rc::clone(&data), cx)),
+                    .child(self.trend_chart(Rc::clone(&data), reading, cx))
+                    .child(self.trend_rank(Rc::clone(&data), reading, cx)),
             )
     }
 
     /// The stacked-column chart: canvas-painted grid/axis/bars plus an
     /// absolutely positioned tooltip overlay.
-    fn trend_chart(&self, data: Rc<TrendData>, cx: &mut Context<Self>) -> impl IntoElement {
+    fn trend_chart(
+        &self,
+        data: Rc<TrendData>,
+        reading: Reading,
+        cx: &mut Context<Self>,
+    ) -> impl IntoElement {
         let theme_grid = cx.theme().border;
         let theme_hot: Hsla = gpui::rgb(0xf1f1f4).into();
-        let metric = self.trend_metric;
+        let metric = reading.metric;
         let hover = self.trend_hover;
         let emphasize = self.trend_emphasize.clone();
 
@@ -571,8 +616,12 @@ impl UsagePage {
     /// The per-category ranking beside the chart: swatch,
     /// name, value; a share bar; a stats line. Hovering a row dims the other
     /// categories' columns.
-    fn trend_rank(&self, data: Rc<TrendData>, cx: &mut Context<Self>) -> impl IntoElement {
-        let metric = self.trend_metric;
+    fn trend_rank(
+        &self,
+        data: Rc<TrendData>,
+        reading: Reading,
+        cx: &mut Context<Self>,
+    ) -> impl IntoElement {
         let total = data.metric_total;
         let mut list = div()
             .id("usage-trend-rank")
@@ -586,10 +635,10 @@ impl UsagePage {
             .first()
             .map_or(1., |c| c.metric_value.max(1.));
         for category in &data.categories {
-            list = list.child(self.rank_row(category, leader, total, metric, false, cx));
+            list = list.child(self.rank_row(category, leader, total, reading, false, cx));
         }
         if let Some(other) = &data.other {
-            list = list.child(self.rank_row(other, leader, total, metric, true, cx));
+            list = list.child(self.rank_row(other, leader, total, reading, true, cx));
         }
         list
     }
@@ -599,11 +648,12 @@ impl UsagePage {
         category: &TrendCategory,
         leader: f64,
         total: f64,
-        metric: TrendMetric,
+        reading: Reading,
         plain: bool,
         cx: &mut Context<Self>,
     ) -> impl IntoElement {
         let theme = cx.theme();
+        let metric = reading.metric;
         let share = (100. * category.metric_value / leader).max(1.5) as f32;
         let key: SharedString = category.key.clone().into();
         let row = div()
@@ -697,9 +747,14 @@ impl UsagePage {
         if metric != TrendMetric::Cost
             && let Some(cost) = category.cost
         {
-            stats.push(format!("标准价 ${cost:.2}"));
+            stats.push(format!(
+                "{} ${cost:.2}",
+                crate::sales_mode::cost_word(reading.sales)
+            ));
         }
-        if metric != TrendMetric::Revenue && category.charged_microus > 0 {
+        // 营收 belongs to the selling reading; a non-selling deployment has no
+        // revenue figure to report even when rows carry a charged amount.
+        if reading.sales && metric != TrendMetric::Revenue && category.charged_microus > 0 {
             stats.push(format!("营收 {}", usd_microus(category.charged_microus)));
         }
         if category.decode_ms > 0 {

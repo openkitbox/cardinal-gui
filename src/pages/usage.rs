@@ -186,7 +186,8 @@ pub struct UsagePage {
     pub(super) range: UsageRange,
     /// The custom-range date picker in the tab row.
     range_picker: gpui::Entity<DatePickerState>,
-    /// Trend metric (Token / 标准价 / 营收 / 请求); switching is client-side.
+    /// Trend metric (Token / 标准价 / 营收 / 请求, minus 营收 when 销售模式 is off);
+    /// switching is client-side.
     pub(super) trend_metric: TrendMetric,
     /// Trend split dimension; switching refetches.
     pub(super) trend_split: TrendSplit,
@@ -603,39 +604,53 @@ impl Render for UsagePage {
                 format!("{}内没有计量的请求。", self.range.label()),
                 cx,
             )),
-            LoadState::Loaded((window, trend, resolved)) => frame
-                .child(
-                    gpui::div()
-                        .flex()
-                        .gap_4()
-                        .child(kpi_card(
-                            "Token",
-                            humanize_count(window.input_tokens + window.output_tokens),
-                            token_sub(window),
-                            cx,
-                        ))
-                        .child(kpi_card(
-                            "请求",
-                            window.requests.to_string(),
-                            requests_sub(window),
-                            cx,
-                        ))
-                        .child(kpi_card(
-                            "营收",
-                            usd_microus(window.charged_microus),
-                            "扣费合计".to_string(),
-                            cx,
-                        ))
-                        .child(kpi_card("标准价", cost_value(window), cost_sub(window), cx))
-                        .child(hit_rate_card(window, cx))
-                        .child(kpi_card(
-                            "输出速度",
-                            speed_value(window),
-                            speed_sub(window),
-                            cx,
-                        )),
-                )
-                .child(self.trend_card(trend, *resolved, cx)),
+            LoadState::Loaded((window, trend, resolved)) => {
+                // Read once: the 营收 card and the 标准价/金额 wording both follow
+                // it, and the trend card coerces its metric under it.
+                let sales = crate::sales_mode::enabled();
+                frame
+                    .child(
+                        gpui::div()
+                            .flex()
+                            .gap_4()
+                            .child(kpi_card(
+                                "Token",
+                                humanize_count(window.input_tokens + window.output_tokens),
+                                token_sub(window),
+                                cx,
+                            ))
+                            .child(kpi_card(
+                                "请求",
+                                window.requests.to_string(),
+                                requests_sub(window),
+                                cx,
+                            ))
+                            // 营收 is a sales-mode reading: a deployment nobody is billed
+                            // through has none, so the card is absent rather than zeroed.
+                            .when(sales, |this| {
+                                this.child(kpi_card(
+                                    "营收",
+                                    usd_microus(window.charged_microus),
+                                    "扣费合计".to_string(),
+                                    cx,
+                                ))
+                            })
+                            .child(kpi_card(
+                                crate::sales_mode::cost_word(sales),
+                                cost_value(window),
+                                cost_sub(window, sales),
+                                cx,
+                            ))
+                            .child(hit_rate_card(window, cx))
+                            .child(kpi_card(
+                                "输出速度",
+                                speed_value(window),
+                                speed_sub(window),
+                                cx,
+                            )),
+                    )
+                    .child(self.trend_card(trend, *resolved, cx))
+            }
         };
 
         // The feed card is always the last child. This page has no wire-flow
@@ -739,12 +754,15 @@ fn cost_value(window: &UsageWindow) -> String {
 }
 
 /// Cost card sub: unpriced rows are called out, otherwise the card reads as
-/// priced at the effective prices.
-fn cost_sub(window: &UsageWindow) -> String {
+/// priced at the effective prices (金额 in a non-selling deployment — there is no
+/// price list, only what was spent).
+fn cost_sub(window: &UsageWindow, sales: bool) -> String {
     if window.unpriced > 0 {
         format!("{} 条未计价", window.unpriced)
-    } else {
+    } else if sales {
         "生效价格".to_string()
+    } else {
+        "生效金额".to_string()
     }
 }
 

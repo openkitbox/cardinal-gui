@@ -16,6 +16,7 @@ mod fmt;
 pub mod load;
 mod pages;
 mod runtime;
+mod sales_mode;
 mod ui_tz;
 
 use app::App;
@@ -128,9 +129,11 @@ pub struct Configs {
 /// of the main config file.
 pub fn run(configs: Configs) {
     // Install the display timezone and the open config path before any page
-    // renders — every timestamp formatter reads `ui_tz::display_tz()`, and the
-    // settings page writes back to `load::config_path()`.
+    // renders — every timestamp formatter reads `ui_tz::display_tz()`, the 概览
+    // page reads `sales_mode::enabled()`, and the settings page writes back to
+    // `load::config_path()`.
     ui_tz::init(&configs.gui);
+    sales_mode::init(&configs.gui);
     if let Some(path) = configs.config_path {
         load::set_config_path(path);
     }

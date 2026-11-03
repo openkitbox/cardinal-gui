@@ -1,7 +1,8 @@
 //! Settings page: a read-only Runtime card describing how this GUI reaches
 //! the gateway (the standalone `cardinal-gateway` process over loopback
-//! HTTP, startup state), plus a 显示 card for the display timezone — the one
-//! GUI-local setting, written back to the open config file's `[gui]` section.
+//! HTTP, startup state), plus the GUI-local settings written back to the open
+//! config file's `[gui]` section: the display timezone and 销售模式 (whether the
+//! 概览 page reports revenue at all).
 
 use gpui::prelude::FluentBuilder as _;
 use gpui::{
@@ -10,6 +11,7 @@ use gpui::{
 use gpui_kit::component::ActiveTheme;
 use gpui_kit::component::button::Button;
 use gpui_kit::component::input::{Input, InputState};
+use gpui_kit::component::switch::Switch;
 use gpui_kit::component::tag::Tag;
 
 use crate::pages::{card, page_frame};
@@ -29,6 +31,8 @@ pub struct SettingsPage {
     timezone: Entity<InputState>,
     /// Write-back failure of the last save; shown under the 显示 card.
     save_error: Option<String>,
+    /// Write-back failure of the last 销售模式 toggle; shown under the 业务 card.
+    sales_error: Option<String>,
 }
 
 impl SettingsPage {
@@ -57,6 +61,7 @@ impl SettingsPage {
             status: RuntimeStatus::Starting,
             timezone,
             save_error: None,
+            sales_error: None,
         }
     }
 
@@ -85,6 +90,25 @@ impl SettingsPage {
                 self.save_error = None;
             }
             Err(error) => self.save_error = Some(error),
+        }
+        cx.notify();
+    }
+
+    /// Toggle 销售模式: write it to the open config file, then apply it. A write
+    /// failure keeps the old value — the switch must never claim a state the file
+    /// does not hold, or the next start would silently disagree with what the card
+    /// showed.
+    fn set_sales_mode(&mut self, on: bool, cx: &mut Context<Self>) {
+        let outcome = match crate::load::config_path() {
+            Some(path) => crate::sales_mode::save(&path, on),
+            None => Err("无法确定打开的配置文件路径，无法保存".to_string()),
+        };
+        match outcome {
+            Ok(()) => {
+                crate::sales_mode::set_enabled(on);
+                self.sales_error = None;
+            }
+            Err(error) => self.sales_error = Some(error),
         }
         cx.notify();
     }
@@ -173,6 +197,54 @@ impl Render for SettingsPage {
                             ),
                     )
                     .when_some(self.save_error.as_ref(), |this, error| {
+                        this.child(
+                            gpui::div()
+                                .text_size(px(12.))
+                                .text_color(cx.theme().danger)
+                                .child(error.clone()),
+                        )
+                    }),
+            )
+            .child(
+                card(cx)
+                    .child(
+                        gpui::div()
+                            .font_weight(gpui::FontWeight::MEDIUM)
+                            .text_color(cx.theme().foreground)
+                            .child("业务"),
+                    )
+                    .child(
+                        gpui::div()
+                            .flex()
+                            .items_center()
+                            .justify_between()
+                            .gap_4()
+                            .child(
+                                gpui::div()
+                                    .flex()
+                                    .flex_col()
+                                    .gap_0p5()
+                                    .child(
+                                        gpui::div()
+                                            .text_color(cx.theme().foreground)
+                                            .child("销售模式"),
+                                    )
+                                    .child(
+                                        gpui::div()
+                                            .text_size(px(12.))
+                                            .text_color(cx.theme().muted_foreground)
+                                            .child("关闭后概览页不显示营收，标准价显示为金额"),
+                                    ),
+                            )
+                            .child(
+                                Switch::new("settings-sales-mode")
+                                    .checked(crate::sales_mode::enabled())
+                                    .on_change(cx.listener(|this, on: &bool, _window, cx| {
+                                        this.set_sales_mode(*on, cx);
+                                    })),
+                            ),
+                    )
+                    .when_some(self.sales_error.as_ref(), |this, error| {
                         this.child(
                             gpui::div()
                                 .text_size(px(12.))
