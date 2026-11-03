@@ -424,7 +424,7 @@ impl LedgerPanel {
             ReconcileState::Failed(error) => {
                 return Some(body.child(inline_error(error.clone(), cx)));
             }
-            ReconcileState::Done(report) => &report.report,
+            ReconcileState::Done(report) => report,
         };
         let verdict = |ok: bool| if ok { "✓ 一致" } else { "✗ 不一致" };
         let color = |ok: bool| {
@@ -434,19 +434,46 @@ impl LedgerPanel {
                 cx.theme().danger
             }
         };
-        let balance_ok = report.balance_microus == report.entries_sum_microus;
+        // The server owns the verdict: it also compares the request log with
+        // the ledger, which the loaded page cannot see.
+        let server_ok = report.consistent;
         let mut body = body.child(
+            gpui::div()
+                .text_size(px(12.))
+                .text_color(color(server_ok))
+                .child(verdict(server_ok)),
+        );
+        let balance_ok = report.report.balance_microus == report.report.entries_sum_microus;
+        body = body.child(
             gpui::div()
                 .text_size(px(12.))
                 .text_color(color(balance_ok))
                 .child(format!(
                     "余额 {} · 流水合计 {} · {}",
-                    usd_exact(report.balance_microus),
-                    usd_exact(report.entries_sum_microus),
+                    usd_exact(report.report.balance_microus),
+                    usd_exact(report.report.entries_sum_microus),
                     verdict(balance_ok)
                 )),
         );
-        if report.keys.is_empty() {
+        // What the request log says was owed against what the ledger took.
+        let uncollected = report.report.uncollected_microus;
+        let charged = report.report.requests_sum_microus - uncollected;
+        body = body.child(
+            gpui::div()
+                .text_size(px(12.))
+                .text_color(if uncollected == 0 {
+                    muted
+                } else {
+                    cx.theme().danger
+                })
+                .child(format!(
+                    "请求合计 {} · 扣费合计 {} · 差额 {}",
+                    usd_exact(report.report.requests_sum_microus),
+                    usd_exact(charged),
+                    usd_exact(uncollected)
+                )),
+        );
+        if report.report.keys.is_empty() {
             body = body.child(
                 gpui::div()
                     .text_size(px(12.))
@@ -454,7 +481,7 @@ impl LedgerPanel {
                     .child("该用户没有 Key"),
             );
         }
-        for key in &report.keys {
+        for key in &report.report.keys {
             let ok = key.spent_microus == key.entries_sum_microus;
             body = body.child(
                 gpui::div()
