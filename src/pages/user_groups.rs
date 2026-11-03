@@ -342,7 +342,7 @@ impl UserGroupsView {
                     gpui::div()
                         .text_size(px(12.))
                         .text_color(cx.theme().muted_foreground)
-                        .child("× 标准价，0 = 免费，最多 4 位小数，上限 100"),
+                        .child("× 金额，0 = 免费，最多 4 位小数，上限 100"),
                 ),
             )
             .child(Self::route_picker(editor, aliases, cx));

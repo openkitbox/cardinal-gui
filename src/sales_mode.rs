@@ -6,10 +6,9 @@
 //! ```
 //!
 //! Off — the default — the 概览 page reports no 营收 at all (a relay nobody is
-//! billed through has no revenue) and calls the catalogue cost 金额 instead of
-//! 标准价 (there is no price list to advertise). The switch is display-only: the
-//! gateway keeps returning the charged amount, and the admin bookkeeping pages
-//! (请求, 流水, 用户组定价说明) keep their own wording.
+//! billed through has no revenue). The switch is display-only: the gateway keeps
+//! returning the charged amount, and no label changes with it — cost figures are
+//! 金额 everywhere, because there is no price list to advertise.
 //!
 //! Process-global like [`crate::ui_tz`]'s offset: `init` installs the startup
 //! value once, the settings page writes a toggle through, and every reader picks
@@ -30,8 +29,8 @@ pub(crate) fn init(section: &GuiSection) {
     SALES_MODE.store(section.sales_mode.unwrap_or(false), Ordering::Relaxed);
 }
 
-/// Whether the deployment sells usage: 概览 shows 营收 and says 标准价. Render
-/// boundaries read this once and pass the bool down, so formatting stays pure.
+/// Whether the deployment sells usage: 概览 shows 营收. Render boundaries read
+/// this once and pass the bool down, so formatting stays pure.
 pub(crate) fn enabled() -> bool {
     SALES_MODE.load(Ordering::Relaxed)
 }
@@ -39,12 +38,6 @@ pub(crate) fn enabled() -> bool {
 /// Apply a toggle immediately, after its config write has landed.
 pub(crate) fn set_enabled(on: bool) {
     SALES_MODE.store(on, Ordering::Relaxed);
-}
-
-/// The word the catalogue cost figure carries: 标准价 when the deployment prices
-/// against the catalogue, 金额 when it only reports what it spent.
-pub(crate) fn cost_word(sales: bool) -> &'static str {
-    if sales { "标准价" } else { "金额" }
 }
 
 /// Persist the switch to the open config file. `false` removes the key instead of

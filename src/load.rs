@@ -12,8 +12,8 @@ use std::path::{Path, PathBuf};
 pub struct GuiSection {
     /// Display timezone, `±HH:MM`; omitted/empty = follow the system.
     pub timezone: Option<String>,
-    /// 销售模式: whether this deployment sells usage (概览 shows 营收 and says
-    /// 标准价). Omitted = not selling.
+    /// 销售模式: whether this deployment sells usage (概览 shows 营收). Omitted =
+    /// not selling.
     pub sales_mode: Option<bool>,
 }
 

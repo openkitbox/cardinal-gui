@@ -564,7 +564,7 @@ impl LedgerPanel {
             detail = detail.child(format!("Key {}", key_label(keys, key_id)));
         }
         if let Some(cost) = entry.cost_microus {
-            detail = detail.child(format!("标准价 {}", usd_exact(cost)));
+            detail = detail.child(format!("金额 {}", usd_exact(cost)));
         }
         if let Some(rate_bp) = entry.rate_bp {
             detail = detail.child(format!("倍率 {}", gateway::billing::format_rate(rate_bp)));

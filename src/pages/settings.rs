@@ -233,7 +233,7 @@ impl Render for SettingsPage {
                                         gpui::div()
                                             .text_size(px(12.))
                                             .text_color(cx.theme().muted_foreground)
-                                            .child("关闭后概览页不显示营收，标准价显示为金额"),
+                                            .child("关闭后概览页不显示营收"),
                                     ),
                             )
                             .child(

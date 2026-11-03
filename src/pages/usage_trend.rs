@@ -1,13 +1,13 @@
 //! Usage trend card: a segmented metric switch (Token /
-//! 标准价 / 营收 / 请求) and a split-dimension switch (路由 / 模型 / 供应商 / 客户端 / 用户) over a
+//! 金额 / 营收 / 请求) and a split-dimension switch (路由 / 模型 / 供应商 / 客户端 / 用户) over a
 //! stacked-column chart with a hover tooltip, flanked by a per-category
 //! ranking. The top 7 categories take the palette colours; the rest fold
 //! into 其他. Geometry and paint happen in a `canvas` element; the tooltip
 //! and the ranking are regular divs positioned from the geometry the last
 //! prepaint stored.
 //!
-//! 营收 and 标准价 are sales-mode vocabulary: with [`crate::sales_mode`] off the
-//! switch drops 营收 entirely and the cost metric reads 金额.
+//! 营收 is sales-mode vocabulary: with [`crate::sales_mode`] off the switch
+//! drops it entirely.
 
 use std::cell::RefCell;
 use std::collections::HashMap;
@@ -87,10 +87,10 @@ impl TrendMetric {
         }
     }
 
-    fn label(self, sales: bool) -> &'static str {
+    fn label(self) -> &'static str {
         match self {
             Self::Tokens => "Token",
-            Self::Cost => crate::sales_mode::cost_word(sales),
+            Self::Cost => "金额",
             Self::Revenue => "营收",
             Self::Requests => "请求",
         }
@@ -144,7 +144,7 @@ impl TrendMetric {
 #[derive(Clone, Copy)]
 struct Reading {
     metric: TrendMetric,
-    /// Whether the deployment sells usage: gates 营收 and the 标准价/金额 word.
+    /// Whether the deployment sells usage: gates the 营收 figures.
     sales: bool,
 }
 
@@ -507,7 +507,7 @@ impl UsagePage {
                     .gap_2()
                     .child(segs(
                         "trend-metric",
-                        TrendMetric::offered(reading.sales).map(|m| (m, m.label(reading.sales))),
+                        TrendMetric::offered(reading.sales).map(|m| (m, m.label())),
                         metric,
                         cx,
                         |page, m, cx| {
@@ -747,10 +747,7 @@ impl UsagePage {
         if metric != TrendMetric::Cost
             && let Some(cost) = category.cost
         {
-            stats.push(format!(
-                "{} ${cost:.2}",
-                crate::sales_mode::cost_word(reading.sales)
-            ));
+            stats.push(format!("金额 ${cost:.2}"));
         }
         // 营收 belongs to the selling reading; a non-selling deployment has no
         // revenue figure to report even when rows carry a charged amount.

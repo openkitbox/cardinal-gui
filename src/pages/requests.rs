@@ -745,7 +745,7 @@ fn requests_header(cx: &App) -> Div {
         .child(ttft_header(cx))
         .child(speed_header(cx))
         .child(label("Token 入/出", true))
-        .child(label("标准价", true))
+        .child(label("金额", true))
         .child(label("扣费", true))
 }
 
