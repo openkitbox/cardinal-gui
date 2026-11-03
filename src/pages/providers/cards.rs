@@ -33,7 +33,10 @@ use super::groups::{group_chips, group_tags};
 use super::kiro_import;
 use super::order::DropSide;
 use super::quota::quota_row;
-use super::{FormSource, KeyCardData, KeyEditor, KeyForm, KiroImportForm, ProvidersPage};
+use super::{
+    FormSource, KeyCardData, KeyEditor, KeyForm, KiroImportForm, LoginProgress, OpencodeLoginForm,
+    ProvidersPage,
+};
 use crate::app::StatusTip;
 use crate::fmt::mask_api_key;
 use crate::pages::{LoadState, card};
@@ -56,6 +59,10 @@ impl ProvidersPage {
             FormSource::Custom { .. } => None,
         };
         let is_kiro = form.source.is_kiro();
+        let is_account_login = form.source.is_account_login();
+        // Only a pasted credential can be probed or whitelisted while adding:
+        // Kiro parses its import locally and OpenCode Go has no key to probe.
+        let has_pasted_key = !is_kiro && !is_account_login;
         card(cx)
             .child(
                 gpui::div()
@@ -294,6 +301,14 @@ impl ProvidersPage {
                     )),
                     None => this,
                 })
+            // OpenCode Go: the credential is an account login, so the block owns
+            // the code, the console URL and the session's progress instead of an
+            // API-key field.
+            .when(is_account_login, |this| {
+                this.when_some(form.opencode_login.as_ref(), |this, login| {
+                    this.child(self.opencode_login_fields(login, cx))
+                })
+            })
             .when(!is_kiro, |this| {
                 this.child(editor_field(
                     "Label",
@@ -301,12 +316,14 @@ impl ProvidersPage {
                     Some(240.),
                     cx,
                 ))
-                .child(editor_field(
-                    "API Key",
-                    Input::new(&form.api_key).disabled(form.saving),
-                    None,
-                    cx,
-                ))
+                .when(!is_account_login, |this| {
+                    this.child(editor_field(
+                        "API Key",
+                        Input::new(&form.api_key).disabled(form.saving),
+                        None,
+                        cx,
+                    ))
+                })
                 .child(editor_field(
                     "并发上限",
                     Input::new(&form.max_concurrency).disabled(form.saving),
@@ -314,8 +331,8 @@ impl ProvidersPage {
                     cx,
                 ))
             })
-            // 普通供应商才显示模型探测；Kiro 导入必须保持纯本地解析。
-            .when(!is_kiro, |this| {
+            // 普通供应商才显示模型探测；Kiro 导入必须保持纯本地解析，登录账号无 key 可探测。
+            .when(has_pasted_key, |this| {
                 this.child(
                     gpui::div()
                         .flex()
@@ -343,7 +360,7 @@ impl ProvidersPage {
                         ),
                 )
             })
-            .when(!is_kiro, |this| {
+            .when(has_pasted_key, |this| {
                 this.when_some(form.probed_models.as_ref(), |this, models| {
                     let listed: Vec<&str> = models.iter().map(|model| model.id.as_str()).collect();
                     let orphans = form
@@ -419,11 +436,121 @@ impl ProvidersPage {
                             .label(save_label(form))
                             .primary()
                             .compact()
-                            .loading(form.saving)
+                            // A waiting login keeps the form locked but is not a
+                            // running request: no spinner for minutes on end.
+                            .loading(form.saving && !login_waiting(form))
                             .disabled(form.saving)
                             .on_click(cx.listener(|this, _, window, cx| this.save_key(window, cx))),
                     ),
             )
+    }
+
+    /// The OpenCode Go login block: what the console asks of the user while a
+    /// session waits, and what went wrong when one fails. Nothing here is
+    /// editable — the gateway owns the session and the credential.
+    fn opencode_login_fields(&self, login: &OpencodeLoginForm, cx: &mut Context<Self>) -> Div {
+        let mut fields = gpui::div().flex().flex_col().gap_2().child(
+            gpui::div()
+                .text_size(px(12.))
+                .text_color(cx.theme().muted_foreground)
+                .child("用 OpenCode 账号登录，无需粘贴 API key"),
+        );
+        match &login.progress {
+            LoginProgress::Idle => {}
+            LoginProgress::Waiting {
+                user_code,
+                verification_url,
+                started,
+                expires_in,
+                ..
+            } => {
+                let code = user_code.clone();
+                fields = fields.child(
+                    gpui::div()
+                        .flex()
+                        .items_center()
+                        .gap_2()
+                        .child(field_label("验证码", cx))
+                        .child(
+                            gpui::div()
+                                .font_weight(gpui::FontWeight::MEDIUM)
+                                .text_size(px(16.))
+                                .text_color(cx.theme().foreground)
+                                .child(user_code.clone()),
+                        )
+                        .child(
+                            Button::new("opencode-login-copy-code")
+                                .icon(Icon::new(IconName::Copy).small())
+                                .ghost()
+                                .compact()
+                                .on_click(cx.listener(move |_, _, _, cx| {
+                                    cx.write_to_clipboard(gpui::ClipboardItem::new_string(
+                                        code.clone(),
+                                    ));
+                                })),
+                        ),
+                );
+                let url = verification_url.clone();
+                let open_url = verification_url.clone();
+                fields = fields.child(
+                    gpui::div()
+                        .flex()
+                        .items_center()
+                        .gap_2()
+                        .child(field_label("链接", cx))
+                        .child(
+                            gpui::div()
+                                .id("opencode-login-url")
+                                .cursor_pointer()
+                                .text_color(cx.theme().primary)
+                                .child(verification_url.clone())
+                                .on_click(cx.listener(move |_, _, _, cx| {
+                                    cx.open_url(&open_url);
+                                })),
+                        )
+                        .child(
+                            Button::new("opencode-login-copy-url")
+                                .icon(Icon::new(IconName::Copy).small())
+                                .ghost()
+                                .compact()
+                                .on_click(cx.listener(move |_, _, _, cx| {
+                                    cx.write_to_clipboard(gpui::ClipboardItem::new_string(
+                                        url.clone(),
+                                    ));
+                                })),
+                        ),
+                );
+                let elapsed = started.elapsed().as_secs();
+                fields = fields.child(
+                    gpui::div()
+                        .flex()
+                        .items_center()
+                        .gap_3()
+                        .child(
+                            gpui::div()
+                                .text_size(px(12.))
+                                .text_color(cx.theme().muted_foreground)
+                                .child(format!(
+                                    "打开上面的链接完成授权（验证码已预填） · 已等待 {elapsed} 秒 · 有效期 {} 分钟",
+                                    expires_in / 60
+                                )),
+                        )
+                        .child(
+                            Button::new("opencode-login-cancel")
+                                .label("取消")
+                                .outline()
+                                .compact()
+                                .on_click(
+                                    cx.listener(|this, _, _, cx| this.cancel_opencode_login(cx)),
+                                ),
+                        ),
+                );
+            }
+            LoginProgress::Failed(message) => {
+                fields = fields.child(inline_error(message, cx));
+            }
+        }
+        fields
     }
 
     fn kiro_import_fields(
@@ -753,6 +880,9 @@ impl ProvidersPage {
                     })
                     .child(key_menu_button(provider.id, key, cx.weak_entity())),
             )
+            // Credential row: an account key has no key to preview, so the card
+            // names the login that maintains it and the account it belongs to.
+            .when_some(account_row(key, cx), |this, row| this.child(row))
             // Tag row: the groups this account belongs to (derived from
             // `groups` at render time), then the variant markers (kimi/glm
             // only): 区域 (国内/国际) + Coding Plan — the variant decides the
@@ -824,6 +954,7 @@ impl ProvidersPage {
         } else {
             IconName::Eye
         };
+        let key = &card_data.key;
         card(cx)
             .w(px(KEY_CARD_WIDTH))
             .child(
@@ -832,7 +963,21 @@ impl ProvidersPage {
                     .text_color(cx.theme().foreground)
                     .child("编辑账号"),
             )
-            .child(
+            // An account row has no key to reveal: its credential belongs to the
+            // login that created it, and is renewed by logging in again.
+            .when(key.auth_kind != "static", |this| {
+                let hint = match key.auth_kind.as_str() {
+                    "kiro_oidc" => "凭证由 Kiro 导入维护 · 重新导入以更新",
+                    _ => "凭证由登录维护 · 重新登录以更新",
+                };
+                this.child(
+                    gpui::div()
+                        .text_size(px(12.))
+                        .text_color(cx.theme().muted_foreground)
+                        .child(hint),
+                )
+            })
+            .when(key.auth_kind == "static", |this| this.child(
                 gpui::div()
                     .flex()
                     .items_center()
@@ -883,7 +1028,7 @@ impl ProvidersPage {
                                 }
                             })),
                     ),
-            )
+            ))
             .child(editor_field(
                 "Label",
                 Input::new(&editor.label).disabled(editor.saving),
@@ -1489,6 +1634,13 @@ fn letter_tile(letter: &str, height: f32, cx: &App) -> Div {
 /// The add form's save button text: the Kiro import counts its accounts
 /// while running.
 fn save_label(form: &KeyForm) -> String {
+    if form.source.is_account_login() {
+        return if login_waiting(form) {
+            "登录中…".to_string()
+        } else {
+            "开始登录".to_string()
+        };
+    }
     let progress = form
         .kiro_import
         .as_ref()
@@ -1498,6 +1650,14 @@ fn save_label(form: &KeyForm) -> String {
         _ if form.saving => "验证中…".to_string(),
         _ => "保存".to_string(),
     }
+}
+
+/// Whether the add form waits on an account login: the form stays locked while
+/// it does, but no request is in flight.
+fn login_waiting(form: &KeyForm) -> bool {
+    form.opencode_login
+        .as_ref()
+        .is_some_and(|login| login.progress.is_waiting())
 }
 
 /// Small fixed-width field label used by the form cards.
@@ -1603,6 +1763,43 @@ fn tag_row(key_id: i64, provider: &ProviderRow, groups: &[KeyGroupView], cx: &Ap
             .gap_1()
             .children(tags),
     )
+}
+
+/// The credential line of an account card: the login a non-static credential is
+/// maintained through (a badge), then the account and its organization, where a
+/// pasted key's preview would otherwise sit. `None` for static-key rows — they
+/// add nothing beyond the key itself.
+fn account_row(key: &ProviderKeyView, cx: &App) -> Option<Div> {
+    let kind = match key.auth_kind.as_str() {
+        "static" => return None,
+        "opencode_oauth" => "OpenCode 账号",
+        "kiro_oidc" => "Kiro 账号",
+        // A kind this build does not know yet: show it rather than hide the
+        // fact that the credential is login-maintained.
+        other => other,
+    };
+    let mut row = gpui::div()
+        .flex()
+        .flex_wrap()
+        .items_center()
+        .gap_1()
+        .child(Tag::secondary().child(kind.to_string()));
+    if let Some(account) = key.account.as_deref() {
+        row = row.child(
+            gpui::div()
+                .min_w(px(0.))
+                .overflow_hidden()
+                .whitespace_nowrap()
+                .text_ellipsis()
+                .text_size(px(11.))
+                .text_color(cx.theme().muted_foreground)
+                .child(account.to_string()),
+        );
+    }
+    if let Some(organization) = key.organization.as_deref() {
+        row = row.child(Tag::secondary().child(organization.to_string()));
+    }
+    Some(row)
 }
 
 /// The variant markers of a catalog variant row (kimi/glm only): 区域
