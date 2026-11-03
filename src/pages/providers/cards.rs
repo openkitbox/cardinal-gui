@@ -34,8 +34,8 @@ use super::kiro_import;
 use super::order::DropSide;
 use super::quota::quota_row;
 use super::{
-    FormSource, KeyCardData, KeyEditor, KeyForm, KiroImportForm, LoginProgress, OpencodeLoginForm,
-    ProvidersPage,
+    CredentialMode, FormSource, KeyCardData, KeyEditor, KeyForm, KiroImportForm, LoginProgress,
+    OpencodeLoginForm, ProvidersPage,
 };
 use crate::app::StatusTip;
 use crate::fmt::mask_api_key;
@@ -59,10 +59,14 @@ impl ProvidersPage {
             FormSource::Custom { .. } => None,
         };
         let is_kiro = form.source.is_kiro();
-        let is_account_login = form.source.is_account_login();
+        // The vendor whose credential is normally a console login: it offers
+        // both, so the picker shows either way.
+        let offers_login = form.source.is_account_login();
+        // ... and this form picked it, so its one write is the device flow.
+        let account_login = form.uses_account_login();
         // Only a pasted credential can be probed or whitelisted while adding:
-        // Kiro parses its import locally and OpenCode Go has no key to probe.
-        let has_pasted_key = !is_kiro && !is_account_login;
+        // Kiro parses its import locally and a login has no key to probe.
+        let has_pasted_key = !is_kiro && !account_login;
         card(cx)
             .child(
                 gpui::div()
@@ -301,10 +305,14 @@ impl ProvidersPage {
                     )),
                     None => this,
                 })
-            // OpenCode Go: the credential is an account login, so the block owns
-            // the code, the console URL and the session's progress instead of an
-            // API-key field.
-            .when(is_account_login, |this| {
+            // OpenCode Go takes two kinds of credential: a dropdown picks the
+            // account login (default) or a pasted API key.
+            .when(offers_login, |this| {
+                this.child(credential_mode_field(form, cx.weak_entity(), cx))
+            })
+            // The login block owns the code, the console URL and the session's
+            // progress; the API-key field below replaces it in the other mode.
+            .when(account_login, |this| {
                 this.when_some(form.opencode_login.as_ref(), |this, login| {
                     this.child(self.opencode_login_fields(login, cx))
                 })
@@ -316,7 +324,7 @@ impl ProvidersPage {
                     Some(240.),
                     cx,
                 ))
-                .when(!is_account_login, |this| {
+                .when(!account_login, |this| {
                     this.child(editor_field(
                         "API Key",
                         Input::new(&form.api_key).disabled(form.saving),
@@ -453,7 +461,7 @@ impl ProvidersPage {
             gpui::div()
                 .text_size(px(12.))
                 .text_color(cx.theme().muted_foreground)
-                .child("用 OpenCode 账号登录，无需粘贴 API key"),
+                .child("浏览器里授权 OpenCode 账号；有 API key 也可以在上方切换为填写 key"),
         );
         match &login.progress {
             LoginProgress::Idle => {}
@@ -882,7 +890,10 @@ impl ProvidersPage {
             )
             // Credential row: an account key has no key to preview, so the card
             // names the login that maintains it and the account it belongs to.
-            .when_some(account_row(key, cx), |this, row| this.child(row))
+            .when_some(
+                account_row(key, self.revealed_accounts.contains(&key_id), cx),
+                |this, row| this.child(row),
+            )
             // Tag row: the groups this account belongs to (derived from
             // `groups` at render time), then the variant markers (kimi/glm
             // only): 区域 (国内/国际) + Coding Plan — the variant decides the
@@ -1574,7 +1585,15 @@ fn model_rows(key: &ProviderKeyView, cx: &App) -> Div {
             }
         }
         None => {
-            rows.push(Tag::secondary().child(concurrency).into_any_element());
+            // A row of its own: a bare tag would be stretched to the card's
+            // full width by the column's cross-axis alignment.
+            rows.push(
+                gpui::div()
+                    .flex()
+                    .items_center()
+                    .child(Tag::secondary().child(concurrency))
+                    .into_any_element(),
+            );
         }
     }
     gpui::div().flex().flex_col().gap_1().children(rows)
@@ -1631,10 +1650,46 @@ fn letter_tile(letter: &str, height: f32, cx: &App) -> Div {
         .child(letter.to_string())
 }
 
+/// The credential picker of a vendor that offers both an account login and a
+/// pasted API key (OpenCode Go): a dropdown naming the current choice, so the
+/// login block and the API-key field never render together.
+fn credential_mode_field(form: &KeyForm, weak: WeakEntity<ProvidersPage>, cx: &App) -> Div {
+    let current = form.credential_mode;
+    // The set the menu offers, in display order (the default first).
+    let modes = [CredentialMode::AccountLogin, CredentialMode::ApiKey];
+    gpui::div()
+        .flex()
+        .items_center()
+        .gap_2()
+        .child(field_label("凭证方式", cx))
+        .child(
+            Button::new("key-form-credential-mode")
+                .label(current.label())
+                .outline()
+                .compact()
+                .disabled(form.saving)
+                .dropdown_menu_with_anchor(Anchor::BottomLeft, move |menu, _, _| {
+                    modes.into_iter().fold(menu, |menu, mode| {
+                        let weak = weak.clone();
+                        menu.item(
+                            PopupMenuItem::new(mode.label())
+                                .checked(mode == current)
+                                .on_click(move |_, _, cx| {
+                                    weak.update(cx, |this, cx| {
+                                        this.set_form_credential_mode(mode, cx)
+                                    })
+                                    .ok();
+                                }),
+                        )
+                    })
+                }),
+        )
+}
+
 /// The add form's save button text: the Kiro import counts its accounts
 /// while running.
 fn save_label(form: &KeyForm) -> String {
-    if form.source.is_account_login() {
+    if form.uses_account_login() {
         return if login_waiting(form) {
             "登录中…".to_string()
         } else {
@@ -1675,9 +1730,10 @@ fn field_label(label: &'static str, cx: &App) -> Div {
 const FIELD_LABEL_W: f32 = 72.;
 
 /// One selectable model chip for the whitelist pickers (add form and key
-/// editor): model id plus the attribute badges the probe list carried
-/// (id · 上下文 · 输出上限 · 模态 · 推理), highlighted when selected. Same
-/// render conventions as the route editor's model chips.
+/// editor): model id plus the numeric limits the probe list carried
+/// (id · 上下文 · 输出上限 · 推理), highlighted when selected. Input modalities
+/// are deliberately not rendered — a model's accepted media is not something a
+/// whitelist picker has to spell out on every chip.
 fn model_chip(model: &ProbeModel, selected: bool, id: ElementId, cx: &App) -> gpui::Stateful<Div> {
     let mut chip_text = model.id.clone();
     if let Some(context) = model.context {
@@ -1691,15 +1747,6 @@ fn model_chip(model: &ProbeModel, selected: bool, id: ElementId, cx: &App) -> gp
             " · 出 {}",
             crate::fmt::humanize_count(output as i64)
         ));
-    }
-    for modality in &model.input_modalities {
-        let badge = match modality.as_str() {
-            "image" => "图",
-            "audio" => "音",
-            "video" => "视",
-            other => other,
-        };
-        chip_text.push_str(&format!(" · {badge}"));
     }
     if !model.effort_levels.is_empty() {
         chip_text.push_str(" · 推理");
@@ -1765,41 +1812,104 @@ fn tag_row(key_id: i64, provider: &ProviderRow, groups: &[KeyGroupView], cx: &Ap
     )
 }
 
-/// The credential line of an account card: the login a non-static credential is
-/// maintained through (a badge), then the account and its organization, where a
-/// pasted key's preview would otherwise sit. `None` for static-key rows — they
-/// add nothing beyond the key itself.
-fn account_row(key: &ProviderKeyView, cx: &App) -> Option<Div> {
-    let kind = match key.auth_kind.as_str() {
-        "static" => return None,
-        "opencode_oauth" => "OpenCode 账号",
-        "kiro_oidc" => "Kiro 账号",
-        // A kind this build does not know yet: show it rather than hide the
-        // fact that the credential is login-maintained.
-        other => other,
+/// The credential line of an account card, where a pasted key's preview would
+/// otherwise sit. `None` for static-key rows — they add nothing beyond the key
+/// itself.
+fn account_row(
+    key: &ProviderKeyView,
+    revealed: bool,
+    cx: &mut Context<ProvidersPage>,
+) -> Option<Div> {
+    match key.auth_kind.as_str() {
+        "static" => None,
+        // The OpenCode login is identified by its email alone: the login badge
+        // and the workspace name say nothing about which account is in use, and
+        // the address is masked until the eye is clicked.
+        "opencode_oauth" => Some(opencode_account_row(key, revealed, cx)),
+        // A Kiro import (and any kind this build does not know yet — shown
+        // rather than hidden, so the card still says the credential is
+        // login-maintained) keeps the badge, then account and organization.
+        kind => {
+            let kind = match kind {
+                "kiro_oidc" => "Kiro 账号",
+                other => other,
+            };
+            let mut row = gpui::div()
+                .flex()
+                .flex_wrap()
+                .items_center()
+                .gap_1()
+                .child(Tag::secondary().child(kind.to_string()));
+            if let Some(account) = key.account.as_deref() {
+                row = row.child(
+                    gpui::div()
+                        .min_w(px(0.))
+                        .overflow_hidden()
+                        .whitespace_nowrap()
+                        .text_ellipsis()
+                        .text_size(px(11.))
+                        .text_color(cx.theme().muted_foreground)
+                        .child(account.to_string()),
+                );
+            }
+            if let Some(organization) = key.organization.as_deref() {
+                row = row.child(Tag::secondary().child(organization.to_string()));
+            }
+            Some(row)
+        }
+    }
+}
+
+/// The OpenCode account's email — masked by default — and the eye that toggles
+/// between the mask and the address in clear. A login that recorded no address
+/// falls back to the login badge: there is nothing to reveal.
+fn opencode_account_row(
+    key: &ProviderKeyView,
+    revealed: bool,
+    cx: &mut Context<ProvidersPage>,
+) -> Div {
+    let key_id = key.id;
+    let Some(account) = key.account.as_deref() else {
+        return gpui::div()
+            .flex()
+            .items_center()
+            .child(Tag::secondary().child("OpenCode 账号"));
     };
-    let mut row = gpui::div()
+    let text = if revealed {
+        account.to_string()
+    } else {
+        crate::fmt::mask_email(account)
+    };
+    let eye = if revealed {
+        IconName::EyeOff
+    } else {
+        IconName::Eye
+    };
+    gpui::div()
         .flex()
-        .flex_wrap()
         .items_center()
         .gap_1()
-        .child(Tag::secondary().child(kind.to_string()));
-    if let Some(account) = key.account.as_deref() {
-        row = row.child(
+        .min_w(px(0.))
+        .child(
             gpui::div()
+                .flex_1()
                 .min_w(px(0.))
                 .overflow_hidden()
                 .whitespace_nowrap()
                 .text_ellipsis()
                 .text_size(px(11.))
                 .text_color(cx.theme().muted_foreground)
-                .child(account.to_string()),
-        );
-    }
-    if let Some(organization) = key.organization.as_deref() {
-        row = row.child(Tag::secondary().child(organization.to_string()));
-    }
-    Some(row)
+                .child(text),
+        )
+        .child(
+            Button::new(("account-email-eye", key_id as u64))
+                .icon(Icon::new(eye).small())
+                .ghost()
+                .compact()
+                .on_click(
+                    cx.listener(move |this, _, _, cx| this.toggle_account_reveal(key_id, cx)),
+                ),
+        )
 }
 
 /// The variant markers of a catalog variant row (kimi/glm only): 区域

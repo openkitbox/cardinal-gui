@@ -18,8 +18,10 @@ use gpui::{
 };
 use gpui_kit::component::ActiveTheme;
 
-/// Chart element height: plot + one label row.
-const TREND_HEIGHT: f32 = 88.;
+/// Chart element height: plot + one label row. 60% of the original 88px — the
+/// chart is a trend hint under a meter, not the card's subject, and the taller
+/// version pushed the card's own rows off the fold.
+const TREND_HEIGHT: f32 = 52.8;
 /// The chart's y-axis top: the window allowance is the story, so the scale
 /// never stretches past it — a projection past 100% pins there and runs flat.
 const TREND_TOP_PCT: f64 = 100.;

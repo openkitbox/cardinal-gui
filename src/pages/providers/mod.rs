@@ -29,7 +29,7 @@ mod order;
 mod quota;
 mod trend;
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -218,6 +218,24 @@ impl FormSource {
     }
 }
 
+/// How the add form authenticates a vendor that offers both (OpenCode Go): the
+/// console account login is the default, a pasted API key the alternative.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum CredentialMode {
+    AccountLogin,
+    ApiKey,
+}
+
+impl CredentialMode {
+    /// The dropdown trigger's label and the matching menu line.
+    fn label(self) -> &'static str {
+        match self {
+            CredentialMode::AccountLogin => "账号登录",
+            CredentialMode::ApiKey => "API Key",
+        }
+    }
+}
+
 /// The provider row parameters the add form submits, copied out of the
 /// inputs once at submit time so the async call can own them.
 #[derive(Clone, PartialEq, Eq)]
@@ -256,8 +274,12 @@ struct KeyForm {
     /// Kiro uses a JSON import instead of the ordinary API-key field.
     kiro_import: Option<KiroImportForm>,
     /// OpenCode Go logs in through the console device flow instead of an API
-    /// key; the block owns that session's state.
+    /// key; the block owns that session's state. Present for the vendor whether
+    /// or not the login is the chosen [`CredentialMode`].
     opencode_login: Option<OpencodeLoginForm>,
+    /// Which credential the form writes for a vendor that offers both: the
+    /// console login (default) or a pasted API key.
+    credential_mode: CredentialMode,
     /// Optional per-key concurrency cap (empty = 不限).
     max_concurrency: Entity<InputState>,
     /// Models the last 获取模型 probe returned (None until probed).
@@ -275,6 +297,12 @@ struct KeyForm {
 }
 
 impl KeyForm {
+    /// Whether this form's one write is the account login rather than a pasted
+    /// API key: a vendor that supports a login, with the login chosen.
+    fn uses_account_login(&self) -> bool {
+        self.source.is_account_login() && self.credential_mode == CredentialMode::AccountLogin
+    }
+
     /// Derive the provider parameters from the source: catalog entries
     /// resolve their variant, custom providers take the typed label (as the
     /// name) and base_url. Err carries the message for the form.
@@ -547,6 +575,10 @@ pub struct ProvidersPage {
     /// never stored, so two overlapping drops could both fail and leave the
     /// grid on neither the served nor the requested order.
     order_write_in_flight: bool,
+    /// Accounts whose email the card shows in clear: the eye on an account
+    /// card toggles one entry. View state only — the address is already on the
+    /// card, masked, and nothing is fetched to reveal it.
+    revealed_accounts: HashSet<i64>,
 }
 
 impl ProvidersPage {
@@ -568,6 +600,7 @@ impl ProvidersPage {
             seen_quota: feed.read(cx).quota_rev(),
             drag: None,
             order_write_in_flight: false,
+            revealed_accounts: HashSet::new(),
         };
         // The page renders from the PUSHED bootstrap document — providers,
         // every key (with its model snapshot), the stored quota readings and
@@ -1010,6 +1043,7 @@ impl ProvidersPage {
             base_url,
             kiro_import: None,
             opencode_login: source.login_form(self.form_generation),
+            credential_mode: CredentialMode::AccountLogin,
             max_concurrency,
             probed_models: None,
             selected_models: Vec::new(),
@@ -1073,6 +1107,7 @@ impl ProvidersPage {
             None
         };
         form.opencode_login = source.login_form(self.form_generation);
+        form.credential_mode = CredentialMode::AccountLogin;
         // The account login labels the new key after the vendor; an empty field
         // would make the gateway create an unnamed account.
         if source.is_account_login() && form.label.read(cx).value().trim().is_empty() {
@@ -1154,7 +1189,7 @@ impl ProvidersPage {
         }
         // An account-login vendor has no key to validate or persist: the whole
         // write is the gateway's device flow (which the block polls).
-        if form.source.is_account_login() {
+        if form.uses_account_login() {
             self.start_opencode_login(cx);
             return;
         }
@@ -1959,6 +1994,41 @@ impl ProvidersPage {
             && let Some(import) = &mut form.kiro_import
         {
             toggle_selection(&mut import.selected_groups, &group_id);
+        }
+        cx.notify();
+    }
+
+    /// The eye on an account card: show that account's email in clear, or mask
+    /// it again.
+    fn toggle_account_reveal(&mut self, key_id: i64, cx: &mut Context<Self>) {
+        if !self.revealed_accounts.remove(&key_id) {
+            self.revealed_accounts.insert(key_id);
+        }
+        cx.notify();
+    }
+
+    /// Switch the add form's credential between the account login and a pasted
+    /// API key. A login session the user abandons on the way is cancelled: the
+    /// gateway keeps polling a waiting session until it expires, and a landing
+    /// after the switch would create an account nobody asked for.
+    fn set_form_credential_mode(&mut self, mode: CredentialMode, cx: &mut Context<Self>) {
+        let Some(form) = self.key_form.as_ref().filter(|form| !form.saving) else {
+            return;
+        };
+        if form.credential_mode == mode {
+            return;
+        }
+        let abandon_login = mode == CredentialMode::ApiKey
+            && form
+                .opencode_login
+                .as_ref()
+                .is_some_and(|login| login.progress.is_waiting());
+        if let Some(form) = &mut self.key_form {
+            form.credential_mode = mode;
+            form.error = None;
+        }
+        if abandon_login {
+            self.cancel_opencode_login(cx);
         }
         cx.notify();
     }
