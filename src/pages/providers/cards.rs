@@ -880,6 +880,10 @@ impl ProvidersPage {
                             .text_color(cx.theme().foreground)
                             .child(key.label.clone()),
                     )
+                    // Concurrency is the account's, not the model's: the card
+                    // carries it once, right after the label, however many
+                    // models the account serves.
+                    .child(concurrency_tag(key))
                     .when(archived, |this| this.child(archived_badge(cx)))
                     // The quota reading's probe age lives on the title row
                     // (配额 header row removed — the card is one row shorter).
@@ -1541,26 +1545,38 @@ fn probe_age_label(probed_at: chrono::DateTime<chrono::Utc>, cx: &App) -> Div {
         .child(crate::fmt::probe_age(probed_at, chrono::Utc::now()))
 }
 
-/// The key card's model rows: one line per whitelisted model (`KEY_MODEL_ROWS`
-/// shown, the rest folded into an 「其他模型 N 个」 hint), the key's concurrency
-/// sitting after each model ID — a key-level metric repeated per row by
-/// design. A key without a whitelist (= 全部模型) shows the concurrency alone,
-/// so a limited key keeps its occupancy visible; with neither, the section
-/// collapses.
-fn model_rows(key: &ProviderKeyView, cx: &App) -> Div {
-    let concurrency = match key.max_concurrency {
+/// The account's concurrency occupancy, shown once per card on the header row:
+/// concurrency is a limit on the account, so every model it serves shares the
+/// one figure (a per-model row would print the same tag N times).
+fn concurrency_tag(key: &ProviderKeyView) -> Tag {
+    let text = match key.max_concurrency {
         Some(max) => format!("并发 {}/{}", key.inflight.unwrap_or(0), max),
         None => "并发 不限".to_string(),
     };
-    let mut rows: Vec<gpui::AnyElement> = Vec::new();
-    match key
+    Tag::secondary().child(text)
+}
+
+/// The key card's model rows: one line per whitelisted model (`KEY_MODEL_ROWS`
+/// shown, the rest folded into an 「其他模型 N 个」 hint). A key without a
+/// whitelist (= 全部模型) renders nothing — the section collapses and the card
+/// shrinks. The account's concurrency sits on the header instead, because it is
+/// one limit for the whole account rather than a per-model setting.
+fn model_rows(key: &ProviderKeyView, cx: &App) -> Div {
+    let models = key
         .allowed_models
         .as_ref()
-        .filter(|models| !models.is_empty())
-    {
-        Some(models) => {
-            for model in models.iter().take(KEY_MODEL_ROWS) {
-                let mut row = gpui::div().flex().items_center().gap_1().child(
+        .filter(|models| !models.is_empty());
+    let Some(models) = models else {
+        return gpui::div();
+    };
+    let mut rows: Vec<gpui::AnyElement> = Vec::new();
+    for model in models.iter().take(KEY_MODEL_ROWS) {
+        rows.push(
+            gpui::div()
+                .flex()
+                .items_center()
+                .gap_1()
+                .child(
                     gpui::div()
                         .flex_1()
                         .min_w(px(0.))
@@ -1570,31 +1586,18 @@ fn model_rows(key: &ProviderKeyView, cx: &App) -> Div {
                         .text_size(px(12.))
                         .text_color(cx.theme().foreground)
                         .child(model.clone()),
-                );
-                row = row.child(Tag::secondary().child(concurrency.clone()));
-                rows.push(row.into_any_element());
-            }
-            if models.len() > KEY_MODEL_ROWS {
-                rows.push(
-                    gpui::div()
-                        .text_size(px(11.))
-                        .text_color(cx.theme().muted_foreground)
-                        .child(format!("其他模型 {} 个", models.len() - KEY_MODEL_ROWS))
-                        .into_any_element(),
-                );
-            }
-        }
-        None => {
-            // A row of its own: a bare tag would be stretched to the card's
-            // full width by the column's cross-axis alignment.
-            rows.push(
-                gpui::div()
-                    .flex()
-                    .items_center()
-                    .child(Tag::secondary().child(concurrency))
-                    .into_any_element(),
-            );
-        }
+                )
+                .into_any_element(),
+        );
+    }
+    if models.len() > KEY_MODEL_ROWS {
+        rows.push(
+            gpui::div()
+                .text_size(px(11.))
+                .text_color(cx.theme().muted_foreground)
+                .child(format!("其他模型 {} 个", models.len() - KEY_MODEL_ROWS))
+                .into_any_element(),
+        );
     }
     gpui::div().flex().flex_col().gap_1().children(rows)
 }
