@@ -53,7 +53,7 @@ impl QuotaBand {
 /// the gateway's probed reading).
 #[derive(Clone, Debug)]
 pub(super) struct QuotaWindowView {
-    /// Display name from the probe ("5 小时", "本周").
+    /// Display name from the probe ("5h", "本周").
     name: String,
     /// Share of the window already used, 0–100.
     used_pct: f64,
@@ -62,9 +62,7 @@ pub(super) struct QuotaWindowView {
     /// Approximate window length in minutes (sort key, and the trend chart's
     /// x-axis span). `None` in snapshots written before the field existed.
     period_minutes: Option<i64>,
-    /// The window's full allowance ("$70.00") for a money-window, so the meter
-    /// renders "remaining/total" instead of a bare percent.
-    total: Option<String>,
+
     /// Probe samples recorded for this window name, oldest first — all of the
     /// gateway's 35-day series, including a previous window's points; the
     /// chart trims them to the current window.
@@ -82,7 +80,6 @@ impl QuotaWindowView {
             used_pct: window.used_pct,
             resets_at: window.resets_at,
             period_minutes: window.period_minutes,
-            total: window.total,
             history,
         }
     }
@@ -223,16 +220,14 @@ fn quota_meter(
                 .child(gpui::div().flex_1())
                 .child(
                     gpui::div()
-                        .text_size(px(12.))
-                        .font_weight(gpui::FontWeight::MEDIUM)
-                        .child(match &window.total {
-                            Some(total) => {
-                                let remaining_amount = remaining_amount(total, remaining);
-                                format!("{remaining_amount}/{total}")
-                            }
-                            None => format!("剩余 {}", pct_label(remaining)),
-                        }),
-                ),
+                        .text_size(px(11.))
+                        .text_color(cx.theme().muted_foreground)
+                        .children(
+                            window
+                                .resets_at
+                                .map(|resets_at| reset_line(resets_at, chrono::Utc::now())),
+                        ),
+                )
         )
         // The bar: fill width = remaining share, band-colored by the used share.
         // 4px, same gauge as the overview card bars (usage.rs).
@@ -253,18 +248,6 @@ fn quota_meter(
         // sits between the bar and the reset line so the reading hierarchy
         // stays name → share → shape → reset.
         .children(trend_section(window, probed_at, cx))
-        // Below the bar: when the window resets, when the vendor says so — a
-        // money-window has no reset instant, so the line simply stays empty.
-        .child(
-            gpui::div()
-                .text_size(px(11.))
-                .text_color(cx.theme().muted_foreground)
-                .children(
-                    window
-                        .resets_at
-                        .map(|resets_at| reset_line(resets_at, chrono::Utc::now())),
-                ),
-        )
 }
 
 // ---------- trend chart (cumulative series + straight-line forecast) ----------
@@ -369,7 +352,7 @@ fn trend_section(window: &QuotaWindowView, probed_at: DateTime<Utc>, cx: &App) -
             gpui::div()
                 .py_1()
                 .text_color(theme.muted_foreground)
-                .child(format!("累计 {:.0}%", trend.used_pct)),
+                .child(format!("用量 {:.0}%", trend.used_pct)),
         )
         .child(gpui::div().pt_0p5().flex_1())
         .child(gpui::div().text_color(forecast_color).child(forecast_text));
@@ -384,41 +367,6 @@ fn trend_section(window: &QuotaWindowView, probed_at: DateTime<Utc>, cx: &App) -
     )
 }
 
-/// Remaining-share label: whole percentages render as "100%", fractional as
-/// "45.0%".
-fn pct_label(pct: f64) -> String {
-    let pct = pct.clamp(0., 100.);
-    if (pct * 10.).round() % 10. == 0. {
-        format!("{pct:.0}%")
-    } else {
-        format!("{pct:.1}%")
-    }
-}
-
-/// The remaining amount of a money-window, from its total and the remaining
-/// share, rendered as "remaining/total" ("$69.99/$70.00"). Falls back to the
-/// total itself when the total string is not a plain number (keeps the unit
-/// prefix/suffix as-is).
-fn remaining_amount(total: &str, remaining_pct: f64) -> String {
-    let Some((prefix, amount, suffix)) = parse_amount(total) else {
-        return total.to_string();
-    };
-    format!("{prefix}{:.2}{suffix}", amount * remaining_pct / 100.)
-}
-
-/// Split a window total into its unit prefix, number and unit suffix
-/// (`"$70.00"` → `("$", 70.0, "")`, `"10000"` → `("", 10000.0, "")`).
-/// `None` when the digits do not form a number.
-fn parse_amount(total: &str) -> Option<(&str, f64, &str)> {
-    let (prefix, digits) = total.split_at(total.find(|c: char| c.is_ascii_digit()).unwrap_or(0));
-    let (num, suffix) = digits.split_at(
-        digits
-            .find(|c: char| !(c.is_ascii_digit() || c == '.'))
-            .unwrap_or(digits.len()),
-    );
-    let amount: f64 = num.parse().ok()?;
-    Some((prefix, amount, suffix))
-}
 
 /// Reset line under a bar: "重置 21:40 · 4 小时后" when the reset is within
 /// 24 hours, "重置 10月12日 17:40 · 2 天后" beyond that.

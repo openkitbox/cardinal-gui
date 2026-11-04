@@ -539,7 +539,7 @@ impl ProvidersPage {
                                 .text_size(px(12.))
                                 .text_color(cx.theme().muted_foreground)
                                 .child(format!(
-                                    "打开上面的链接完成授权（验证码已预填） · 已等待 {elapsed} 秒 · 有效期 {} 分钟",
+                                    "已自动打开浏览器，完成授权即可（若没打开请点上面的链接，验证码已预填） · 已等待 {elapsed} 秒 · 有效期 {} 分钟",
                                     expires_in / 60
                                 )),
                         )

@@ -1650,6 +1650,11 @@ impl ProvidersPage {
         let session = match result {
             Ok(start) => {
                 let session: Arc<str> = Arc::from(start.session);
+                // The console's URL already carries the code, so handing it to
+                // the system browser saves the operator a copy-and-paste round
+                // trip. The code and link stay on screen for the case where no
+                // browser came up.
+                cx.open_url(&start.verification_url);
                 login.progress = LoginProgress::Waiting {
                     session: Arc::clone(&session),
                     user_code: start.user_code,
