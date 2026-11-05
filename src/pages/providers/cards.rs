@@ -890,7 +890,7 @@ impl ProvidersPage {
                     .when_some(card_data.quota.as_ref(), |this, quota| {
                         this.child(probe_age_label(quota.probed_at, cx))
                     })
-                    .child(key_menu_button(provider.id, key, cx.weak_entity())),
+                    .child(key_menu_button(provider, key, cx.weak_entity())),
             )
             // Credential row: an account key has no key to preview, so the card
             // names the login that maintains it and the account it belongs to.
@@ -1369,15 +1369,20 @@ fn rest_tags(
 /// items display are captured (the menu entity is cached between opens and
 /// cannot borrow the card); every click resolves the key through the page.
 fn key_menu_button(
-    provider_id: i64,
+    provider: &ProviderRow,
     key: &ProviderKeyView,
     weak: WeakEntity<ProvidersPage>,
 ) -> impl IntoElement {
     let shown = MenuKey {
-        provider_id,
+        provider_id: provider.id,
         key_id: key.id,
         enabled: key.enabled,
         archived: key.archived_at.is_some(),
+        rest_on_429: key.rest_on_429,
+        // The 429 switch is a Kiro setting (its 429 is an account-level rate
+        // limit that clears in seconds); other accounts keep the default
+        // cooldown and get no item for it.
+        kiro: provider.protocol == "kiro",
     };
     Button::new(("key-menu", key.id as u64))
         .icon(Icon::new(IconName::Ellipsis).small())
@@ -1396,6 +1401,11 @@ struct MenuKey {
     key_id: i64,
     enabled: bool,
     archived: bool,
+    /// `rest_on_429` as loaded: the 429 不冷却 item shows the opposite.
+    rest_on_429: bool,
+    /// Whether this account's provider is Kiro, i.e. whether the 429 switch
+    /// applies at all.
+    kiro: bool,
 }
 
 /// What a toggle item (启用, 归档) writes, from the key's state read back at
@@ -1408,16 +1418,19 @@ fn toggle_target<E>(read: Result<Option<bool>, E>) -> Option<bool> {
     read.ok().flatten().map(|current| !current)
 }
 
-/// The account menu: 启用/停用、编辑、归档/移出归档、删除. The state the items show
+/// The account menu: 启用/停用、429 不冷却 (Kiro accounts only)、编辑、
+/// 归档/移出归档、删除. The state the items show
 /// is captured at render time; every click resolves the key again through the
 /// page, because the cached menu entity can outlive the snapshot it was built
 /// from, and a key that left the list is a no-op in every item.
-fn key_menu(menu: PopupMenu, shown: MenuKey, weak: WeakEntity<ProvidersPage>) -> PopupMenu {
+fn key_menu(mut menu: PopupMenu, shown: MenuKey, weak: WeakEntity<ProvidersPage>) -> PopupMenu {
     let MenuKey {
         provider_id,
         key_id,
         enabled,
         archived,
+        rest_on_429,
+        kiro,
     } = shown;
     // Breadcrumb kept from the menu's first debugging round.
     if let Ok(mut file) = std::fs::OpenOptions::new()
@@ -1431,7 +1444,7 @@ fn key_menu(menu: PopupMenu, shown: MenuKey, weak: WeakEntity<ProvidersPage>) ->
             "[build] menu provider={provider_id} key={key_id} captured_enabled={enabled}"
         );
     }
-    menu.item(PopupMenuItem::new("启用").checked(enabled).on_click({
+    menu = menu.item(PopupMenuItem::new("启用").checked(enabled).on_click({
         let weak = weak.clone();
         // listener_for-style plumbing (the library's own pattern): the handler
         // carries the window itself, and Entity::update never consults the
@@ -1462,66 +1475,104 @@ fn key_menu(menu: PopupMenu, shown: MenuKey, weak: WeakEntity<ProvidersPage>) ->
                 eprintln!("card menu enable failed: {error}");
             }
         }
-    }))
-    .separator()
-    .item(
-        PopupMenuItem::new("编辑")
-            .icon(Icon::new(IconName::Pencil).small())
-            .on_click({
-                let weak = weak.clone();
-                move |_, window, cx| {
-                    if let Err(error) = weak.update(cx, |this, cx| {
-                        this.open_key_editor(provider_id, key_id, window, cx)
-                    }) {
-                        eprintln!("card menu edit failed: {error}");
-                    }
-                }
-            }),
-    )
-    .item(
-        PopupMenuItem::new(if archived { "移出归档" } else { "归档" })
-            .icon(
-                Icon::new(if archived {
-                    IconName::ArchiveRestore
-                } else {
-                    IconName::Archive
-                })
-                .small(),
-            )
-            .on_click({
-                let weak = weak.clone();
-                move |_, _window, cx| {
-                    // Cached menu entity: read the current state at click time
-                    // and write nothing for a key that left the list (as 启用).
-                    let read = weak.read_with(cx, |page, _| page.key_archived(provider_id, key_id));
-                    let Some(target) = toggle_target(read) else {
-                        return;
-                    };
-                    if let Err(error) = weak.update(cx, |this, cx| {
-                        this.set_key_archived(provider_id, key_id, target, cx)
-                    }) {
-                        eprintln!("card menu archive failed: {error}");
-                    }
-                }
-            }),
-    )
-    .item(
-        PopupMenuItem::new("删除")
-            .icon(Icon::new(IconName::Delete).small())
-            .on_click({
-                let weak = weak.clone();
-                move |_, window, cx| {
-                    if let Err(error) = weak.update(cx, |this, cx| {
-                        // A key that left the list has nothing to delete.
-                        if let Some(label) = this.key_label(provider_id, key_id) {
-                            this.confirm_delete_key(provider_id, key_id, label, window, cx)
+    }));
+    // Kiro accounts only: no cooldown on a 429 — retry the account in place,
+    // then fail over with the account still eligible.
+    if kiro {
+        menu = menu.item(
+            PopupMenuItem::new("429 不冷却")
+                .checked(!rest_on_429)
+                .on_click({
+                    let weak = weak.clone();
+                    move |_, _window, cx| {
+                        // Cached menu entity: read the account's current
+                        // setting at click time, and write nothing for a key
+                        // that left the list (as 启用).
+                        let read =
+                            weak.read_with(cx, |page, _| page.key_rest_on_429(provider_id, key_id));
+                        let Some(target) = toggle_target(read) else {
+                            return;
+                        };
+                        if let Err(error) = weak.update(cx, |this, cx| {
+                            this.write(cx, move |admin| async move {
+                                admin
+                                    .update_key(
+                                        provider_id,
+                                        key_id,
+                                        &KeyUpdate {
+                                            rest_on_429: Some(target),
+                                            ..Default::default()
+                                        },
+                                    )
+                                    .await
+                            });
+                        }) {
+                            eprintln!("card menu 429 switch failed: {error}");
                         }
-                    }) {
-                        eprintln!("card menu delete failed: {error}");
                     }
-                }
-            }),
-    )
+                }),
+        );
+    }
+    menu.separator()
+        .item(
+            PopupMenuItem::new("编辑")
+                .icon(Icon::new(IconName::Pencil).small())
+                .on_click({
+                    let weak = weak.clone();
+                    move |_, window, cx| {
+                        if let Err(error) = weak.update(cx, |this, cx| {
+                            this.open_key_editor(provider_id, key_id, window, cx)
+                        }) {
+                            eprintln!("card menu edit failed: {error}");
+                        }
+                    }
+                }),
+        )
+        .item(
+            PopupMenuItem::new(if archived { "移出归档" } else { "归档" })
+                .icon(
+                    Icon::new(if archived {
+                        IconName::ArchiveRestore
+                    } else {
+                        IconName::Archive
+                    })
+                    .small(),
+                )
+                .on_click({
+                    let weak = weak.clone();
+                    move |_, _window, cx| {
+                        // Cached menu entity: read the current state at click time
+                        // and write nothing for a key that left the list (as 启用).
+                        let read =
+                            weak.read_with(cx, |page, _| page.key_archived(provider_id, key_id));
+                        let Some(target) = toggle_target(read) else {
+                            return;
+                        };
+                        if let Err(error) = weak.update(cx, |this, cx| {
+                            this.set_key_archived(provider_id, key_id, target, cx)
+                        }) {
+                            eprintln!("card menu archive failed: {error}");
+                        }
+                    }
+                }),
+        )
+        .item(
+            PopupMenuItem::new("删除")
+                .icon(Icon::new(IconName::Delete).small())
+                .on_click({
+                    let weak = weak.clone();
+                    move |_, window, cx| {
+                        if let Err(error) = weak.update(cx, |this, cx| {
+                            // A key that left the list has nothing to delete.
+                            if let Some(label) = this.key_label(provider_id, key_id) {
+                                this.confirm_delete_key(provider_id, key_id, label, window, cx)
+                            }
+                        }) {
+                            eprintln!("card menu delete failed: {error}");
+                        }
+                    }
+                }),
+        )
 }
 
 /// The 已归档 marker on an account header.

@@ -954,6 +954,13 @@ impl ProvidersPage {
             .map(|card| card.key.enabled)
     }
 
+    /// Whether a 429 may cool the account down, as the page last loaded it
+    /// (`None` if unknown). Read at click time like [`Self::key_enabled`].
+    fn key_rest_on_429(&self, provider_id: i64, key_id: i64) -> Option<bool> {
+        self.key_row(provider_id, key_id)
+            .map(|card| card.key.rest_on_429)
+    }
+
     /// Whether the key is archived as the page last loaded it (`None` if
     /// unknown). Read at click time like [`Self::key_enabled`].
     fn key_archived(&self, provider_id: i64, key_id: i64) -> Option<bool> {
