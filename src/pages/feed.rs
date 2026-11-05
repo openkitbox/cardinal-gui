@@ -7,6 +7,8 @@
 //! (timestamp, status · duration · speed). In-flight attempts never sink below
 //! a settled row, however long they run.
 
+use std::borrow::Cow;
+
 use gpui::{App, Div, Entity, Hsla, ParentElement, Styled, prelude::FluentBuilder as _, px};
 use gpui_kit::component::{ActiveTheme, Theme};
 
@@ -124,8 +126,8 @@ fn feed_row(row: &FeedRow, cx: &App) -> Div {
             let name = named_client(attempt.agent.as_deref(), attempt.caller.as_deref());
             let dot = client_hue(&name);
             let (status, color) = match attempt.status {
-                EndStatus::Ok => ("ok", theme.muted_foreground),
-                EndStatus::Error => ("error", theme.danger),
+                EndStatus::Ok => (Cow::Borrowed("ok"), theme.muted_foreground),
+                EndStatus::Error => (error_label(attempt.metrics.http_status), theme.danger),
             };
             let time = stamp_of(attempt.settled_at);
             // Millisecond duration, like the requests page's total.
@@ -142,7 +144,7 @@ fn feed_row(row: &FeedRow, cx: &App) -> Div {
                         Some(attempt.served_model.as_str()),
                     ),
                     reason: reason_of(&attempt.reason),
-                    meta: settled_meta(status, &duration, &attempt.metrics),
+                    meta: settled_meta(&status, &duration, &attempt.metrics),
                     meta_color: color,
                 },
             )
@@ -154,6 +156,15 @@ fn feed_row(row: &FeedRow, cx: &App) -> Div {
 /// model id the client sent (a direct call, `provider/model`).
 fn route_of(client_model: &str, route: Option<&str>) -> String {
     route.unwrap_or(client_model).to_string()
+}
+
+/// A failed row's status word: `err(429)` with the row's HTTP status, a bare
+/// `err` when the End carried none (a publisher that predates the field).
+fn error_label(http_status: Option<u16>) -> Cow<'static, str> {
+    match http_status {
+        Some(code) => Cow::Owned(format!("err({code})")),
+        None => Cow::Borrowed("err"),
+    }
 }
 
 /// The settled row's meta: `ok · 1.2s`, plus ` · 120 t/s` when the ledger
