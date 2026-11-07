@@ -125,8 +125,10 @@ pub(super) enum ClientFilter {
 }
 
 impl ClientFilter {
-    /// The usage scope this selection queries.
-    fn scope(&self) -> UsageScope {
+    /// The usage scope this selection queries. The 动态 feed filters its rows
+    /// by the same value, so the live rows and the aggregates above them
+    /// always describe the same callers.
+    pub(super) fn scope(&self) -> UsageScope {
         match self {
             Self::All => UsageScope::All,
             Self::Key { id, .. } => UsageScope::Key(*id),
@@ -650,8 +652,14 @@ impl Render for UsagePage {
 
         // The feed card is always the last child. This page has no wire-flow
         // ticker, and the feed adds none: live rows render steady, and no repaint
-        // happens for animation's sake (the dots carry the client's colour).
-        body.child(crate::pages::feed::feed_card(&self.feed, cx))
+        // happens for animation's sake (the dots carry the client's colour). It
+        // reads the SAME scope the aggregates were queried with, so selecting a
+        // client narrows the live rows with the numbers above them.
+        body.child(crate::pages::feed::feed_card(
+            &self.feed,
+            self.client_filter.scope(),
+            cx,
+        ))
     }
 }
 

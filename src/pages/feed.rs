@@ -6,13 +6,20 @@
 //! A row is either a live attempt (client dot, phase + bytes) or a settled one
 //! (timestamp, status · duration · speed). In-flight attempts never sink below
 //! a settled row, however long they run.
+//!
+//! The host page hands in the caller scope its own filter is on
+//! ([`UsageScope`], the same vocabulary the usage queries speak), so the feed
+//! shows the same clients the numbers above it do. An attempt whose caller is
+//! unknown (a loopback call, or an event from a gateway that predates the
+//! caller ids) matches only [`UsageScope::All`].
 
 use std::borrow::Cow;
 
-use gpui::{App, Div, Entity, Hsla, ParentElement, Styled, prelude::FluentBuilder as _, px};
+use gpui::{App, Div, Entity, Hsla, ParentElement, Styled, px};
 use gpui_kit::component::{ActiveTheme, Theme};
 
 use gateway::activity::{EndMetrics, EndStatus};
+use gateway::http_client::UsageScope;
 
 use crate::activity::{ActivityFeed, LiveAttempt, SettledAttempt, client_hue, named_client};
 
@@ -31,15 +38,31 @@ pub(crate) enum FeedRow {
     Settled(SettledAttempt),
 }
 
+/// Whether an attempt by this caller belongs in a feed scoped that way. A
+/// caller the event never named (`None`) is only in scope for
+/// [`UsageScope::All`]: the filter asks for one client's traffic, and an
+/// unattributed row is not known to be it.
+fn in_scope(caller_key_id: Option<i64>, caller_user_id: Option<i64>, scope: UsageScope) -> bool {
+    match scope {
+        UsageScope::All => true,
+        UsageScope::Key(id) => caller_key_id == Some(id),
+        UsageScope::User(id) => caller_user_id == Some(id),
+    }
+}
+
 /// The feed rows: in-flight attempts first (newest start first), then settled
 /// attempts (newest settle first), the live block never trimmed. A live
-/// attempt never sinks below a settled row, however long it runs.
-pub(crate) fn feed_rows(feed: &ActivityFeed) -> Vec<FeedRow> {
+/// attempt never sinks below a settled row, however long it runs. Only the
+/// callers `scope` selects are shown.
+pub(crate) fn feed_rows(feed: &ActivityFeed, scope: UsageScope) -> Vec<FeedRow> {
     // Newest start first, ordered by the monotonic `Instant` the attempt
     // recorded — exact, unlike a wall clock derived from an elapsed reading,
     // which moves between comparisons. The borrows sort first, so each snapshot
     // is cloned once, already in order.
-    let mut live: Vec<&LiveAttempt> = feed.live().collect();
+    let mut live: Vec<&LiveAttempt> = feed
+        .live()
+        .filter(|attempt| in_scope(attempt.caller_key_id, attempt.caller_user_id, scope))
+        .collect();
     live.sort_by_key(|attempt| std::cmp::Reverse(attempt.started));
     let mut rows: Vec<FeedRow> = live
         .into_iter()
@@ -50,6 +73,7 @@ pub(crate) fn feed_rows(feed: &ActivityFeed) -> Vec<FeedRow> {
     // `FEED_LIMIT` lengthens the card instead of dropping live work.
     rows.extend(
         feed.settled()
+            .filter(|attempt| in_scope(attempt.caller_key_id, attempt.caller_user_id, scope))
             .take(FEED_LIMIT.saturating_sub(rows.len()))
             .cloned()
             .map(FeedRow::Settled),
@@ -59,11 +83,12 @@ pub(crate) fn feed_rows(feed: &ActivityFeed) -> Vec<FeedRow> {
 
 /// The 动态 feed card: in-flight attempts (client dot, phase + bytes) over the
 /// newest settled attempts (timestamp, status · duration · speed), most recent
-/// first, the settled rows capped by [`FEED_LIMIT`]. Renders even when empty —
-/// a quiet "暂无请求" line keeps the section's place in the layout.
-pub(crate) fn feed_card(feed: &Entity<ActivityFeed>, cx: &App) -> Div {
+/// first, the settled rows capped by [`FEED_LIMIT`] and every row filtered to
+/// `scope`'s callers. Renders even when empty — a quiet "暂无请求" line keeps
+/// the section's place in the layout.
+pub(crate) fn feed_card(feed: &Entity<ActivityFeed>, scope: UsageScope, cx: &App) -> Div {
     let theme = cx.theme();
-    let rows = feed_rows(feed.read(cx));
+    let rows = feed_rows(feed.read(cx), scope);
     let mut body = gpui::div().flex().flex_col();
     if rows.is_empty() {
         body = body.child(
@@ -86,9 +111,10 @@ pub(crate) fn feed_card(feed: &Entity<ActivityFeed>, cx: &App) -> Div {
 }
 
 /// One compact line: `HH:MM:SS` · client dot+name · route · 供应商
-/// (`account/model`) · reason · meta. In-flight rows show the phase + bytes,
-/// settled rows the status · duration · speed — the color carries the state
-/// (muted = ok, danger = error), no background blocks.
+/// (`account/model`) · meta · status. In-flight rows show the phase + bytes,
+/// settled rows the duration · speed · tokens with `ok` / `err(429)` last —
+/// the color carries the state (muted = ok, danger = error), no background
+/// blocks.
 fn feed_row(row: &FeedRow, cx: &App) -> Div {
     let theme = cx.theme();
     match row {
@@ -116,7 +142,6 @@ fn feed_row(row: &FeedRow, cx: &App) -> Div {
                         attempt.account.as_deref(),
                         Some(attempt.served_model.as_str()),
                     ),
-                    reason: reason_of(&attempt.reason),
                     meta,
                     meta_color: theme.muted_foreground,
                 },
@@ -143,7 +168,6 @@ fn feed_row(row: &FeedRow, cx: &App) -> Div {
                         attempt.account.as_deref(),
                         Some(attempt.served_model.as_str()),
                     ),
-                    reason: reason_of(&attempt.reason),
                     meta: settled_meta(&status, &duration, &attempt.metrics),
                     meta_color: color,
                 },
@@ -167,13 +191,14 @@ fn error_label(http_status: Option<u16>) -> Cow<'static, str> {
     }
 }
 
-/// The settled row's meta: `ok · 1.2s`, plus ` · 120 t/s` when the ledger
-/// carries a decode window (the same [`crate::fmt::format_speed`] as the 请求
-/// page's 速度 column, so the two agree) and ` · 总… 入… 出… 缓…` when it
-/// carries tokens. A non-streaming or untimed attempt has no window — the
-/// requests page dashes it, the feed leaves it out.
+/// The settled row's meta: `1.2s`, plus ` · 120 t/s` when the ledger carries a
+/// decode window (the same [`crate::fmt::format_speed`] as the 请求 page's 速度
+/// column, so the two agree) and ` · 总/入/出/缓` when it carries tokens, with
+/// the status word (`ok` / `err(429)`) LAST so every row ends on its outcome.
+/// A non-streaming or untimed attempt has no window — the requests page dashes
+/// it, the feed leaves it out.
 fn settled_meta(status: &str, duration: &str, metrics: &EndMetrics) -> String {
-    let mut meta = format!("{status} · {duration}");
+    let mut meta = duration.to_owned();
     if crate::fmt::decode_window(metrics.output_tokens, metrics.total_ms, metrics.ttft_ms).is_some()
     {
         meta.push_str(" · ");
@@ -187,6 +212,8 @@ fn settled_meta(status: &str, duration: &str, metrics: &EndMetrics) -> String {
         meta.push_str(" · ");
         meta.push_str(&tokens);
     }
+    meta.push_str(" · ");
+    meta.push_str(status);
     meta
 }
 
@@ -209,12 +236,6 @@ fn token_group(metrics: &EndMetrics) -> Option<String> {
     ))
 }
 
-/// The Smart strategy's reason for the chosen model, or None when empty (an
-/// ordered route / resting candidate has none; no element renders).
-fn reason_of(reason: &str) -> Option<String> {
-    (!reason.is_empty()).then(|| reason.to_string())
-}
-
 /// One feed line's content (keeps feed_line under the argument limit — the
 /// same consolidation as relay's AttemptStart).
 struct FeedLine {
@@ -226,8 +247,6 @@ struct FeedLine {
     /// model it served (`cc/deepseek-v4.1-flash`) — rendered by the shared
     /// [`crate::fmt::account_model`], so the feed and the 请求 list agree.
     landing: String,
-    /// The Smart strategy's reason for the chosen model (None = no reason).
-    reason: Option<String>,
     meta: String,
     meta_color: Hsla,
 }
@@ -281,8 +300,8 @@ fn feed_line(theme: &Theme, line: FeedLine) -> Div {
                 .child(line.route),
         )
         // The 供应商 cell — the account landed on and the upstream model served
-        // (`cc/deepseek-v4.1-flash`) — takes the line's slack, so the reason and
-        // meta sit right after it. Ellipsized, never wrapped: a namespaced id is
+        // (`cc/deepseek-v4.1-flash`) — takes the line's slack, so the meta sits
+        // flush at the line's end. Ellipsized, never wrapped: a namespaced id is
         // wider than the line.
         .child(
             gpui::div()
@@ -293,19 +312,6 @@ fn feed_line(theme: &Theme, line: FeedLine) -> Div {
                 .text_color(theme.foreground)
                 .child(line.landing),
         )
-        // The Smart verdict reason sits between the landing and the meta: a small
-        // muted aside, never folded into the landing string (which keeps flex_1).
-        .when_some(line.reason, |this, reason| {
-            this.child(
-                gpui::div()
-                    .flex_shrink_0()
-                    .max_w(px(160.))
-                    .truncate()
-                    .text_size(px(10.))
-                    .text_color(theme.muted_foreground)
-                    .child(reason),
-            )
-        })
         .child(
             gpui::div()
                 .flex_shrink_0()

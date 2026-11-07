@@ -39,11 +39,13 @@ pub(crate) struct LiveAttempt {
     pub route: Option<String>,
     pub account: Option<String>,
     pub served_model: String,
-    /// The Smart strategy's reason for choosing this model ("" = ordered route
-    /// or a resting candidate); carried over to the settled row on End.
-    pub reason: String,
     /// The caller's identity (gateway key label); None renders as 本机.
     pub caller: Option<String>,
+    /// Who the caller is, by id: the gateway key and its owning user. The
+    /// feed's client filter matches on these (a label is clipped and only
+    /// unique per user); None = a loopback or in-process call.
+    pub caller_key_id: Option<i64>,
+    pub caller_user_id: Option<i64>,
     /// Which client the request's User-Agent named; display wins over `caller`.
     pub agent: Option<String>,
     /// The provider key serving the attempt (identity for stage matching —
@@ -86,8 +88,9 @@ impl LiveAttempt {
             account: self.account,
             served_model: self.served_model,
             caller: self.caller,
+            caller_key_id: self.caller_key_id,
+            caller_user_id: self.caller_user_id,
             agent: self.agent,
-            reason: self.reason,
             status,
             metrics,
             settled_at: chrono::Utc::now(),
@@ -111,11 +114,12 @@ pub(crate) struct SettledAttempt {
     pub served_model: String,
     /// The caller's identity (gateway key label); None renders as 本机.
     pub caller: Option<String>,
+    /// Who the caller is, by id — the feed's client filter matches on these
+    /// (see [`LiveAttempt::caller_key_id`]).
+    pub caller_key_id: Option<i64>,
+    pub caller_user_id: Option<i64>,
     /// Which client the request's User-Agent named; display wins over `caller`.
     pub agent: Option<String>,
-    /// The Smart strategy's reason for choosing this model, carried from the
-    /// Start event ("" = no reason).
-    pub reason: String,
     /// How the attempt ended — colours the row (ok muted, error danger).
     pub status: EndStatus,
     /// The ledger's numbers for this attempt, as the End carried them: the
@@ -482,9 +486,10 @@ fn apply_to(
                 account,
                 served_model,
                 caller,
+                caller_key_id,
+                caller_user_id,
                 agent,
                 key_id,
-                reason,
                 stream,
                 ..
             } = *event;
@@ -496,8 +501,9 @@ fn apply_to(
                     route,
                     account,
                     served_model,
-                    reason: reason.into_string(),
                     caller,
+                    caller_key_id,
+                    caller_user_id,
                     agent,
                     key_id,
                     stream,

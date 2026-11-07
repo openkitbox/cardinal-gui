@@ -1213,9 +1213,12 @@ impl RoutesPage {
             )
             .child(
                 gpui::div()
+                    // Sized by the model id itself: the row has slack (the
+                    // flex_1 spacer below eats it), and a capped width would
+                    // wrap a long id onto a second line the fixed row height
+                    // then clips.
                     .flex_shrink_0()
-                    .max_w(px(220.))
-                    .overflow_hidden()
+                    .whitespace_nowrap()
                     .font_family("Menlo")
                     .text_size(px(11.))
                     .text_color(theme.muted_foreground)

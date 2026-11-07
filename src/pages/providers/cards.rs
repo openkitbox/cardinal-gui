@@ -769,6 +769,10 @@ impl ProvidersPage {
         let rests = live_rests(rests, now);
         let base = card(cx)
             .w(px(KEY_CARD_WIDTH))
+            // Half the shared card's bottom padding: the footer spacer below
+            // the model rows already holds the card's bottom edge off them.
+            .pb_0()
+            .pt_3()
             .when(!key.enabled || !provider.enabled, |this| this.opacity(0.6));
         // Drag visuals exist only while a drag is actually active (gpui-fast is
         // retained-mode: gating on `has_active_drag` also clears a stale
