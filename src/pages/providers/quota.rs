@@ -15,6 +15,7 @@
 use std::rc::Rc;
 
 use chrono::{DateTime, Datelike, Duration, Timelike, Utc};
+use gpui::prelude::FluentBuilder;
 use gpui::{App, Div, ParentElement, Styled, px, relative};
 use gpui_kit::component::ActiveTheme;
 
@@ -66,6 +67,9 @@ pub(super) struct QuotaWindowView {
     /// Amount already spent in this window, display-ready ("$0.04"), when the
     /// vendor reports one. Shown beside the used share on the trend line.
     used: Option<String>,
+    /// The window's full allowance ("2650"), when the vendor reports one. The
+    /// meter header shows "remaining / total" from it.
+    total: Option<String>,
 
     /// Probe samples recorded for this window name, oldest first — all of the
     /// gateway's 35-day series, including a previous window's points; the
@@ -85,6 +89,7 @@ impl QuotaWindowView {
             resets_at: window.resets_at,
             period_minutes: window.period_minutes,
             used: window.used,
+            total: window.total,
             history,
         }
     }
@@ -196,6 +201,33 @@ pub(super) fn quota_row(
     )
 }
 
+/// The remaining amount of a window with a known total, from the total and the
+/// remaining share. Whole amounts print without decimals ("2650" -> "1325"),
+/// and a total that is not a plain number is shown unchanged.
+fn remaining_amount(total: &str, remaining_pct: f64) -> String {
+    let Some((prefix, amount, suffix)) = parse_amount(total) else {
+        return total.to_string();
+    };
+    let left = amount * remaining_pct / 100.;
+    if left.fract() == 0. {
+        format!("{prefix}{left:.0}{suffix}")
+    } else {
+        format!("{prefix}{left:.2}{suffix}")
+    }
+}
+
+/// Split a window total into its unit prefix, number and unit suffix.
+fn parse_amount(total: &str) -> Option<(&str, f64, &str)> {
+    let (prefix, digits) = total.split_at(total.find(|c: char| c.is_ascii_digit()).unwrap_or(0));
+    let (num, suffix) = digits.split_at(
+        digits
+            .find(|c: char| !(c.is_ascii_digit() || c == '.'))
+            .unwrap_or(digits.len()),
+    );
+    let amount: f64 = num.parse().ok()?;
+    Some((prefix, amount, suffix))
+}
+
 /// One window column: name + reset line, bar, trend (long windows).
 fn quota_meter(
     window: &QuotaWindowView,
@@ -214,8 +246,8 @@ fn quota_meter(
         .flex()
         .flex_col()
         .gap_1()
-        // Above the bar: window name left, remaining share (or "remaining / total"
-        // for a money-window) right.
+        // Above the bar: window name left, "remaining / total" right when the
+        // window has an allowance.
         .child(
             gpui::div()
                 .flex()
@@ -228,16 +260,20 @@ fn quota_meter(
                         .child(window.name.clone()),
                 )
                 .child(gpui::div().flex_1())
-                .child(
-                    gpui::div()
-                        .text_size(px(11.))
-                        .text_color(cx.theme().muted_foreground)
-                        .children(
-                            window
-                                .resets_at
-                                .map(|resets_at| reset_line(resets_at, chrono::Utc::now())),
-                        ),
-                ),
+                // A window with a known allowance reads "remaining / total".
+                // Only the amount sits here: the reset line goes below the bar,
+                // so a long name and a long amount never push the row wider
+                // than the card.
+                .when_some(window.total.as_deref(), |this, total| {
+                    this.child(
+                        gpui::div()
+                            .flex_none()
+                            .whitespace_nowrap()
+                            .text_size(px(12.))
+                            .font_weight(gpui::FontWeight::MEDIUM)
+                            .child(format!("{}/{total}", remaining_amount(total, remaining))),
+                    )
+                }),
         )
         // The bar: fill width = remaining share, band-colored by the used share.
         // 4px, same gauge as the overview card bars (usage.rs).
@@ -254,9 +290,19 @@ fn quota_meter(
                         .w(relative(remaining as f32 / 100.)),
                 ),
         )
-        // The cumulative trend + forecast (weekly / monthly only): the chart
-        // sits between the bar and the reset line so the reading hierarchy
-        // stays name → share → shape → reset.
+        // Below the bar: when the window resets, when the vendor says so.
+        .child(
+            gpui::div()
+                .text_size(px(11.))
+                .text_color(cx.theme().muted_foreground)
+                .children(
+                    window
+                        .resets_at
+                        .map(|resets_at| reset_line(resets_at, chrono::Utc::now())),
+                ),
+        )
+        // The cumulative trend + forecast (weekly / monthly only) follows the
+        // reset line, so the reading hierarchy stays name → share → reset → shape.
         .children(trend_section(window, probed_at, cx))
 }
 
