@@ -44,8 +44,8 @@ const AXIS_LINE_HEIGHT: f32 = 14.;
 const MAX_BAR_WIDTH: f32 = 30.;
 /// X ticks are thinned to one per ~62px of plot width.
 const TICK_SPACING: f32 = 62.;
-/// Wide enough for the stats line with a 次失败 suffix (was 272).
-const RANK_WIDTH: f32 = 299.;
+/// Wide enough for the stats line with a failure suffix (was 272, then 299).
+const RANK_WIDTH: f32 = 350.;
 
 fn palette(index: usize) -> Hsla {
     gpui::rgb(PALETTE[index]).into()
@@ -738,8 +738,15 @@ impl UsagePage {
 
         // The rank row: every figure but the ranked metric, then the share.
         let mut stats: Vec<String> = Vec::new();
+        // if total > 0. {
+        //     stats.push(format!("{:.0}%", 100. * category.metric_value / total));
+        // }
         if metric != TrendMetric::Requests {
-            stats.push(format!("{} 请求", category.requests));
+            stats.push(format!(
+                "{}({:.0}%)",
+                category.requests,
+                100. * category.metric_value / total
+            ));
         }
         if metric != TrendMetric::Tokens {
             stats.push(format!("{} token", humanize_count(category.tokens)));
@@ -747,7 +754,7 @@ impl UsagePage {
         if metric != TrendMetric::Cost
             && let Some(cost) = category.cost
         {
-            stats.push(format!("金额 ${cost:.2}"));
+            stats.push(format!("${cost:.2}"));
         }
         // 营收 belongs to the selling reading; a non-selling deployment has no
         // revenue figure to report even when rows carry a charged amount.
@@ -760,9 +767,7 @@ impl UsagePage {
                 category.timed_output as f64 * 1000. / category.decode_ms as f64
             ));
         }
-        if total > 0. {
-            stats.push(format!("{:.0}%", 100. * category.metric_value / total));
-        }
+
         stats.push(cache_stat);
         let mut line = div()
             .flex()
@@ -772,10 +777,13 @@ impl UsagePage {
             .text_color(theme.muted_foreground)
             .child(stats.join(" · "));
         if category.failed > 0 {
+            // Failure share of this category's own requests; failed rows are
+            // a subset of requests, so requests > 0 here.
+            let failed_pct = 100. * category.failed as f64 / category.requests.max(1) as f64;
             line = line.child(
                 div()
                     .text_color(theme.danger)
-                    .child(format!(" · {} 次失败", category.failed)),
+                    .child(format!(" · {}({failed_pct:.1}%)", category.failed)),
             );
         }
         row.child(line)

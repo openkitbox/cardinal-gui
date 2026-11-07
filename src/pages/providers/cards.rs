@@ -25,8 +25,8 @@ use gateway::store::{ProviderRow, RestRow};
 
 use super::balance::balance_row;
 use super::catalog::{
-    PROTOCOL_CHOICES, PROVIDER_SPECS, ProviderIcon, ProviderSpec, Region, imported_logo, spec_for,
-    variant_of_row, variants_of,
+    AccountLogin, PROTOCOL_CHOICES, PROVIDER_SPECS, ProviderIcon, ProviderSpec, Region,
+    imported_logo, spec_for, variant_of_row, variants_of,
 };
 use super::chip::selectable_chip;
 use super::groups::{group_chips, group_tags};
@@ -34,8 +34,8 @@ use super::kiro_import;
 use super::order::DropSide;
 use super::quota::quota_row;
 use super::{
-    CredentialMode, FormSource, KeyCardData, KeyEditor, KeyForm, KiroImportForm, LoginProgress,
-    OpencodeLoginForm, ProvidersPage,
+    AccountLoginForm, CredentialMode, FormSource, KeyCardData, KeyEditor, KeyForm, KiroImportForm,
+    LoginProgress, ProvidersPage,
 };
 use crate::app::StatusTip;
 use crate::fmt::mask_api_key;
@@ -305,16 +305,17 @@ impl ProvidersPage {
                     )),
                     None => this,
                 })
-            // OpenCode Go takes two kinds of credential: a dropdown picks the
-            // account login (default) or a pasted API key.
+            // An account-login vendor (OpenCode Go, Cursor) takes two kinds of
+            // credential: a dropdown picks the account login (default) or a
+            // pasted API key.
             .when(offers_login, |this| {
                 this.child(credential_mode_field(form, cx.weak_entity(), cx))
             })
-            // The login block owns the code, the console URL and the session's
+            // The login block owns the URL (and code), and the session's
             // progress; the API-key field below replaces it in the other mode.
             .when(account_login, |this| {
-                this.when_some(form.opencode_login.as_ref(), |this, login| {
-                    this.child(self.opencode_login_fields(login, cx))
+                this.when_some(form.login.as_ref(), |this, login| {
+                    this.child(self.account_login_fields(login, cx))
                 })
             })
             .when(!is_kiro, |this| {
@@ -453,15 +454,25 @@ impl ProvidersPage {
             )
     }
 
-    /// The OpenCode Go login block: what the console asks of the user while a
+    /// The account login block: what the vendor asks of the user while a
     /// session waits, and what went wrong when one fails. Nothing here is
     /// editable — the gateway owns the session and the credential.
-    fn opencode_login_fields(&self, login: &OpencodeLoginForm, cx: &mut Context<Self>) -> Div {
+    fn account_login_fields(&self, login: &AccountLoginForm, cx: &mut Context<Self>) -> Div {
+        let (intro, waiting_hint) = match login.kind {
+            AccountLogin::OpencodeDevice => (
+                "浏览器里授权 OpenCode 账号；有 API key 也可以在上方切换为填写 key",
+                "已自动打开浏览器，完成授权即可（若没打开请点上面的链接，验证码已预填）",
+            ),
+            AccountLogin::CursorBrowser => (
+                "浏览器里登录 Cursor 账号；有 API key 也可以在上方切换为填写 key",
+                "已自动打开浏览器，登录 Cursor 后回到这里即可（若没打开请点上面的链接）",
+            ),
+        };
         let mut fields = gpui::div().flex().flex_col().gap_2().child(
             gpui::div()
                 .text_size(px(12.))
                 .text_color(cx.theme().muted_foreground)
-                .child("浏览器里授权 OpenCode 账号；有 API key 也可以在上方切换为填写 key"),
+                .child(intro),
         );
         match &login.progress {
             LoginProgress::Idle => {}
@@ -472,32 +483,34 @@ impl ProvidersPage {
                 expires_in,
                 ..
             } => {
-                let code = user_code.clone();
-                fields = fields.child(
-                    gpui::div()
-                        .flex()
-                        .items_center()
-                        .gap_2()
-                        .child(field_label("验证码", cx))
-                        .child(
-                            gpui::div()
-                                .font_weight(gpui::FontWeight::MEDIUM)
-                                .text_size(px(16.))
-                                .text_color(cx.theme().foreground)
-                                .child(user_code.clone()),
-                        )
-                        .child(
-                            Button::new("opencode-login-copy-code")
-                                .icon(Icon::new(IconName::Copy).small())
-                                .ghost()
-                                .compact()
-                                .on_click(cx.listener(move |_, _, _, cx| {
-                                    cx.write_to_clipboard(gpui::ClipboardItem::new_string(
-                                        code.clone(),
-                                    ));
-                                })),
-                        ),
-                );
+                if let Some(user_code) = user_code {
+                    let code = user_code.clone();
+                    fields = fields.child(
+                        gpui::div()
+                            .flex()
+                            .items_center()
+                            .gap_2()
+                            .child(field_label("验证码", cx))
+                            .child(
+                                gpui::div()
+                                    .font_weight(gpui::FontWeight::MEDIUM)
+                                    .text_size(px(16.))
+                                    .text_color(cx.theme().foreground)
+                                    .child(user_code.clone()),
+                            )
+                            .child(
+                                Button::new("account-login-copy-code")
+                                    .icon(Icon::new(IconName::Copy).small())
+                                    .ghost()
+                                    .compact()
+                                    .on_click(cx.listener(move |_, _, _, cx| {
+                                        cx.write_to_clipboard(gpui::ClipboardItem::new_string(
+                                            code.clone(),
+                                        ));
+                                    })),
+                            ),
+                    );
+                }
                 let url = verification_url.clone();
                 let open_url = verification_url.clone();
                 fields = fields.child(
@@ -508,7 +521,7 @@ impl ProvidersPage {
                         .child(field_label("链接", cx))
                         .child(
                             gpui::div()
-                                .id("opencode-login-url")
+                                .id("account-login-url")
                                 .cursor_pointer()
                                 .text_color(cx.theme().primary)
                                 .child(verification_url.clone())
@@ -517,7 +530,7 @@ impl ProvidersPage {
                                 })),
                         )
                         .child(
-                            Button::new("opencode-login-copy-url")
+                            Button::new("account-login-copy-url")
                                 .icon(Icon::new(IconName::Copy).small())
                                 .ghost()
                                 .compact()
@@ -539,17 +552,17 @@ impl ProvidersPage {
                                 .text_size(px(12.))
                                 .text_color(cx.theme().muted_foreground)
                                 .child(format!(
-                                    "已自动打开浏览器，完成授权即可（若没打开请点上面的链接，验证码已预填） · 已等待 {elapsed} 秒 · 有效期 {} 分钟",
+                                    "{waiting_hint} · 已等待 {elapsed} 秒 · 有效期 {} 分钟",
                                     expires_in / 60
                                 )),
                         )
                         .child(
-                            Button::new("opencode-login-cancel")
+                            Button::new("account-login-cancel")
                                 .label("取消")
                                 .outline()
                                 .compact()
                                 .on_click(
-                                    cx.listener(|this, _, _, cx| this.cancel_opencode_login(cx)),
+                                    cx.listener(|this, _, _, cx| this.cancel_account_login(cx)),
                                 ),
                         ),
                 );
@@ -1764,7 +1777,7 @@ fn save_label(form: &KeyForm) -> String {
 /// Whether the add form waits on an account login: the form stays locked while
 /// it does, but no request is in flight.
 fn login_waiting(form: &KeyForm) -> bool {
-    form.opencode_login
+    form.login
         .as_ref()
         .is_some_and(|login| login.progress.is_waiting())
 }
@@ -1876,10 +1889,11 @@ fn account_row(
 ) -> Option<Div> {
     match key.auth_kind.as_str() {
         "static" => None,
-        // The OpenCode login is identified by its email alone: the login badge
-        // and the workspace name say nothing about which account is in use, and
-        // the address is masked until the eye is clicked.
-        "opencode_oauth" => Some(opencode_account_row(key, revealed, cx)),
+        // An OpenCode or Cursor login is identified by its email alone: the
+        // login badge and the workspace/team say nothing about which account
+        // is in use, and the address is masked until the eye is clicked.
+        "opencode_oauth" => Some(oauth_account_row(key, revealed, "OpenCode 账号", cx)),
+        "cursor_oauth" => Some(oauth_account_row(key, revealed, "Cursor 账号", cx)),
         // A Kiro import (and any kind this build does not know yet — shown
         // rather than hidden, so the card still says the credential is
         // login-maintained) keeps the badge, then account and organization.
@@ -1914,20 +1928,27 @@ fn account_row(
     }
 }
 
-/// The OpenCode account's email — masked by default — and the eye that toggles
-/// between the mask and the address in clear. A login that recorded no address
-/// falls back to the login badge: there is nothing to reveal.
-fn opencode_account_row(
+/// A logged-in account's email — masked by default — and the eye that toggles
+/// between the mask and the address in clear, then the organization/team tag
+/// when the login recorded one. A login that recorded no address falls back
+/// to the login badge `kind`: there is nothing to reveal.
+fn oauth_account_row(
     key: &ProviderKeyView,
     revealed: bool,
+    kind: &'static str,
     cx: &mut Context<ProvidersPage>,
 ) -> Div {
     let key_id = key.id;
     let Some(account) = key.account.as_deref() else {
-        return gpui::div()
+        let mut row = gpui::div()
             .flex()
             .items_center()
-            .child(Tag::secondary().child("OpenCode 账号"));
+            .gap_1()
+            .child(Tag::secondary().child(kind));
+        if let Some(organization) = key.organization.as_deref() {
+            row = row.child(Tag::secondary().child(organization.to_string()));
+        }
+        return row;
     };
     let text = if revealed {
         account.to_string()
@@ -1964,6 +1985,9 @@ fn opencode_account_row(
                     cx.listener(move |this, _, _, cx| this.toggle_account_reveal(key_id, cx)),
                 ),
         )
+        .when_some(key.organization.as_deref(), |row, organization| {
+            row.child(Tag::secondary().child(organization.to_string()))
+        })
 }
 
 /// The variant markers of a catalog variant row (kimi/glm only): 区域

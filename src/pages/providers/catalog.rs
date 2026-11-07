@@ -22,11 +22,24 @@ pub(super) struct ProviderSpec {
     pub(super) protocol: &'static str,
     pub(super) auth_scheme: &'static str,
     pub(super) icon: ProviderIcon,
-    /// The account's credential comes from a console login (device flow) that
-    /// the gateway runs, not from a pasted API key: the add form shows the
-    /// login block instead of the key field, and the stored row has no key to
-    /// reveal.
-    pub(super) account_login: bool,
+    /// The account's credential may come from a login that the gateway runs
+    /// (the kind says which flow), not only from a pasted API key: the add
+    /// form shows the login block instead of the key field, and the stored
+    /// row has no key to reveal.
+    pub(super) login: Option<AccountLogin>,
+}
+
+/// The login flow a vendor's account credential comes from. The gateway owns
+/// every flow (it talks to the vendor and writes the key row); the kind
+/// decides which admin routes the form calls and what the block shows.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(super) enum AccountLogin {
+    /// OpenCode Console device flow: a user code plus the console URL that
+    /// prefills it; the gateway polls the console on its interval.
+    OpencodeDevice,
+    /// Cursor's browser login: one URL carrying the challenge, no code; the
+    /// gateway polls Cursor every 500 ms.
+    CursorBrowser,
 }
 
 /// The provider catalog. Adding a key picks from this list; the provider row
@@ -42,7 +55,7 @@ pub(super) const PROVIDER_SPECS: &[ProviderSpec] = &[
         protocol: "gemini",
         auth_scheme: "x_goog_api_key",
         icon: ProviderIcon::Svg(provider_logos::GEMINI),
-        account_login: false,
+        login: None,
     },
     ProviderSpec {
         name: "glm",
@@ -51,7 +64,7 @@ pub(super) const PROVIDER_SPECS: &[ProviderSpec] = &[
         protocol: "openai_chat",
         auth_scheme: "bearer",
         icon: ProviderIcon::Svg(provider_logos::GLM),
-        account_login: false,
+        login: None,
     },
     ProviderSpec {
         name: "anthropic",
@@ -60,7 +73,7 @@ pub(super) const PROVIDER_SPECS: &[ProviderSpec] = &[
         protocol: "anthropic_messages",
         auth_scheme: "x_api_key",
         icon: ProviderIcon::Svg(provider_logos::ANTHROPIC),
-        account_login: false,
+        login: None,
     },
     ProviderSpec {
         name: "openai",
@@ -69,7 +82,7 @@ pub(super) const PROVIDER_SPECS: &[ProviderSpec] = &[
         protocol: "openai_chat",
         auth_scheme: "bearer",
         icon: ProviderIcon::Svg(provider_logos::OPENAI),
-        account_login: false,
+        login: None,
     },
     ProviderSpec {
         name: "deepseek",
@@ -78,7 +91,7 @@ pub(super) const PROVIDER_SPECS: &[ProviderSpec] = &[
         protocol: "openai_chat",
         auth_scheme: "bearer",
         icon: ProviderIcon::Svg(provider_logos::DEEPSEEK),
-        account_login: false,
+        login: None,
     },
     ProviderSpec {
         name: "kimi",
@@ -89,7 +102,7 @@ pub(super) const PROVIDER_SPECS: &[ProviderSpec] = &[
         protocol: "openai_chat",
         auth_scheme: "bearer",
         icon: ProviderIcon::Svg(provider_logos::KIMI),
-        account_login: false,
+        login: None,
     },
     ProviderSpec {
         name: "opencode-go",
@@ -103,9 +116,9 @@ pub(super) const PROVIDER_SPECS: &[ProviderSpec] = &[
         protocol: "openai_chat",
         auth_scheme: "bearer",
         icon: ProviderIcon::Svg(provider_logos::OPENCODE),
-        // The one vendor whose credential is an account, not a key: the add
-        // form logs in through OpenCode's console instead of asking for one.
-        account_login: true,
+        // A vendor whose credential is an account, not a key: the add form
+        // logs in through OpenCode's console instead of asking for one.
+        login: Some(AccountLogin::OpencodeDevice),
     },
     ProviderSpec {
         name: "commandcode",
@@ -119,7 +132,7 @@ pub(super) const PROVIDER_SPECS: &[ProviderSpec] = &[
         protocol: "openai_chat",
         auth_scheme: "bearer",
         icon: ProviderIcon::Svg(provider_logos::COMMANDCODE),
-        account_login: false,
+        login: None,
     },
     // ---- Retrieval (embeddings) providers ----
     // A retrieval row is passthrough-only: the client calls /v1/embeddings and
@@ -133,7 +146,21 @@ pub(super) const PROVIDER_SPECS: &[ProviderSpec] = &[
         protocol: "openai_embeddings",
         auth_scheme: "bearer",
         icon: ProviderIcon::Svg(provider_logos::OPENAI),
-        account_login: false,
+        login: None,
+    },
+    ProviderSpec {
+        name: "cursor",
+        display: "Cursor",
+        // Cursor's private agent protocol: the backend origin is fixed in the
+        // gateway (the row's base_url is recorded, not consulted). The
+        // credential is normally a browser login; an API key from the Cursor
+        // dashboard is the alternative (the gateway exchanges it for a
+        // bearer).
+        base_url: "https://api2.cursor.sh",
+        protocol: "cursor",
+        auth_scheme: "bearer",
+        icon: ProviderIcon::Svg(provider_logos::CURSOR),
+        login: Some(AccountLogin::CursorBrowser),
     },
     ProviderSpec {
         name: "kiro",
@@ -145,7 +172,7 @@ pub(super) const PROVIDER_SPECS: &[ProviderSpec] = &[
         protocol: "kiro",
         auth_scheme: "bearer",
         icon: ProviderIcon::Svg(provider_logos::KIRO),
-        account_login: false,
+        login: None,
     },
 ];
 

@@ -227,7 +227,7 @@ fn quota_meter(
                                 .resets_at
                                 .map(|resets_at| reset_line(resets_at, chrono::Utc::now())),
                         ),
-                )
+                ),
         )
         // The bar: fill width = remaining share, band-colored by the used share.
         // 4px, same gauge as the overview card bars (usage.rs).
@@ -366,7 +366,6 @@ fn trend_section(window: &QuotaWindowView, probed_at: DateTime<Utc>, cx: &App) -
             .child(trend::chart(trend)),
     )
 }
-
 
 /// Reset line under a bar: "重置 21:40 · 4 小时后" when the reset is within
 /// 24 hours, "重置 10月12日 17:40 · 2 天后" beyond that.

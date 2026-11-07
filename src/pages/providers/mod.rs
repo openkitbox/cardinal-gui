@@ -44,7 +44,8 @@ use gpui_kit::component::{Disableable, Icon, Sizable, WindowExt};
 
 use gateway::admin_ops::Bootstrap;
 use gateway::http_client::{
-    GatewayHttpClient, KeyUpdate, OpencodeLoginRequest, OpencodeLoginStart, OpencodeLoginStatus,
+    CursorLoginRequest, CursorLoginStart, CursorLoginStatus, GatewayHttpClient, KeyUpdate,
+    OpencodeLoginRequest, OpencodeLoginStart, OpencodeLoginStatus,
 };
 
 use gateway::probe::ProbeModel;
@@ -53,7 +54,8 @@ use gateway::store::{KeyGroupView, ProviderInput, ProviderKeyView, ProviderRow, 
 
 use cards::CardDrag;
 use catalog::{
-    PROTOCOL_CHOICES, PROVIDER_SPECS, ProtocolChoice, Region, is_custom, protocol_choice, resolve,
+    AccountLogin, PROTOCOL_CHOICES, PROVIDER_SPECS, ProtocolChoice, ProviderSpec, Region,
+    is_custom, protocol_choice, resolve,
 };
 use group_editor::{GroupCreate, GroupManager};
 use groups::{GroupFilter, KeyFacts, Visibility};
@@ -197,24 +199,34 @@ impl FormSource {
         matches!(self, FormSource::Catalog(index) if PROVIDER_SPECS[index].name == "kiro")
     }
 
-    /// The catalog entry whose credential is an account login (console device
-    /// flow) rather than a pasted API key — see
-    /// [`catalog::ProviderSpec::account_login`].
+    /// The catalog entry this source names, if it is one.
+    fn spec(self) -> Option<&'static ProviderSpec> {
+        match self {
+            FormSource::Catalog(index) => Some(&PROVIDER_SPECS[index]),
+            FormSource::Custom { .. } => None,
+        }
+    }
+
+    /// The login flow of a catalog entry whose credential can be an account
+    /// login rather than a pasted API key — see
+    /// [`catalog::ProviderSpec::login`].
+    fn account_login(self) -> Option<AccountLogin> {
+        self.spec().and_then(|spec| spec.login)
+    }
+
+    /// Whether this source offers an account login at all.
     fn is_account_login(self) -> bool {
-        matches!(self, FormSource::Catalog(index) if PROVIDER_SPECS[index].account_login)
+        self.account_login().is_some()
     }
 
     /// The login block this source needs: a fresh idle session owned by the
     /// form generation that is opening it.
-    fn login_form(self, generation: u64) -> Option<OpencodeLoginForm> {
-        if self.is_account_login() {
-            Some(OpencodeLoginForm {
-                progress: LoginProgress::Idle,
-                generation,
-            })
-        } else {
-            None
-        }
+    fn login_form(self, generation: u64) -> Option<AccountLoginForm> {
+        self.account_login().map(|kind| AccountLoginForm {
+            kind,
+            progress: LoginProgress::Idle,
+            generation,
+        })
     }
 }
 
@@ -273,10 +285,11 @@ struct KeyForm {
     base_url: Entity<InputState>,
     /// Kiro uses a JSON import instead of the ordinary API-key field.
     kiro_import: Option<KiroImportForm>,
-    /// OpenCode Go logs in through the console device flow instead of an API
-    /// key; the block owns that session's state. Present for the vendor whether
-    /// or not the login is the chosen [`CredentialMode`].
-    opencode_login: Option<OpencodeLoginForm>,
+    /// An account-login vendor (OpenCode Go, Cursor) logs in through the
+    /// gateway instead of an API key; the block owns that session's state.
+    /// Present for the vendor whether or not the login is the chosen
+    /// [`CredentialMode`].
+    login: Option<AccountLoginForm>,
     /// Which credential the form writes for a vendor that offers both: the
     /// console login (default) or a pasted API key.
     credential_mode: CredentialMode,
@@ -386,11 +399,14 @@ struct ImportOutcome {
 /// that may refresh a token upstream).
 const KIRO_IMPORT_CONCURRENCY: usize = 4;
 
-/// State for one OpenCode account login. The gateway owns the device flow: it
-/// asks the console for the code, polls it and writes the key row. This block
-/// only shows what the user needs (the code and the console's URL) and asks
-/// the gateway what the session's state is.
-struct OpencodeLoginForm {
+/// State for one account login. The gateway owns the flow: it opens the
+/// session with the vendor, polls it and writes the key row. This block only
+/// shows what the user needs (the URL, and for a device flow the code) and
+/// asks the gateway what the session's state is.
+struct AccountLoginForm {
+    /// Which vendor flow this is — decides the admin routes and the block's
+    /// wording.
+    kind: AccountLogin,
     progress: LoginProgress,
     /// The add form generation this login belongs to: a landing that arrives
     /// after the form was reopened or switched away is stale and ignored.
@@ -401,17 +417,21 @@ struct OpencodeLoginForm {
 enum LoginProgress {
     /// No session: the form's button starts one.
     Idle,
-    /// The console opened a session and waits for the user to authorize it.
+    /// The vendor opened a session and waits for the user to authorize it.
     Waiting {
         /// The gateway's session id (shared with the poll loop, never copied).
         session: Arc<str>,
-        user_code: String,
+        /// The code the user confirms on the console (a device flow); a
+        /// browser login carries everything in its URL.
+        user_code: Option<String>,
+        /// The URL the user opens (prefilled code, or the challenge).
         verification_url: String,
         /// When the session started: the block reports the elapsed time.
         started: Instant,
-        /// The console's polling cadence in seconds, from the start response.
+        /// How often the block re-reads the session, in seconds: the
+        /// console's own cadence for a device flow, 1 s for a browser login.
         interval: u64,
-        /// How long the code stays valid, from the start response.
+        /// How long the session stays open, from the start response.
         expires_in: u64,
     },
     /// The session ended in an error; the form stays open so the user can
@@ -431,6 +451,72 @@ impl LoginProgress {
     /// Whether the block is waiting for the user to authorize in the browser.
     fn is_waiting(&self) -> bool {
         self.session().is_some()
+    }
+}
+
+/// What starting a login gives the block, whichever flow opened it.
+struct LoginStart {
+    session: String,
+    /// The device flow's code; a browser login has none.
+    user_code: Option<String>,
+    verification_url: String,
+    expires_in: u64,
+    /// The block's poll cadence in seconds.
+    interval: u64,
+}
+
+impl From<OpencodeLoginStart> for LoginStart {
+    fn from(start: OpencodeLoginStart) -> Self {
+        Self {
+            session: start.session,
+            user_code: Some(start.user_code),
+            verification_url: start.verification_url,
+            expires_in: start.expires_in,
+            interval: start.interval,
+        }
+    }
+}
+
+impl From<CursorLoginStart> for LoginStart {
+    fn from(start: CursorLoginStart) -> Self {
+        Self {
+            session: start.session,
+            user_code: None,
+            verification_url: start.login_url,
+            expires_in: start.expires_in,
+            interval: CURSOR_LOGIN_POLL_SECS,
+        }
+    }
+}
+
+/// How often the block re-reads a Cursor login: the gateway polls Cursor
+/// every 500 ms, so a one-second read sees a landing within a second.
+const CURSOR_LOGIN_POLL_SECS: u64 = 1;
+
+/// One session state read, whichever flow it belongs to: the state word and
+/// the gateway's display-safe failure message. The account facts a success
+/// carries (key id, email, team) are not read here — the page reloads the
+/// cards, which show them from the key row.
+struct LoginState {
+    state: String,
+    message: Option<String>,
+}
+
+impl From<OpencodeLoginStatus> for LoginState {
+    fn from(status: OpencodeLoginStatus) -> Self {
+        Self {
+            state: status.state,
+            message: status.message,
+        }
+    }
+}
+
+impl From<CursorLoginStatus> for LoginState {
+    fn from(status: CursorLoginStatus) -> Self {
+        Self {
+            state: status.state,
+            message: status.message,
+        }
     }
 }
 
@@ -1049,7 +1135,7 @@ impl ProvidersPage {
             api_key,
             base_url,
             kiro_import: None,
-            opencode_login: source.login_form(self.form_generation),
+            login: source.login_form(self.form_generation),
             credential_mode: CredentialMode::AccountLogin,
             max_concurrency,
             probed_models: None,
@@ -1113,13 +1199,15 @@ impl ProvidersPage {
         } else {
             None
         };
-        form.opencode_login = source.login_form(self.form_generation);
+        form.login = source.login_form(self.form_generation);
         form.credential_mode = CredentialMode::AccountLogin;
         // The account login labels the new key after the vendor; an empty field
         // would make the gateway create an unnamed account.
-        if source.is_account_login() && form.label.read(cx).value().trim().is_empty() {
+        if let Some(spec) = source.spec().filter(|spec| spec.login.is_some())
+            && form.label.read(cx).value().trim().is_empty()
+        {
             form.label
-                .update(cx, |input, cx| input.set_value("opencode", window, cx));
+                .update(cx, |input, cx| input.set_value(spec.name, window, cx));
         }
         cx.notify();
     }
@@ -1197,7 +1285,7 @@ impl ProvidersPage {
         // An account-login vendor has no key to validate or persist: the whole
         // write is the gateway's device flow (which the block polls).
         if form.uses_account_login() {
-            self.start_opencode_login(cx);
+            self.start_account_login(cx);
             return;
         }
         if form.saving {
@@ -1567,20 +1655,20 @@ impl ProvidersPage {
     }
 
     /// Start an account login (add form): find-or-create the provider row, ask
-    /// the gateway to open a console session, then let the block poll it. The
-    /// provider row is created here because a session needs a real provider id
-    /// and the row may not exist yet.
-    fn start_opencode_login(&mut self, cx: &mut Context<Self>) {
+    /// the gateway to open a session with the vendor, then let the block poll
+    /// it. The provider row is created here because a session needs a real
+    /// provider id and the row may not exist yet.
+    fn start_account_login(&mut self, cx: &mut Context<Self>) {
         let Some(form) = &self.key_form else { return };
         if form.saving {
             return; // one write in flight at a time
         }
-        if form.opencode_login.is_none() {
+        let Some(kind) = form.login.as_ref().map(|login| login.kind) else {
             // The block that owns the session is missing (the source is not an
             // account-login one): fail closed rather than lock a form no login
             // can ever finish.
             return;
-        }
+        };
         let label = form.label.read(cx).value().trim().to_string();
         if label.is_empty() {
             if let Some(form) = &mut self.key_form {
@@ -1614,7 +1702,7 @@ impl ProvidersPage {
         if let Some(form) = &mut self.key_form {
             form.saving = true;
             form.error = None;
-            if let Some(login) = &mut form.opencode_login {
+            if let Some(login) = &mut form.login {
                 // A fresh attempt replaces whatever the block was showing.
                 login.progress = LoginProgress::Idle;
                 login.generation = generation;
@@ -1625,13 +1713,26 @@ impl ProvidersPage {
             .global::<GatewayRuntime>()
             .admin_call(move |admin| async move {
                 let provider_id = admin.find_or_create_provider(&target.input()).await?;
+                // The two bodies are one type; the route differs by flow.
                 let request = OpencodeLoginRequest {
                     label,
                     key_id: None,
                     group_ids: Vec::new(),
                     max_concurrency,
                 };
-                admin.start_opencode_login(provider_id, &request).await
+                match kind {
+                    AccountLogin::OpencodeDevice => admin
+                        .start_opencode_login(provider_id, &request)
+                        .await
+                        .map(LoginStart::from),
+                    AccountLogin::CursorBrowser => {
+                        let request: CursorLoginRequest = request;
+                        admin
+                            .start_cursor_login(provider_id, &request)
+                            .await
+                            .map(LoginStart::from)
+                    }
+                }
             });
         cx.spawn(async move |this, cx| {
             let result = call.await;
@@ -1648,19 +1749,19 @@ impl ProvidersPage {
     fn land_login_start(
         &mut self,
         generation: u64,
-        result: Result<OpencodeLoginStart, String>,
+        result: Result<LoginStart, String>,
         cx: &mut Context<Self>,
     ) {
-        let Some(login) = self.opencode_login_mut(generation) else {
+        let Some(login) = self.login_mut(generation) else {
             return; // the form closed while the gateway was opening the session
         };
         let session = match result {
             Ok(start) => {
                 let session: Arc<str> = Arc::from(start.session);
-                // The console's URL already carries the code, so handing it to
-                // the system browser saves the operator a copy-and-paste round
-                // trip. The code and link stay on screen for the case where no
-                // browser came up.
+                // The URL already carries the code (or the challenge), so
+                // handing it to the system browser saves the operator a
+                // copy-and-paste round trip. The link (and code) stay on
+                // screen for the case where no browser came up.
                 cx.open_url(&start.verification_url);
                 login.progress = LoginProgress::Waiting {
                     session: Arc::clone(&session),
@@ -1682,22 +1783,22 @@ impl ProvidersPage {
             }
         };
         cx.notify();
-        self.poll_opencode_login(generation, session, false, cx);
+        self.poll_account_login(generation, session, false, cx);
     }
 
-    /// Poll the login session once: wait the console's interval, read the
+    /// Poll the login session once: wait the block's interval, read the
     /// state and land it. The landing re-arms this until the session ends.
-    fn poll_opencode_login(
+    fn poll_account_login(
         &mut self,
         generation: u64,
         session: Arc<str>,
         retry: bool,
         cx: &mut Context<Self>,
     ) {
-        let Some(interval) =
-            self.opencode_login_mut(generation)
+        let Some((kind, interval)) =
+            self.login_mut(generation)
                 .and_then(|login| match &login.progress {
-                    LoginProgress::Waiting { interval, .. } => Some(*interval),
+                    LoginProgress::Waiting { interval, .. } => Some((login.kind, *interval)),
                     LoginProgress::Idle | LoginProgress::Failed(_) => None,
                 })
         else {
@@ -1706,12 +1807,21 @@ impl ProvidersPage {
         let call_session = Arc::clone(&session);
         let call = cx
             .global::<GatewayRuntime>()
-            .admin_call(
-                move |admin| async move { admin.opencode_login_status(&call_session).await },
-            );
+            .admin_call(move |admin| async move {
+                match kind {
+                    AccountLogin::OpencodeDevice => admin
+                        .opencode_login_status(&call_session)
+                        .await
+                        .map(LoginState::from),
+                    AccountLogin::CursorBrowser => admin
+                        .cursor_login_status(&call_session)
+                        .await
+                        .map(LoginState::from),
+                }
+            });
         cx.spawn(async move |this, cx| {
-            // The console's own cadence (the gateway polls it on the same
-            // interval), so the read never races the flow it is watching.
+            // The vendor's own cadence (the gateway polls on the same or a
+            // finer interval), so the read never races the flow it watches.
             cx.background_executor()
                 .timer(Duration::from_secs(interval.max(1)))
                 .await;
@@ -1731,7 +1841,7 @@ impl ProvidersPage {
         &mut self,
         generation: u64,
         session: Arc<str>,
-        result: Result<OpencodeLoginStatus, String>,
+        result: Result<LoginState, String>,
         retry: bool,
         cx: &mut Context<Self>,
     ) {
@@ -1743,7 +1853,7 @@ impl ProvidersPage {
             // A dropped read is not a failed login: give it one more chance
             // before saying so — the user may be authorizing right now.
             Err(_) if !retry => {
-                self.poll_opencode_login(generation, session, true, cx);
+                self.poll_account_login(generation, session, true, cx);
                 return;
             }
             Err(error) => {
@@ -1755,7 +1865,7 @@ impl ProvidersPage {
             "waiting" => {
                 // Repaint: the block's elapsed hint is derived at render time.
                 cx.notify();
-                self.poll_opencode_login(generation, session, false, cx);
+                self.poll_account_login(generation, session, false, cx);
             }
             "succeeded" => {
                 // The gateway wrote the account, its model snapshot and the
@@ -1770,7 +1880,7 @@ impl ProvidersPage {
                 let message = status.message.unwrap_or_else(|| "登录失败".to_string());
                 self.fail_login(generation, message, cx);
             }
-            "expired" => self.reset_login(generation, "登录码已过期，请重新开始", cx),
+            "expired" => self.reset_login(generation, "登录已过期，请重新开始", cx),
             "cancelled" => self.reset_login(generation, "登录已取消", cx),
             other => self.fail_login(generation, format!("未知的登录状态：{other}"), cx),
         }
@@ -1779,7 +1889,7 @@ impl ProvidersPage {
     /// End the block's session with a message it shows; the form stays open so
     /// the login can be retried.
     fn fail_login(&mut self, generation: u64, message: String, cx: &mut Context<Self>) {
-        let Some(login) = self.opencode_login_mut(generation) else {
+        let Some(login) = self.login_mut(generation) else {
             return;
         };
         login.progress = LoginProgress::Failed(message);
@@ -1792,7 +1902,7 @@ impl ProvidersPage {
     /// Return the block to idle with a hint on the form: the session ended
     /// without an account, so nothing was written.
     fn reset_login(&mut self, generation: u64, hint: &str, cx: &mut Context<Self>) {
-        let Some(login) = self.opencode_login_mut(generation) else {
+        let Some(login) = self.login_mut(generation) else {
             return;
         };
         login.progress = LoginProgress::Idle;
@@ -1804,10 +1914,10 @@ impl ProvidersPage {
     }
 
     /// The open login block, if it is still the one `generation` names.
-    fn opencode_login_mut(&mut self, generation: u64) -> Option<&mut OpencodeLoginForm> {
+    fn login_mut(&mut self, generation: u64) -> Option<&mut AccountLoginForm> {
         self.key_form
             .as_mut()?
-            .opencode_login
+            .login
             .as_mut()
             .filter(|login| login.generation == generation)
     }
@@ -1815,11 +1925,7 @@ impl ProvidersPage {
     /// Whether the block still waits on login session `session` — the poll
     /// loop's stop signal (cancel, provider switch and form close clear it).
     fn login_waiting(&self, generation: u64, session: &str) -> bool {
-        let Some(login) = self
-            .key_form
-            .as_ref()
-            .and_then(|form| form.opencode_login.as_ref())
-        else {
+        let Some(login) = self.key_form.as_ref().and_then(|form| form.login.as_ref()) else {
             return false;
         };
         login.generation == generation
@@ -1830,14 +1936,10 @@ impl ProvidersPage {
     }
 
     /// End the block's login session (the block's 取消): the gateway stops
-    /// polling the console and forgets the device code, so no account can land
-    /// from it.
-    fn cancel_opencode_login(&mut self, cx: &mut Context<Self>) {
-        let Some(login) = self
-            .key_form
-            .as_ref()
-            .and_then(|form| form.opencode_login.as_ref())
-        else {
+    /// polling the vendor and forgets the session's secret, so no account can
+    /// land from it.
+    fn cancel_account_login(&mut self, cx: &mut Context<Self>) {
+        let Some(login) = self.key_form.as_ref().and_then(|form| form.login.as_ref()) else {
             return;
         };
         let Some(session) = login.progress.session() else {
@@ -1845,8 +1947,9 @@ impl ProvidersPage {
         };
         let session = Arc::clone(session);
         let generation = login.generation;
+        let kind = login.kind;
         if let Some(form) = &mut self.key_form {
-            if let Some(login) = &mut form.opencode_login {
+            if let Some(login) = &mut form.login {
                 // The block stops showing the code at once: the exit is the
                 // user's click, not the gateway's round trip.
                 login.progress = LoginProgress::Idle;
@@ -1857,7 +1960,12 @@ impl ProvidersPage {
         cx.notify();
         let call = cx
             .global::<GatewayRuntime>()
-            .admin_call(move |admin| async move { admin.cancel_opencode_login(&session).await });
+            .admin_call(move |admin| async move {
+                match kind {
+                    AccountLogin::OpencodeDevice => admin.cancel_opencode_login(&session).await,
+                    AccountLogin::CursorBrowser => admin.cancel_cursor_login(&session).await,
+                }
+            });
         cx.spawn(async move |this, cx| {
             let result = call.await;
             this.update(cx, |page, cx| {
@@ -2032,7 +2140,7 @@ impl ProvidersPage {
         }
         let abandon_login = mode == CredentialMode::ApiKey
             && form
-                .opencode_login
+                .login
                 .as_ref()
                 .is_some_and(|login| login.progress.is_waiting());
         if let Some(form) = &mut self.key_form {
@@ -2040,7 +2148,7 @@ impl ProvidersPage {
             form.error = None;
         }
         if abandon_login {
-            self.cancel_opencode_login(cx);
+            self.cancel_account_login(cx);
         }
         cx.notify();
     }
