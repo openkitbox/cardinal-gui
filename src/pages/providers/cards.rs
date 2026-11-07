@@ -370,19 +370,44 @@ impl ProvidersPage {
                 )
             })
             .when(has_pasted_key, |this| {
+                this.when(form.probed_models.is_some(), |this| {
+                    this.child(model_filter_box(&form.model_filter))
+                })
+            })
+            .when(has_pasted_key, |this| {
                 this.when_some(form.probed_models.as_ref(), |this, models| {
                     let listed: Vec<&str> = models.iter().map(|model| model.id.as_str()).collect();
+                    let needle = model_needle(&form.model_filter, cx);
                     let orphans = form
                         .selected_models
                         .iter()
-                        .filter(|id| !listed.contains(&id.as_str()));
+                        .filter(|id| !listed.contains(&id.as_str()))
+                        .filter(|id| model_matches(id, needle.as_ref()));
+                    let visible = models
+                        .iter()
+                        .filter(|model| model_matches(&model.id, needle.as_ref()));
+                    // Both chip lists are lazy; settle 「matched nothing」 before
+                    // they are consumed so the picker can say so.
+                    let any_match = models
+                        .iter()
+                        .map(|model| model.id.as_str())
+                        .chain(form.selected_models.iter().map(String::as_str))
+                        .any(|id| model_matches(id, needle.as_ref()));
                     this.child(
                         gpui::div()
                             .flex()
                             .flex_wrap()
                             .items_center()
                             .gap_1()
-                            .children(models.iter().map(|model| {
+                            .when(!any_match, |this| {
+                                this.child(
+                                    gpui::div()
+                                        .text_size(px(12.))
+                                        .text_color(cx.theme().muted_foreground)
+                                        .child("没有匹配的模型"),
+                                )
+                            })
+                            .children(visible.map(|model| {
                                 let model_id = model.id.clone();
                                 let selected = form.selected_models.contains(&model.id);
                                 model_chip(
@@ -910,9 +935,18 @@ impl ProvidersPage {
                     .child(key_menu_button(provider, key, cx.weak_entity())),
             )
             // Credential row: an account key has no key to preview, so the card
-            // names the login that maintains it and the account it belongs to.
+            // names the login that maintains it and the account it belongs to,
+            // followed by the plan the vendor's quota probe reported.
             .when_some(
-                account_row(key, self.revealed_accounts.contains(&key_id), cx),
+                account_row(
+                    key,
+                    self.revealed_accounts.contains(&key_id),
+                    card_data
+                        .quota
+                        .as_ref()
+                        .and_then(|quota| quota.plan.as_deref()),
+                    cx,
+                ),
                 |this, row| this.child(row),
             )
             // Tag row: the groups this account belongs to (derived from
@@ -1159,19 +1193,42 @@ impl ProvidersPage {
                             .child("不选 = 全部模型"),
                     ),
             )
+            .when(editor.probed_models.is_some(), |this| {
+                this.child(model_filter_box(&editor.model_filter))
+            })
             .child(match &editor.probed_models {
                 Some(models) => {
                     let listed: Vec<&str> = models.iter().map(|model| model.id.as_str()).collect();
+                    let needle = model_needle(&editor.model_filter, cx);
                     let orphans = editor
                         .selected_models
                         .iter()
-                        .filter(|id| !listed.contains(&id.as_str()));
+                        .filter(|id| !listed.contains(&id.as_str()))
+                        .filter(|id| model_matches(id, needle.as_ref()));
+                    let visible = models
+                        .iter()
+                        .filter(|model| model_matches(&model.id, needle.as_ref()));
+                    // Both chip lists are lazy; settle 「matched nothing」 before
+                    // they are consumed so the picker can say so.
+                    let any_match = models
+                        .iter()
+                        .map(|model| model.id.as_str())
+                        .chain(editor.selected_models.iter().map(String::as_str))
+                        .any(|id| model_matches(id, needle.as_ref()));
                     gpui::div()
                         .flex()
                         .flex_wrap()
                         .items_center()
                         .gap_1()
-                        .children(models.iter().map(|model| {
+                        .when(!any_match, |this| {
+                            this.child(
+                                gpui::div()
+                                    .text_size(px(12.))
+                                    .text_color(cx.theme().muted_foreground)
+                                    .child("没有匹配的模型"),
+                            )
+                        })
+                        .children(visible.map(|model| {
                             let model_id = model.id.clone();
                             let selected = editor.selected_models.contains(&model.id);
                             model_chip(
@@ -1800,6 +1857,29 @@ fn field_label(label: &'static str, cx: &App) -> Div {
 /// edge), which reads cleaner than chips floating mid-card.
 const FIELD_LABEL_W: f32 = 72.;
 
+/// The active model-whitelist search needle, lowercased; `None` when the box
+/// is empty. Matching is a plain case-insensitive substring test on the model
+/// id — the chip's trailing limits are decoration, not something to search.
+fn model_needle(filter: &Entity<InputState>, cx: &App) -> Option<String> {
+    let needle = filter.read(cx).value().trim().to_lowercase();
+    (!needle.is_empty()).then_some(needle)
+}
+
+/// Whether a model id survives the active needle. No needle = no filtering,
+/// so every chip matches.
+fn model_matches(model_id: &str, needle: Option<&String>) -> bool {
+    needle.is_none_or(|needle| model_id.to_lowercase().contains(needle))
+}
+
+/// The search box that narrows a whitelist picker's chips. It takes its own
+/// full-width line: the 「模型」 row above it is already full (label + 获取
+/// button + hint) within the card's ~234px of content.
+fn model_filter_box(filter: &Entity<InputState>) -> Div {
+    gpui::div()
+        .w_full()
+        .child(Input::new(filter).small().cleanable(true))
+}
+
 /// One selectable model chip for the whitelist pickers (add form and key
 /// editor): model id plus the numeric limits the probe list carried
 /// (id · 上下文 · 输出上限 · 推理), highlighted when selected. Input modalities
@@ -1885,10 +1965,12 @@ fn tag_row(key_id: i64, provider: &ProviderRow, groups: &[KeyGroupView], cx: &Ap
 
 /// The credential line of an account card, where a pasted key's preview would
 /// otherwise sit. `None` for static-key rows — they add nothing beyond the key
-/// itself.
+/// itself. `plan` is the vendor's name for the account's plan ("Pro"), from
+/// the quota reading, rendered as a tag beside the account.
 fn account_row(
     key: &ProviderKeyView,
     revealed: bool,
+    plan: Option<&str>,
     cx: &mut Context<ProvidersPage>,
 ) -> Option<Div> {
     match key.auth_kind.as_str() {
@@ -1896,8 +1978,8 @@ fn account_row(
         // An OpenCode or Cursor login is identified by its email alone: the
         // login badge and the workspace/team say nothing about which account
         // is in use, and the address is masked until the eye is clicked.
-        "opencode_oauth" => Some(oauth_account_row(key, revealed, "OpenCode 账号", cx)),
-        "cursor_oauth" => Some(oauth_account_row(key, revealed, "Cursor 账号", cx)),
+        "opencode_oauth" => Some(oauth_account_row(key, revealed, "OpenCode 账号", plan, cx)),
+        "cursor_oauth" => Some(oauth_account_row(key, revealed, "Cursor 账号", plan, cx)),
         // A Kiro import (and any kind this build does not know yet — shown
         // rather than hidden, so the card still says the credential is
         // login-maintained) keeps the badge, then account and organization.
@@ -1927,6 +2009,9 @@ fn account_row(
             if let Some(organization) = key.organization.as_deref() {
                 row = row.child(Tag::secondary().child(organization.to_string()));
             }
+            if let Some(plan) = plan {
+                row = row.child(Tag::secondary().child(plan.to_owned()));
+            }
             Some(row)
         }
     }
@@ -1934,12 +2019,14 @@ fn account_row(
 
 /// A logged-in account's email — masked by default — and the eye that toggles
 /// between the mask and the address in clear, then the organization/team tag
-/// when the login recorded one. A login that recorded no address falls back
-/// to the login badge `kind`: there is nothing to reveal.
+/// when the login recorded one and the plan tag when the quota probe read one.
+/// A login that recorded no address falls back to the login badge `kind`:
+/// there is nothing to reveal.
 fn oauth_account_row(
     key: &ProviderKeyView,
     revealed: bool,
     kind: &'static str,
+    plan: Option<&str>,
     cx: &mut Context<ProvidersPage>,
 ) -> Div {
     let key_id = key.id;
@@ -1951,6 +2038,9 @@ fn oauth_account_row(
             .child(Tag::secondary().child(kind));
         if let Some(organization) = key.organization.as_deref() {
             row = row.child(Tag::secondary().child(organization.to_string()));
+        }
+        if let Some(plan) = plan {
+            row = row.child(Tag::secondary().child(plan.to_owned()));
         }
         return row;
     };
@@ -1991,6 +2081,9 @@ fn oauth_account_row(
         )
         .when_some(key.organization.as_deref(), |row, organization| {
             row.child(Tag::secondary().child(organization.to_string()))
+        })
+        .when_some(plan, |row, plan| {
+            row.child(Tag::secondary().child(plan.to_owned()))
         })
 }
 

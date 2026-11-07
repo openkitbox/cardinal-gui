@@ -1,12 +1,13 @@
 //! Quota view models and their rendering: the vendor-probed plan windows
-//! shown on an account card (meter: window name +
-//! remaining share above the bar, reset time + countdown below; one full-width
-//! meter per row). The bar shows the REMAINING share (full = healthy),
-//! band-colored by the used share. The prepaid balance view lives in the
-//! `balance` module and is carried here as part of the key's reading.
+//! shown on an account card (meter: window name + reset countdown above the
+//! bar; one full-width meter per row). The bar shows the REMAINING share
+//! (full = healthy), band-colored by the used share. The prepaid balance
+//! view lives in the `balance` module and is carried here as part of the
+//! key's reading.
 //!
 //! Windows spanning a week or more (weekly / monthly) also render a cumulative
-//! trend chart under their meter (drawn by the `trend` module). The
+//! trend chart under their meter (drawn by the `trend` module), headed by the
+//! used share and, when the vendor reports one, the amount spent. The
 //! projection needs only the current used share and the elapsed fraction;
 //! history shapes the curve, never the forecast, so a freshly deployed
 //! gateway shows the full diagonal alone while its series fills in.
@@ -62,6 +63,9 @@ pub(super) struct QuotaWindowView {
     /// Approximate window length in minutes (sort key, and the trend chart's
     /// x-axis span). `None` in snapshots written before the field existed.
     period_minutes: Option<i64>,
+    /// Amount already spent in this window, display-ready ("$0.04"), when the
+    /// vendor reports one. Shown beside the used share on the trend line.
+    used: Option<String>,
 
     /// Probe samples recorded for this window name, oldest first — all of the
     /// gateway's 35-day series, including a previous window's points; the
@@ -80,6 +84,7 @@ impl QuotaWindowView {
             used_pct: window.used_pct,
             resets_at: window.resets_at,
             period_minutes: window.period_minutes,
+            used: window.used,
             history,
         }
     }
@@ -93,6 +98,9 @@ impl QuotaWindowView {
 pub(super) struct KeyQuotaView {
     pub(super) windows: Vec<QuotaWindowView>,
     pub(super) balance: Option<BalanceView>,
+    /// The vendor's name for the account's plan ("Pro"), when it names one.
+    /// Rendered beside the account on the credential row, not here.
+    pub(super) plan: Option<String>,
     /// Display-ready info lines (plan, expiry, usage counters).
     pub(super) details: Vec<String>,
     /// When this reading was probed (snapshot time; a live refresh stamps now).
@@ -135,6 +143,7 @@ impl KeyQuotaView {
                 .balance
                 .filter(|balance| balance.amount.is_finite())
                 .map(|balance| BalanceView::new(balance, balance_history, probed_at)),
+            plan: quota.plan,
             details: quota.details,
             probed_at,
         }
@@ -165,15 +174,16 @@ impl KeyQuotaView {
                 })
                 .collect(),
             balance,
+            plan: quota.plan,
             details: quota.details,
             probed_at,
         }
     }
 }
 
-/// Quota windows, one full-width meter per row: name + remaining share above
-/// the bar, reset time + countdown below. The bar fill is the REMAINING share;
-/// long windows also carry a cumulative trend chart under the bar.
+/// Quota windows, one full-width meter per row: name + reset countdown above
+/// the bar. The bar fill is the REMAINING share; long windows also carry a
+/// cumulative trend chart under the bar.
 pub(super) fn quota_row(
     windows: &[QuotaWindowView],
     probed_at: chrono::DateTime<chrono::Utc>,
@@ -186,7 +196,7 @@ pub(super) fn quota_row(
     )
 }
 
-/// One window column: labels, bar, trend (long windows), reset line.
+/// One window column: name + reset line, bar, trend (long windows).
 fn quota_meter(
     window: &QuotaWindowView,
     probed_at: chrono::DateTime<chrono::Utc>,
@@ -324,7 +334,8 @@ fn window_trend(window: &QuotaWindowView, probed_at: DateTime<Utc>) -> Option<Tr
     })
 }
 
-/// The chart's two rows: a header (cumulative / projected) and the canvas.
+/// The chart's two rows: a header (used share, the amount spent when the
+/// vendor reports one, and the projection) and the canvas.
 fn trend_section(window: &QuotaWindowView, probed_at: DateTime<Utc>, cx: &App) -> Option<Div> {
     let trend = Rc::new(window_trend(window, probed_at)?);
     let theme = cx.theme();
@@ -343,6 +354,13 @@ fn trend_section(window: &QuotaWindowView, probed_at: DateTime<Utc>, cx: &App) -
         None => ("预计 —".to_string(), theme.muted_foreground),
     };
 
+    // The amount spent sits beside the share: the vendor reports both for a
+    // window whose allowance is money (Cursor's buckets), and the share alone
+    // cannot say how much that is.
+    let used_label = match &window.used {
+        Some(used) => format!("用量 {:.0}% · {used}", trend.used_pct),
+        None => format!("用量 {:.0}%", trend.used_pct),
+    };
     let header = gpui::div()
         .flex()
         .items_center()
@@ -352,7 +370,7 @@ fn trend_section(window: &QuotaWindowView, probed_at: DateTime<Utc>, cx: &App) -
             gpui::div()
                 .py_1()
                 .text_color(theme.muted_foreground)
-                .child(format!("用量 {:.0}%", trend.used_pct)),
+                .child(used_label),
         )
         .child(gpui::div().pt_0p5().flex_1())
         .child(gpui::div().text_color(forecast_color).child(forecast_text));

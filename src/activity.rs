@@ -24,12 +24,17 @@ use crate::runtime::GatewayRuntime;
 const LIVE_TTL: Duration = Duration::from_secs(600);
 /// Safety-net poll interval: heals dropped events and ages the live labels.
 const POLL: Duration = Duration::from_secs(15);
-/// How many finished attempts the settled ring keeps (newest first); the
+/// How many finished attempts the settled ring retains (newest first); the
 /// oldest are dropped past the cap. An End moves the attempt out of `live`
-/// into this buffer instead of dropping it. The feed renders every in-flight
-/// attempt first (live work is never hidden, so the live block is uncapped),
-/// then the newest settled rows up to this same display limit.
-pub(crate) const SETTLED_CAP: usize = 17;
+/// into this buffer instead of dropping it.
+///
+/// This is retention, not display. The feed filters this ring by caller, so
+/// retention has to outrun the display limit by enough that one client's
+/// newest rows survive the traffic of every other client between them —
+/// retaining only a screenful would leave a filtered feed showing the two or
+/// three rows that client happened to own gateway-wide. The feed's own limit
+/// (`pages::feed::FEED_LIMIT`) decides how many of these are drawn.
+pub(crate) const SETTLED_CAP: usize = 256;
 
 /// One in-flight relay attempt (one ledger row once it settles).
 #[derive(Clone)]

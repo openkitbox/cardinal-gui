@@ -25,11 +25,16 @@ use crate::activity::{ActivityFeed, LiveAttempt, SettledAttempt, client_hue, nam
 
 use super::card;
 
-/// How many SETTLED rows the feed shows: the live block comes first and is
+/// How many SETTLED rows the feed draws: the live block comes first and is
 /// never trimmed, so the newest settled attempts fill what is left of this
 /// budget — a live burst past it lengthens the card instead of hiding work.
-/// Matches the settled ring's cap.
-const FEED_LIMIT: usize = crate::activity::SETTLED_CAP;
+///
+/// Deliberately NOT the settled ring's cap: the ring retains far more than a
+/// screenful so that filtering it by caller still has history to draw from
+/// (see [`crate::activity::SETTLED_CAP`]). Trimming happens after the scope
+/// filter, so a filtered feed shows that client's newest rows, not whatever
+/// survived a global cap.
+const FEED_LIMIT: usize = 17;
 
 /// One row of the 动态 feed: an in-flight attempt (elapsed clock, client dot)
 /// or a finished attempt (timestamp, status · duration · speed).
@@ -68,8 +73,10 @@ pub(crate) fn feed_rows(feed: &ActivityFeed, scope: UsageScope) -> Vec<FeedRow> 
         .into_iter()
         .map(|attempt| FeedRow::Live(attempt.clone()))
         .collect();
-    // Settled rows already come newest first from the ring. The cap trims the
-    // settled tail only, so in-flight rows are never hidden: a burst past
+    // Settled rows already come newest first from the ring. The scope filter
+    // runs BEFORE the cap, so the limit trims this caller's own tail rather
+    // than being spent on rows that belong to other clients. The cap trims
+    // the settled tail only, so in-flight rows are never hidden: a burst past
     // `FEED_LIMIT` lengthens the card instead of dropping live work.
     rows.extend(
         feed.settled()

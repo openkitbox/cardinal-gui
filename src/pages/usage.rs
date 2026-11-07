@@ -637,8 +637,8 @@ impl Render for UsagePage {
                                     cx,
                                 ))
                             })
-                            .child(kpi_card("金额", cost_value(window), cost_sub(window), cx))
                             .child(hit_rate_card(window, cx))
+                            .child(kpi_card("金额", cost_value(window), cost_sub(window), cx))
                             .child(kpi_card(
                                 "输出速度",
                                 speed_value(window),

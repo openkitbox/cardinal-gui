@@ -39,7 +39,7 @@ use gpui::{
 };
 use gpui_kit::assets::IconName;
 use gpui_kit::component::button::{Button, ButtonVariant};
-use gpui_kit::component::input::{InputState, TextareaState};
+use gpui_kit::component::input::{InputEvent, InputState, TextareaState};
 use gpui_kit::component::{Disableable, Icon, Sizable, WindowExt};
 
 use gateway::admin_ops::Bootstrap;
@@ -297,6 +297,11 @@ struct KeyForm {
     max_concurrency: Entity<InputState>,
     /// Models the last 获取模型 probe returned (None until probed).
     probed_models: Option<Vec<ProbeModel>>,
+    /// Narrows the rendered chips to model ids containing this text. A pure
+    /// view filter over `probed_models`: it never touches the selection, so
+    /// clearing it brings every chip back. The input owns the text — nothing
+    /// mirrors it — and every keystroke just re-renders.
+    model_filter: Entity<InputState>,
     /// Model ids the user picked out of `probed_models`; empty = 全部模型.
     selected_models: Vec<String>,
     /// A 获取模型 probe is in flight.
@@ -539,6 +544,11 @@ struct KeyEditor {
     /// Models offered for picking: prefilled from the key's probe snapshot,
     /// refreshed by 重新获取.
     probed_models: Option<Vec<ProbeModel>>,
+    /// Narrows the rendered chips to model ids containing this text. A pure
+    /// view filter over `probed_models`: it never touches the selection, so
+    /// clearing it brings every chip back. The input owns the text — nothing
+    /// mirrors it — and every keystroke just re-renders.
+    model_filter: Entity<InputState>,
     /// The revealed plaintext credential: `None` until the reveal lands
     /// (opening the editor fetches it), `Some("")` when the row stores none.
     /// The list shapes carry no credential, so this is its only source.
@@ -1107,6 +1117,21 @@ impl ProvidersPage {
         .detach();
     }
 
+    /// The model-whitelist search input. A probe list can run to hundreds of
+    /// entries (Cursor returns 270), so both pickers narrow their chips by
+    /// typing; every keystroke re-renders the page so the chips follow the
+    /// text. The text lives only in the input — the render reads it back.
+    fn model_filter_input(window: &mut Window, cx: &mut Context<Self>) -> Entity<InputState> {
+        let filter = cx.new(|cx| InputState::new(window, cx).placeholder("搜索模型"));
+        cx.subscribe(&filter, |_, _, event: &InputEvent, cx| {
+            if let InputEvent::Change = event {
+                cx.notify();
+            }
+        })
+        .detach();
+        filter
+    }
+
     /// Open the add-key form, defaulting to the first catalog provider. A
     /// form that is still saving is kept, so its run can land its result.
     fn open_key_form(&mut self, window: &mut Window, cx: &mut Context<Self>) {
@@ -1139,6 +1164,7 @@ impl ProvidersPage {
             credential_mode: CredentialMode::AccountLogin,
             max_concurrency,
             probed_models: None,
+            model_filter: Self::model_filter_input(window, cx),
             selected_models: Vec::new(),
             probing: false,
             probe_seq: 0,
@@ -2332,6 +2358,7 @@ impl ProvidersPage {
             selected_groups: initial_groups.clone(),
             initial_groups,
             probed_models,
+            model_filter: Self::model_filter_input(window, cx),
             api_key: None,
             probing: false,
             saving: false,
