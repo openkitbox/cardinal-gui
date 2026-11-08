@@ -45,7 +45,8 @@ use gpui_kit::component::{Disableable, Icon, Sizable, WindowExt};
 use gateway::admin_ops::Bootstrap;
 use gateway::http_client::{
     CursorLoginRequest, CursorLoginStart, CursorLoginStatus, GatewayHttpClient, KeyUpdate,
-    OpencodeLoginRequest, OpencodeLoginStart, OpencodeLoginStatus,
+    OpenaiLoginRequest, OpenaiLoginStart, OpenaiLoginStatus, OpencodeLoginRequest,
+    OpencodeLoginStart, OpencodeLoginStatus,
 };
 
 use gateway::probe::ProbeModel;
@@ -482,6 +483,18 @@ impl From<OpencodeLoginStart> for LoginStart {
     }
 }
 
+impl From<OpenaiLoginStart> for LoginStart {
+    fn from(start: OpenaiLoginStart) -> Self {
+        Self {
+            session: start.session,
+            user_code: Some(start.user_code),
+            verification_url: start.verification_url,
+            expires_in: start.expires_in,
+            interval: start.interval,
+        }
+    }
+}
+
 impl From<CursorLoginStart> for LoginStart {
     fn from(start: CursorLoginStart) -> Self {
         Self {
@@ -509,6 +522,15 @@ struct LoginState {
 
 impl From<OpencodeLoginStatus> for LoginState {
     fn from(status: OpencodeLoginStatus) -> Self {
+        Self {
+            state: status.state,
+            message: status.message,
+        }
+    }
+}
+
+impl From<OpenaiLoginStatus> for LoginState {
+    fn from(status: OpenaiLoginStatus) -> Self {
         Self {
             state: status.state,
             message: status.message,
@@ -1758,6 +1780,20 @@ impl ProvidersPage {
                             .await
                             .map(LoginStart::from)
                     }
+                    // OpenAI's route takes the provider in the body.
+                    AccountLogin::OpenaiDevice => {
+                        let request = OpenaiLoginRequest {
+                            provider_id: Some(provider_id),
+                            label: request.label,
+                            key_id: None,
+                            group_ids: request.group_ids,
+                            max_concurrency: request.max_concurrency,
+                        };
+                        admin
+                            .start_openai_login(&request)
+                            .await
+                            .map(LoginStart::from)
+                    }
                 }
             });
         cx.spawn(async move |this, cx| {
@@ -1841,6 +1877,10 @@ impl ProvidersPage {
                         .map(LoginState::from),
                     AccountLogin::CursorBrowser => admin
                         .cursor_login_status(&call_session)
+                        .await
+                        .map(LoginState::from),
+                    AccountLogin::OpenaiDevice => admin
+                        .openai_login_status(&call_session)
                         .await
                         .map(LoginState::from),
                 }
@@ -1990,6 +2030,7 @@ impl ProvidersPage {
                 match kind {
                     AccountLogin::OpencodeDevice => admin.cancel_opencode_login(&session).await,
                     AccountLogin::CursorBrowser => admin.cancel_cursor_login(&session).await,
+                    AccountLogin::OpenaiDevice => admin.cancel_openai_login(&session).await,
                 }
             });
         cx.spawn(async move |this, cx| {

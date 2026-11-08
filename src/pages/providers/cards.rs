@@ -61,7 +61,10 @@ impl ProvidersPage {
         let is_kiro = form.source.is_kiro();
         // The vendor whose credential is normally a console login: it offers
         // both, so the picker shows either way.
-        let offers_login = form.source.is_account_login();
+        // A ChatGPT Codex account has no pasted-key alternative, so it never
+        // shows the picker.
+        let offers_login = form.source.is_account_login()
+            && form.source.account_login() != Some(AccountLogin::OpenaiDevice);
         // ... and this form picked it, so its one write is the device flow.
         let account_login = form.uses_account_login();
         // Only a pasted credential can be probed or whitelisted while adding:
@@ -487,6 +490,10 @@ impl ProvidersPage {
             AccountLogin::OpencodeDevice => (
                 "浏览器里授权 OpenCode 账号；有 API key 也可以在上方切换为填写 key",
                 "已自动打开浏览器，完成授权即可（若没打开请点上面的链接，验证码已预填）",
+            ),
+            AccountLogin::OpenaiDevice => (
+                "浏览器里授权 ChatGPT 账号（Codex 订阅，仅支持流式请求）",
+                "已自动打开浏览器，请在页面输入上面的验证码完成授权（若没打开请点上面的链接）",
             ),
             AccountLogin::CursorBrowser => (
                 "浏览器里登录 Cursor 账号；有 API key 也可以在上方切换为填写 key",
@@ -1975,11 +1982,12 @@ fn account_row(
 ) -> Option<Div> {
     match key.auth_kind.as_str() {
         "static" => None,
-        // An OpenCode or Cursor login is identified by its email alone: the
+        // An OpenCode, Cursor or ChatGPT login is identified by its email alone: the
         // login badge and the workspace/team say nothing about which account
         // is in use, and the address is masked until the eye is clicked.
         "opencode_oauth" => Some(oauth_account_row(key, revealed, "OpenCode 账号", plan, cx)),
         "cursor_oauth" => Some(oauth_account_row(key, revealed, "Cursor 账号", plan, cx)),
+        "openai_oauth" => Some(oauth_account_row(key, revealed, "ChatGPT 账号", plan, cx)),
         // A Kiro import (and any kind this build does not know yet — shown
         // rather than hidden, so the card still says the credential is
         // login-maintained) keeps the badge, then account and organization.

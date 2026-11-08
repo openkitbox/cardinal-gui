@@ -40,6 +40,9 @@ pub(super) enum AccountLogin {
     /// Cursor's browser login: one URL carrying the challenge, no code; the
     /// gateway polls Cursor every 500 ms.
     CursorBrowser,
+    /// ChatGPT Codex device flow: a user code typed at OpenAI's device page;
+    /// the gateway polls the issuer on its interval.
+    OpenaiDevice,
 }
 
 /// The provider catalog. Adding a key picks from this list; the provider row
@@ -83,6 +86,18 @@ pub(super) const PROVIDER_SPECS: &[ProviderSpec] = &[
         auth_scheme: "bearer",
         icon: ProviderIcon::Svg(provider_logos::OPENAI),
         login: None,
+    },
+    ProviderSpec {
+        name: "openai-codex",
+        display: "ChatGPT Codex",
+        // The ChatGPT subscription backend: the base is the backend root; the
+        // gateway appends /codex/responses and speaks the Responses dialect.
+        // Streaming requests only.
+        base_url: "https://chatgpt.com/backend-api",
+        protocol: "openai_responses",
+        auth_scheme: "bearer",
+        icon: ProviderIcon::Svg(provider_logos::OPENAI),
+        login: Some(AccountLogin::OpenaiDevice),
     },
     ProviderSpec {
         name: "deepseek",
