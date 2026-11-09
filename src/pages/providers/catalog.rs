@@ -5,6 +5,7 @@
 //! coexist as independent provider rows.
 
 use crate::assets::provider_logos;
+use gateway::upstream::Dns;
 
 /// How a provider's icon is rendered on cards and the picker.
 pub(super) enum ProviderIcon {
@@ -21,6 +22,7 @@ pub(super) struct ProviderSpec {
     pub(super) base_url: &'static str,
     pub(super) protocol: &'static str,
     pub(super) auth_scheme: &'static str,
+    pub(super) dns: Dns,
     pub(super) icon: ProviderIcon,
     /// The account's credential may come from a login that the gateway runs
     /// (the kind says which flow), not only from a pasted API key: the add
@@ -57,6 +59,7 @@ pub(super) const PROVIDER_SPECS: &[ProviderSpec] = &[
         base_url: "https://generativelanguage.googleapis.com/v1beta",
         protocol: "gemini",
         auth_scheme: "x_goog_api_key",
+        dns: Dns::Overseas,
         icon: ProviderIcon::Svg(provider_logos::GEMINI),
         login: None,
     },
@@ -66,6 +69,7 @@ pub(super) const PROVIDER_SPECS: &[ProviderSpec] = &[
         base_url: "https://open.bigmodel.cn/api/paas/v4",
         protocol: "openai_chat",
         auth_scheme: "bearer",
+        dns: Dns::Domestic,
         icon: ProviderIcon::Svg(provider_logos::GLM),
         login: None,
     },
@@ -75,6 +79,7 @@ pub(super) const PROVIDER_SPECS: &[ProviderSpec] = &[
         base_url: "https://api.anthropic.com",
         protocol: "anthropic_messages",
         auth_scheme: "x_api_key",
+        dns: Dns::Overseas,
         icon: ProviderIcon::Svg(provider_logos::ANTHROPIC),
         login: None,
     },
@@ -84,6 +89,7 @@ pub(super) const PROVIDER_SPECS: &[ProviderSpec] = &[
         base_url: "https://api.openai.com/v1",
         protocol: "openai_chat",
         auth_scheme: "bearer",
+        dns: Dns::Overseas,
         icon: ProviderIcon::Svg(provider_logos::OPENAI),
         login: None,
     },
@@ -96,6 +102,7 @@ pub(super) const PROVIDER_SPECS: &[ProviderSpec] = &[
         base_url: "https://chatgpt.com/backend-api",
         protocol: "openai_responses",
         auth_scheme: "bearer",
+        dns: Dns::Overseas,
         icon: ProviderIcon::Svg(provider_logos::OPENAI),
         login: Some(AccountLogin::OpenaiDevice),
     },
@@ -105,6 +112,7 @@ pub(super) const PROVIDER_SPECS: &[ProviderSpec] = &[
         base_url: "https://api.deepseek.com",
         protocol: "openai_chat",
         auth_scheme: "bearer",
+        dns: Dns::Domestic,
         icon: ProviderIcon::Svg(provider_logos::DEEPSEEK),
         login: None,
     },
@@ -116,6 +124,7 @@ pub(super) const PROVIDER_SPECS: &[ProviderSpec] = &[
         base_url: "https://api.moonshot.cn",
         protocol: "openai_chat",
         auth_scheme: "bearer",
+        dns: Dns::Domestic,
         icon: ProviderIcon::Svg(provider_logos::KIMI),
         login: None,
     },
@@ -130,6 +139,7 @@ pub(super) const PROVIDER_SPECS: &[ProviderSpec] = &[
         base_url: "https://opencode.ai/zen/go",
         protocol: "openai_chat",
         auth_scheme: "bearer",
+        dns: Dns::Overseas,
         icon: ProviderIcon::Svg(provider_logos::OPENCODE),
         // A vendor whose credential is an account, not a key: the add form
         // logs in through OpenCode's console instead of asking for one.
@@ -146,6 +156,7 @@ pub(super) const PROVIDER_SPECS: &[ProviderSpec] = &[
         base_url: "https://api.commandcode.ai/provider",
         protocol: "openai_chat",
         auth_scheme: "bearer",
+        dns: Dns::Overseas,
         icon: ProviderIcon::Svg(provider_logos::COMMANDCODE),
         login: None,
     },
@@ -160,6 +171,7 @@ pub(super) const PROVIDER_SPECS: &[ProviderSpec] = &[
         base_url: "https://api.openai.com/v1",
         protocol: "openai_embeddings",
         auth_scheme: "bearer",
+        dns: Dns::Overseas,
         icon: ProviderIcon::Svg(provider_logos::OPENAI),
         login: None,
     },
@@ -174,6 +186,7 @@ pub(super) const PROVIDER_SPECS: &[ProviderSpec] = &[
         base_url: "https://api2.cursor.sh",
         protocol: "cursor",
         auth_scheme: "bearer",
+        dns: Dns::Overseas,
         icon: ProviderIcon::Svg(provider_logos::CURSOR),
         login: Some(AccountLogin::CursorBrowser),
     },
@@ -186,6 +199,7 @@ pub(super) const PROVIDER_SPECS: &[ProviderSpec] = &[
         base_url: "",
         protocol: "kiro",
         auth_scheme: "bearer",
+        dns: Dns::Overseas,
         icon: ProviderIcon::Svg(provider_logos::KIRO),
         login: None,
     },
@@ -289,31 +303,43 @@ impl Region {
     }
 }
 
-/// (name, base_url) for one vendor's region × Coding Plan combination;
+/// (name, base_url, DNS region) for one vendor's region × Coding Plan combination;
 /// indexed `[coding_plan][region]`.
-type VariantTable = [[(&'static str, &'static str); 2]; 2];
+type VariantTable = [[(&'static str, &'static str, Dns); 2]; 2];
 
 /// kimi：月之暗面平台（host 根，能力路径由网关拼接）与 Kimi Code（base 即版本根）。
 const KIMI_VARIANTS: VariantTable = [
     [
-        ("kimi", "https://api.moonshot.cn"),
-        ("kimi-intl", "https://api.moonshot.ai"),
+        ("kimi", "https://api.moonshot.cn", Dns::Domestic),
+        ("kimi-intl", "https://api.moonshot.ai", Dns::Overseas),
     ],
     [
-        ("kimi-code", "https://api.kimi.com/coding/v1"),
-        ("kimi-code-intl", "https://api.kimi.ai/coding/v1"),
+        ("kimi-code", "https://api.kimi.com/coding/v1", Dns::Domestic),
+        (
+            "kimi-code-intl",
+            "https://api.kimi.ai/coding/v1",
+            Dns::Overseas,
+        ),
     ],
 ];
 
 /// glm：标准版与 Coding Plan（`/api/coding/paas/v4`），国内/国际各一套。
 const GLM_VARIANTS: VariantTable = [
     [
-        ("glm", "https://open.bigmodel.cn/api/paas/v4"),
-        ("glm-intl", "https://api.z.ai/api/paas/v4"),
+        ("glm", "https://open.bigmodel.cn/api/paas/v4", Dns::Domestic),
+        ("glm-intl", "https://api.z.ai/api/paas/v4", Dns::Overseas),
     ],
     [
-        ("glm-code", "https://open.bigmodel.cn/api/coding/paas/v4"),
-        ("glm-code-intl", "https://api.z.ai/api/coding/paas/v4"),
+        (
+            "glm-code",
+            "https://open.bigmodel.cn/api/coding/paas/v4",
+            Dns::Domestic,
+        ),
+        (
+            "glm-code-intl",
+            "https://api.z.ai/api/coding/paas/v4",
+            Dns::Overseas,
+        ),
     ],
 ];
 
@@ -342,7 +368,7 @@ pub(super) fn variant_of_row(name: &str, base_url: &str) -> Option<(Region, bool
     };
     let base = base_url.trim_end_matches('/');
     for (coding_index, row) in table.iter().enumerate() {
-        for (region_index, (variant_name, variant_url)) in row.iter().enumerate() {
+        for (region_index, (variant_name, variant_url, _)) in row.iter().enumerate() {
             if *variant_name == name && *variant_url == base {
                 return Some((Region::ALL[region_index], coding_index == 1));
             }
@@ -352,15 +378,15 @@ pub(super) fn variant_of_row(name: &str, base_url: &str) -> Option<(Region, bool
 }
 
 /// Resolve the catalog spec + 区域/Coding Plan choice into the stored
-/// (name, base_url). Vendors without a variant table keep the catalog entry
-/// (region/plan are not rendered for them).
+/// (name, base_url, DNS region). Vendors without a variant table keep the
+/// catalog entry (region/plan are not rendered for them).
 pub(super) fn resolve(
     spec: &'static ProviderSpec,
     region: Region,
     coding_plan: bool,
-) -> (&'static str, &'static str) {
+) -> (&'static str, &'static str, Dns) {
     match variants_of(spec) {
         Some(table) => table[coding_plan as usize][region as usize],
-        None => (spec.name, spec.base_url),
+        None => (spec.name, spec.base_url, spec.dns),
     }
 }

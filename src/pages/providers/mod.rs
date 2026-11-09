@@ -52,6 +52,7 @@ use gateway::http_client::{
 use gateway::probe::ProbeModel;
 use gateway::quota::KeyQuota;
 use gateway::store::{KeyGroupView, ProviderInput, ProviderKeyView, ProviderRow, RestRow};
+use gateway::upstream::Dns;
 
 use cards::CardDrag;
 use catalog::{
@@ -256,6 +257,7 @@ struct ProviderTarget {
     name: String,
     protocol: &'static str,
     base_url: String,
+    dns: Dns,
     /// `None` lets the gateway infer the scheme from the protocol.
     auth_scheme: Option<&'static str>,
 }
@@ -268,6 +270,7 @@ impl ProviderTarget {
             base_url: &self.base_url,
             auth_scheme: self.auth_scheme,
             enabled: true,
+            dns: self.dns,
         }
     }
 }
@@ -284,6 +287,9 @@ struct KeyForm {
     api_key: Entity<InputState>,
     /// Custom provider endpoint root (rendered only for `FormSource::Custom`).
     base_url: Entity<InputState>,
+    /// Custom provider DNS region (overseas by default); catalog entries take
+    /// the region their resolved variant declares.
+    dns: Dns,
     /// Kiro uses a JSON import instead of the ordinary API-key field.
     kiro_import: Option<KiroImportForm>,
     /// An account-login vendor (OpenCode Go, Cursor) logs in through the
@@ -329,11 +335,12 @@ impl KeyForm {
         match self.source {
             FormSource::Catalog(index) => {
                 let spec = &PROVIDER_SPECS[index];
-                let (name, base_url) = resolve(spec, self.region, self.coding_plan);
+                let (name, base_url, dns) = resolve(spec, self.region, self.coding_plan);
                 Ok(ProviderTarget {
                     name: name.to_string(),
                     protocol: spec.protocol,
                     base_url: base_url.to_string(),
+                    dns,
                     auth_scheme: Some(spec.auth_scheme),
                 })
             }
@@ -355,6 +362,7 @@ impl KeyForm {
                     name: name.to_string(),
                     protocol: protocol.protocol,
                     base_url: base_url.to_string(),
+                    dns: self.dns,
                     auth_scheme: None,
                 })
             }
@@ -587,27 +595,31 @@ struct KeyEditor {
     error: Option<String>,
 }
 
-/// The custom provider's editable endpoint plus the values the editor opened
-/// with, so save writes only what changed. The label input doubles as the
-/// provider name (name = label invariant).
+/// The custom provider's editable endpoint and DNS region plus the values the
+/// editor opened with, so save writes only what changed. The label input
+/// doubles as the provider name (name = label invariant).
 struct CustomEdit {
     protocol: ProtocolChoice,
     base_url: Entity<InputState>,
+    dns: Dns,
     initial_name: String,
     initial_protocol: ProtocolChoice,
     initial_base_url: String,
+    initial_dns: Dns,
 }
 
 /// The custom endpoint as typed, validated and copied out once at submit time.
 struct CustomTarget {
     protocol: ProtocolChoice,
     base_url: String,
+    dns: Dns,
 }
 
 /// The provider PATCH a custom-row save sends (name = the key label).
 struct ProviderWrite {
     protocol: &'static str,
     base_url: String,
+    dns: Dns,
     /// Carried over from the loaded row: the PATCH is a full replace.
     enabled: bool,
     /// The row's stored scheme while the protocol is unchanged; `None` after a
@@ -636,13 +648,16 @@ impl CustomEdit {
         Ok(CustomTarget {
             protocol: self.protocol,
             base_url: base_url.to_string(),
+            dns: self.dns,
         })
     }
 
-    /// Protocol or base_url differ from the stored row: the key must be
-    /// re-validated against the new endpoint before anything is written.
+    /// Protocol, base_url or DNS region differ from the stored row: the key
+    /// must be re-validated against the new endpoint before anything is written.
     fn endpoint_changed(&self, target: &CustomTarget) -> bool {
-        target.protocol != self.initial_protocol || target.base_url != self.initial_base_url
+        target.protocol != self.initial_protocol
+            || target.base_url != self.initial_base_url
+            || target.dns != self.initial_dns
     }
 }
 
@@ -1181,6 +1196,7 @@ impl ProvidersPage {
             label,
             api_key,
             base_url,
+            dns: Dns::Overseas,
             kiro_import: None,
             login: source.login_form(self.form_generation),
             credential_mode: CredentialMode::AccountLogin,
@@ -2159,6 +2175,21 @@ impl ProvidersPage {
         cx.notify();
     }
 
+    /// Pick the custom provider's DNS region. A previous probe described the
+    /// old resolver, so its results are dropped.
+    fn select_form_dns(&mut self, dns: Dns, cx: &mut Context<Self>) {
+        if let Some(form) = self.key_form.as_mut().filter(|form| !form.saving) {
+            if form.dns == dns {
+                return;
+            }
+            form.dns = dns;
+            form.probed_models = None;
+            form.selected_models.clear();
+            form.probing = false;
+        }
+        cx.notify();
+    }
+
     /// Toggle one model chip in the key editor's whitelist selection.
     fn toggle_editor_model(&mut self, model: String, cx: &mut Context<Self>) {
         if let Some(editor) = self.key_editor.as_mut().filter(|editor| !editor.saving) {
@@ -2279,6 +2310,7 @@ impl ProvidersPage {
                             base_url: &target.base_url,
                             auth_scheme: None,
                             enabled: true,
+                            dns: target.dns,
                         };
                         admin.validate_key(&input, &api_key).await
                     }
@@ -2385,9 +2417,11 @@ impl ProvidersPage {
                 Some(CustomEdit {
                     protocol,
                     base_url,
+                    dns: row.dns,
                     initial_name: row.name.clone(),
                     initial_protocol: protocol,
                     initial_base_url: row.base_url.clone(),
+                    initial_dns: row.dns,
                 })
             });
         self.key_editor = Some(KeyEditor {
@@ -2449,6 +2483,23 @@ impl ProvidersPage {
         cx.notify();
     }
 
+    /// Pick the custom provider's DNS region in the key editor.
+    fn select_editor_dns(&mut self, dns: Dns, cx: &mut Context<Self>) {
+        let Some(custom) = self
+            .key_editor
+            .as_mut()
+            .filter(|editor| !editor.saving && !editor.probing)
+            .and_then(|editor| editor.custom.as_mut())
+        else {
+            return;
+        };
+        if custom.dns == dns {
+            return;
+        }
+        custom.dns = dns;
+        cx.notify();
+    }
+
     /// Fetch the editor's plaintext credential (one loopback reveal) into the
     /// open editor. A failure leaves it unset; the card shows 读取失败 and the
     /// next open retries.
@@ -2479,8 +2530,8 @@ impl ProvidersPage {
     }
 
     /// Save the key editor (label, concurrency cap, model whitelist, groups;
-    /// for custom rows also the provider's name, protocol and base_url), then
-    /// reload.
+    /// for custom rows also the provider's name, protocol, base_url and DNS
+    /// region), then reload.
     fn save_key_editor(&mut self, cx: &mut Context<Self>) {
         let Some(editor) = &self.key_editor else {
             return;
@@ -2570,6 +2621,7 @@ impl ProvidersPage {
                 (endpoint_changed || label != custom.initial_name).then_some(ProviderWrite {
                     protocol: target.protocol.protocol,
                     base_url: target.base_url,
+                    dns: target.dns,
                     enabled,
                     auth_scheme,
                     validate_with,
@@ -2593,6 +2645,7 @@ impl ProvidersPage {
                         base_url: &write.base_url,
                         auth_scheme: write.auth_scheme.as_deref(),
                         enabled: write.enabled,
+                        dns: write.dns,
                     };
                     let models = match &write.validate_with {
                         Some(api_key) => Some(admin.validate_key(&input, api_key).await?),

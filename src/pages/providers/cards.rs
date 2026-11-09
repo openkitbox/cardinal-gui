@@ -22,6 +22,7 @@ use gateway::http_client::KeyUpdate;
 use gateway::probe::ProbeModel;
 use gateway::store::{KeyGroupView, ProviderKeyView};
 use gateway::store::{ProviderRow, RestRow};
+use gateway::upstream::Dns;
 
 use super::balance::balance_row;
 use super::catalog::{
@@ -163,7 +164,7 @@ impl ProvidersPage {
                             )
                     }),
             )
-            // 自定义 provider：协议单选 + base_url；label 兼作 provider 名。
+            // 自定义 provider：协议/DNS 单选 + base_url；label 兼作 provider 名。
             .when_some(
                 match form.source {
                     FormSource::Custom { protocol } => Some(protocol),
@@ -210,6 +211,25 @@ impl ProvidersPage {
                         None,
                         cx,
                     ))
+                    .child(
+                        gpui::div()
+                            .flex()
+                            .items_center()
+                            .flex_wrap()
+                            .gap_1()
+                            .child(field_label("DNS 区域", cx))
+                            .children(DNS_CHOICES.into_iter().enumerate().map(|(index, dns)| {
+                                selectable_chip(
+                                    dns_label(dns).to_string(),
+                                    dns == form.dns,
+                                    ElementId::from(("key-form-dns", index)),
+                                    cx,
+                                )
+                                .on_click(cx.listener(move |this, _, _, cx| {
+                                    this.select_form_dns(dns, cx)
+                                }))
+                            })),
+                    )
                     .child(
                         gpui::div()
                             .text_size(px(12.))
@@ -1141,6 +1161,27 @@ impl ProvidersPage {
                 ))
                 .child(
                     gpui::div()
+                        .flex()
+                        .items_center()
+                        .flex_wrap()
+                        .gap_1()
+                        .child(field_label("DNS 区域", cx))
+                        .children(DNS_CHOICES.into_iter().enumerate().map(|(index, dns)| {
+                            selectable_chip(
+                                dns_label(dns).to_string(),
+                                dns == custom.dns,
+                                ElementId::from(("key-editor-dns", index)),
+                                cx,
+                            )
+                            .when(!locked, |chip| {
+                                chip.on_click(cx.listener(move |this, _, _, cx| {
+                                    this.select_editor_dns(dns, cx)
+                                }))
+                            })
+                        })),
+                )
+                .child(
+                    gpui::div()
                         .text_size(px(12.))
                         .text_color(cx.theme().muted_foreground)
                         .child("Label 同时作为 provider 名；改名会改变直连前缀 <label>/<model>（路由不受影响）"),
@@ -1857,6 +1898,15 @@ fn field_label(label: &'static str, cx: &App) -> Div {
         .flex_shrink_0()
         .text_color(cx.theme().muted_foreground)
         .child(label)
+}
+
+const DNS_CHOICES: [Dns; 2] = [Dns::Domestic, Dns::Overseas];
+
+fn dns_label(dns: Dns) -> &'static str {
+    match dns {
+        Dns::Domestic => "国内",
+        Dns::Overseas => "海外",
+    }
 }
 
 /// The model chips sit on the line below the 「模型」 label/button row: no
