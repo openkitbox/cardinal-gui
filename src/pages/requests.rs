@@ -24,8 +24,47 @@ use crate::fmt::usd_microus;
 use crate::pages::{LoadState, empty_card, error_card, loading_card, page_frame, refresh_button};
 use crate::runtime::GatewayRuntime;
 
+fn project_request(row: gateway::activity::PersistedRequest, id: i64) -> RequestRow {
+    RequestRow {
+        id,
+        ts: chrono::Utc::now(),
+        protocol: String::new(),
+        client_protocol: None,
+        effort: None,
+        alias: row.route,
+        provider_id: Some(row.provider_id),
+        provider_key_id: Some(row.provider_key_id),
+        model: Some(row.model),
+        served_model: row.served_model,
+        status: i32::from(row.status),
+        input_tokens: row.input_tokens,
+        output_tokens: row.output_tokens,
+        cached_input_tokens: row.cached_input_tokens,
+        cache_creation_input_tokens: None,
+        total_ms: Some(row.total_ms),
+        ttft_ms: row.ttft_ms,
+        cost_usd: row.cost_usd,
+        error: row.error,
+        caller_key: row.caller_key,
+        agent: None,
+        request_id: row.request_id,
+        key_label: None,
+        user_id: row.user_id,
+        login: None,
+        gateway_key_id: None,
+        charged_microus: row.charged_microus,
+        rate_bp: None,
+    }
+}
+
 /// Rows shown per page.
 const PAGE_SIZE: i64 = 50;
+
+/// Rows merged from a live persisted batch have no database row id yet: their
+/// negative id is a UI-only identity, never a key for a ledger read.
+fn is_live_projection(id: i64) -> bool {
+    id < 0
+}
 
 /// Short display name for a stored protocol id (`openai_chat` → `chat`).
 fn short_protocol(id: &str) -> &str {
@@ -84,12 +123,13 @@ fn protocol_tip(client_protocol: Option<&str>, upstream: &str) -> String {
 /// Gateway request log, cursor-paginated (older = smaller id).
 pub struct RequestsPage {
     state: LoadState<Vec<RequestRow>>,
-    /// Live-activity feed: a Persisted event auto-refreshes the newest page.
+    /// Live-activity feed supplies persisted summaries; no automatic ledger
+    /// reload is needed on the newest page.
     feed: gpui::Entity<crate::activity::ActivityFeed>,
-    /// Last Persisted counter value we refreshed for.
     seen_persisted: u64,
-    /// Auto-refresh floor: a settle storm must not fire a query per request.
-    last_auto_reload: std::time::Instant,
+    seen_resync: u64,
+    active: bool,
+    next_local_id: i64,
     /// Cursor of the page being loaded: None = newest page, Some(id) = rows
     /// older than id. Kept across loads so a refresh re-fetches the current page.
     cursor: Option<i64>,
@@ -186,10 +226,12 @@ impl RequestsPage {
         feed: gpui::Entity<crate::activity::ActivityFeed>,
         cx: &mut Context<Self>,
     ) -> Self {
-        let mut this = Self {
+        let this = Self {
             state: LoadState::Loading,
             seen_persisted: feed.read(cx).persisted(),
-            last_auto_reload: std::time::Instant::now(),
+            seen_resync: feed.read(cx).resync(),
+            active: false,
+            next_local_id: -1,
             cursor: None,
             has_older: false,
             generation: 0,
@@ -199,39 +241,37 @@ impl RequestsPage {
             error_details: HashMap::new(),
             feed,
         };
-        // Read the connect revision off the page's own clone — `feed` moved in.
-        let resync = this.feed.read(cx).resync();
-        // Persisted → the ledger gained rows: refresh the newest page (never an
-        // older cursor page — that would yank the reader back). Any event →
-        // re-render for the live rows (elapsed ticks, phase flips). Min-interval
-        // guards against settle storms; the feed's slow ticker heals any skipped
-        // refresh.
-        // No eager load here: the page opens (and re-opens) on a `resync` —
-        // bumped by the activity stream's connect frame. That keeps opening
-        // the client cheap (the feed subscription carries the bootstrap, and
-        // this page's first ledger page loads when the stream is up).
         cx.observe(&this.feed.clone(), |page, feed, cx| {
-            let persisted = feed.read(cx).persisted();
+            let (persisted, resync) = {
+                let feed = feed.read(cx);
+                (feed.persisted(), feed.resync())
+            };
             if persisted != page.seen_persisted {
                 page.seen_persisted = persisted;
-                if page.cursor.is_none()
-                    && page.last_auto_reload.elapsed() >= std::time::Duration::from_secs(1)
-                {
-                    page.last_auto_reload = std::time::Instant::now();
+                let requests = feed.update(cx, |feed, _| feed.take_persisted_requests());
+                if page.active && page.cursor.is_none() {
+                    page.merge_persisted_rows(requests, cx);
+                }
+            }
+            if resync != page.seen_resync {
+                page.seen_resync = resync;
+                if page.active {
                     page.reload(cx);
                 }
             }
             cx.notify();
         })
         .detach();
-        // The connect frame's resync (bumped along with the pushed bootstrap)
-        // may have landed before this page existed: load its first page now.
-        // A later connect fires the observer, so every (re)connect still
-        // reloads.
-        if matches!(this.state, LoadState::Loading) && resync > 0 {
-            this.reload(cx);
-        }
         this
+    }
+
+    /// The status container reports whether this tab is showing. Hidden pages
+    /// never start an automatic ledger read.
+    pub(crate) fn set_active(&mut self, active: bool) {
+        if self.active == active {
+            return;
+        }
+        self.active = active;
     }
 
     /// (Re)load the page at the current cursor over the HTTP admin API.
@@ -289,12 +329,37 @@ impl RequestsPage {
         .detach();
     }
 
+    /// Merge a newly persisted batch into the newest cached page. No HTTP
+    /// request is involved; the batch is projected once, in its display order.
+    fn merge_persisted_rows(
+        &mut self,
+        rows: Vec<gateway::activity::PersistedRequest>,
+        cx: &mut Context<Self>,
+    ) {
+        let LoadState::Loaded(current) = &mut self.state else {
+            return;
+        };
+        let mut incoming: Vec<RequestRow> = Vec::new();
+        for row in rows {
+            let id = self.next_local_id;
+            self.next_local_id = self.next_local_id.saturating_sub(1);
+            incoming.push(project_request(row, id));
+        }
+        current.splice(0..0, incoming);
+        current.truncate(PAGE_SIZE as usize);
+        cx.notify();
+    }
+
     /// Jump to the page of rows older than the last row currently shown.
     fn older_page(&mut self, cx: &mut Context<Self>) {
         let LoadState::Loaded(rows) = &self.state else {
             return;
         };
-        let Some(oldest) = rows.last().map(|row| row.id) else {
+        let Some(oldest) = rows
+            .iter()
+            .rev()
+            .find_map(|row| (!is_live_projection(row.id)).then_some(row.id))
+        else {
             return;
         };
         self.cursor = Some(oldest);
@@ -320,27 +385,34 @@ impl RequestsPage {
             cx.notify();
             return;
         }
-        let bodies_stale = matches!(
-            self.bodies.get(&id),
-            None | Some(LoadState::Loaded(None) | LoadState::Failed(_))
-        );
-        if bodies_stale {
-            self.fetch_bodies(id, cx);
+        if !is_live_projection(id) {
+            let bodies_stale = matches!(
+                self.bodies.get(&id),
+                None | Some(LoadState::Loaded(None) | LoadState::Failed(_))
+            );
+            if bodies_stale {
+                self.fetch_bodies(id, cx);
+            }
         }
-        let traces_stale = matches!(
-            self.traces.get(&id),
-            None | Some(LoadState::Loaded(None) | LoadState::Failed(_))
-        );
-        if traces_stale {
-            // The request_id is on the row itself; extract it for the trace fetch.
-            let request_id = match &self.state {
-                LoadState::Loaded(rows) => rows
-                    .iter()
-                    .find(|row| row.id == id)
-                    .and_then(|row| row.request_id.clone()),
-                _ => None,
-            };
-            self.fetch_trace(id, request_id, cx);
+        if is_live_projection(id) {
+            // Synthetic rows have no persisted trace, just like their bodies.
+            self.traces.insert(id, LoadState::Loaded(None));
+        } else {
+            let traces_stale = matches!(
+                self.traces.get(&id),
+                None | Some(LoadState::Loaded(None) | LoadState::Failed(_))
+            );
+            if traces_stale {
+                // The request_id is on the row itself; extract it for the trace fetch.
+                let request_id = match &self.state {
+                    LoadState::Loaded(rows) => rows
+                        .iter()
+                        .find(|row| row.id == id)
+                        .and_then(|row| row.request_id.clone()),
+                    _ => None,
+                };
+                self.fetch_trace(id, request_id, cx);
+            }
         }
         let error = match &self.state {
             LoadState::Loaded(rows) => rows
@@ -419,6 +491,11 @@ impl RequestsPage {
     /// since the split — spec §8 decision 6; shaped after routes.rs
     /// `fetch_row_models`).
     fn fetch_bodies(&mut self, id: i64, cx: &mut Context<Self>) {
+        if is_live_projection(id) {
+            // A live summary has no ledger row to ask about; it becomes
+            // fetchable only after a reload replaces it with the stored row.
+            return;
+        }
         self.bodies.insert(id, LoadState::Loading);
         let load = cx
             .global::<GatewayRuntime>()
@@ -827,58 +904,68 @@ fn row_detail(page: &RequestsPage, row: &RequestRow, cx: &mut Context<RequestsPa
         .border_t_1()
         .border_color(cx.theme().border)
         .bg(cx.theme().muted);
-    match page.bodies.get(&row.id) {
-        None | Some(LoadState::Loading) => {
-            detail = detail.child(
-                gpui::div()
-                    .text_size(px(12.))
-                    .text_color(cx.theme().muted_foreground)
-                    .child("加载中…"),
-            );
-        }
-        Some(LoadState::Failed(error)) => {
-            detail = detail.child(
-                gpui::div()
-                    .text_size(px(12.))
-                    .text_color(cx.theme().danger)
-                    .child(error.clone()),
-            );
-        }
-        Some(LoadState::Loaded(None)) => {
-            detail = detail.child(
-                gpui::div()
-                    .text_size(px(12.))
-                    .text_color(cx.theme().muted_foreground)
-                    .child("正文未捕获（[gateway].payloads 关闭、已被淘汰，或 relay 在另一进程）"),
-            );
-        }
-        Some(LoadState::Loaded(Some(bodies))) => {
-            detail = detail
-                .child(body_panel(
-                    "request-body",
-                    row.id,
-                    "请求正文",
-                    &bodies.request,
-                    &bodies.request_md,
-                    bodies.request_display_lines,
-                    bodies.request_truncated.then_some("已截断 · 前 256KB"),
-                    cx,
-                ))
-                .child(match (&bodies.response, &bodies.response_md) {
-                    (Some(response), Some(response_md)) => body_panel(
-                        "response-body",
+    if is_live_projection(row.id) {
+        detail = detail.child(note_panel(
+            "请求正文",
+            "实时摘要行没有记录 ID，不加载正文；刷新后可按存储记录查看",
+            cx,
+        ));
+    } else {
+        match page.bodies.get(&row.id) {
+            None | Some(LoadState::Loading) => {
+                detail = detail.child(
+                    gpui::div()
+                        .text_size(px(12.))
+                        .text_color(cx.theme().muted_foreground)
+                        .child("加载中…"),
+                );
+            }
+            Some(LoadState::Failed(error)) => {
+                detail = detail.child(
+                    gpui::div()
+                        .text_size(px(12.))
+                        .text_color(cx.theme().danger)
+                        .child(error.clone()),
+                );
+            }
+            Some(LoadState::Loaded(None)) => {
+                detail = detail.child(
+                    gpui::div()
+                        .text_size(px(12.))
+                        .text_color(cx.theme().muted_foreground)
+                        .child(
+                            "正文未捕获（[gateway].payloads 关闭、已被淘汰，或 relay 在另一进程）",
+                        ),
+                );
+            }
+            Some(LoadState::Loaded(Some(bodies))) => {
+                detail = detail
+                    .child(body_panel(
+                        "request-body",
                         row.id,
-                        "响应正文",
-                        response,
-                        response_md,
-                        bodies.response_display_lines.unwrap_or(1),
-                        bodies
-                            .response_truncated
-                            .then_some("不完整（截断或含非 UTF-8 帧）"),
+                        "请求正文",
+                        &bodies.request,
+                        &bodies.request_md,
+                        bodies.request_display_lines,
+                        bodies.request_truncated.then_some("已截断 · 前 256KB"),
                         cx,
-                    ),
-                    _ => note_panel("响应正文", "无响应正文（请求失败）", cx),
-                });
+                    ))
+                    .child(match (&bodies.response, &bodies.response_md) {
+                        (Some(response), Some(response_md)) => body_panel(
+                            "response-body",
+                            row.id,
+                            "响应正文",
+                            response,
+                            response_md,
+                            bodies.response_display_lines.unwrap_or(1),
+                            bodies
+                                .response_truncated
+                                .then_some("不完整（截断或含非 UTF-8 帧）"),
+                            cx,
+                        ),
+                        _ => note_panel("响应正文", "无响应正文（请求失败）", cx),
+                    });
+            }
         }
     }
     // Routing trace panel (loaded lazily like the bodies).

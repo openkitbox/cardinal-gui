@@ -144,6 +144,7 @@ struct UserSubmit {
 /// User management page (the 用户 tab).
 pub struct UsersPage {
     segment: Segment,
+    active: bool,
     state: LoadState<Vec<UserRow>>,
     groups: Entity<UserGroupsView>,
     action_error: Option<String>,
@@ -172,12 +173,15 @@ impl UsersPage {
         let groups = cx.new(|_| UserGroupsView::new());
         // User rows carry the group name and rate: a group write reloads them.
         cx.subscribe(&groups, |page, _, _: &GroupsChanged, cx| {
-            page.reload_users(cx)
+            if page.active {
+                page.reload_users(cx);
+            }
         })
         .detach();
         cx.observe(&groups, |_, _, cx| cx.notify()).detach();
         Self {
             segment: Segment::Users,
+            active: false,
             state: LoadState::Loading,
             groups,
             action_error: None,
@@ -189,6 +193,10 @@ impl UsersPage {
             editor: None,
             detail: None,
         }
+    }
+
+    pub(crate) fn set_active(&mut self, active: bool) {
+        self.active = active;
     }
 
     /// Tab-bar actions: the segment's create button + refresh.
@@ -221,6 +229,9 @@ impl UsersPage {
     }
 
     fn reload_users(&mut self, cx: &mut Context<Self>) {
+        if !self.active {
+            return;
+        }
         begin_load(&mut self.state);
         let call = cx
             .global::<GatewayRuntime>()
@@ -1025,6 +1036,9 @@ impl ActionPage for UsersPage {
     /// Reload the users, the groups (filter, picker and the 用户组 segment)
     /// and the open ledger panel.
     fn reload(&mut self, cx: &mut Context<Self>) {
+        if !self.active {
+            return;
+        }
         self.reload_users(cx);
         self.groups.update(cx, |groups, cx| groups.reload(cx));
         if let Some(panel) = &self.detail {

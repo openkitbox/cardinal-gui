@@ -117,6 +117,29 @@ impl RoutesPage {
         self.prune_clients();
     }
 
+    /// Fold the feed's current live-call snapshot into the client registry and
+    /// start the wire animation when anything is in flight. Only the visible
+    /// page calls this (from activity events) plus explicit reloads, which
+    /// restore the snapshot after a hidden tab paused updates.
+    pub(super) fn sync_live_clients(&mut self, cx: &mut Context<Self>) {
+        let live_calls: Vec<(String, String)> = self
+            .feed
+            .read(cx)
+            .live()
+            .map(|attempt| {
+                (
+                    named_client(attempt.agent.as_deref(), attempt.caller.as_deref()),
+                    attempt.client_model.clone(),
+                )
+            })
+            .collect();
+        let idle = live_calls.is_empty();
+        self.sync_clients(live_calls, cx);
+        if !idle {
+            self.arm_anim(cx);
+        }
+    }
+
     /// Fold the live-call snapshot into the client registry: live callers
     /// upsert (name derived from the label's `cardinal-` suffix), clients whose
     /// last call just settled start their linger clock, expired ones drop out.
@@ -236,6 +259,10 @@ impl RoutesPage {
                 .timer(std::time::Duration::from_millis(66))
                 .await;
             this.update(cx, |page, cx| {
+                if !page.active {
+                    page.anim_armed = false;
+                    return;
+                }
                 page.anim_armed = false;
                 page.phase = (page.phase + 0.75) % 8.0;
                 cx.notify();

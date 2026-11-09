@@ -712,9 +712,17 @@ pub struct ProvidersPage {
     /// card toggles one entry. View state only — the address is already on the
     /// card, masked, and nothing is fetched to reveal it.
     revealed_accounts: HashSet<i64>,
+    active: bool,
 }
 
 impl ProvidersPage {
+    pub(crate) fn set_active(&mut self, active: bool) {
+        if self.active == active {
+            return;
+        }
+        self.active = active;
+    }
+
     pub fn new(feed: gpui::Entity<crate::activity::ActivityFeed>, cx: &mut Context<Self>) -> Self {
         let mut this = Self {
             state: LoadState::Loading,
@@ -734,6 +742,7 @@ impl ProvidersPage {
             drag: None,
             order_write_in_flight: false,
             revealed_accounts: HashSet::new(),
+            active: false,
         };
         // The page renders from the PUSHED bootstrap document — providers,
         // every key (with its model snapshot), the stored quota readings and
@@ -752,14 +761,14 @@ impl ProvidersPage {
                 cx.notify();
             }
             let resync = feed.read(cx).resync();
-            if resync != page.seen_resync {
+            if page.active && resync != page.seen_resync {
                 page.seen_resync = resync;
                 page.reload(cx);
             }
             // The gateway's background prober persisted fresh quota snapshots;
             // nothing else pushes them, so re-read (the old cards stay up).
             let quota_rev = feed.read(cx).quota_rev();
-            if quota_rev != page.seen_quota {
+            if page.active && quota_rev != page.seen_quota {
                 page.seen_quota = quota_rev;
                 page.reload(cx);
             }

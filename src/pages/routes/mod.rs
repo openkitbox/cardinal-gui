@@ -26,7 +26,7 @@ use gateway::store::{
     RouteStrategy,
 };
 
-use crate::activity::{ActivityFeed, named_client};
+use crate::activity::ActivityFeed;
 use crate::pages::{
     LoadState, action_error_card, card, empty_card, error_card, loading_card, page_frame,
     refresh_button,
@@ -479,11 +479,10 @@ pub struct RoutesPage {
     /// Per-row drag moves set it, the stage root clears it, on_drop consumes.
     stage_drop: Option<(String, usize)>,
     /// The shared live-activity feed driving the stage (observed).
+    /// Route state comes from explicit reloads (including tab activation) and
+    /// manual writes; activity events only drive the visible client stage.
     feed: Entity<ActivityFeed>,
-    /// Persisted counter already handled (debounced reload on change).
-    seen_persisted: u64,
-    /// A debounced reload is scheduled (coalesces a settle storm).
-    refresh_pending: bool,
+    active: bool,
     /// Listen address shown under the hub node ("" until resolved / Down).
     hub_addr: String,
     /// Flow phase of the live wires' dash pattern, 0..8 (3 on + 5 off).
@@ -507,7 +506,7 @@ pub struct RoutesPage {
 /// much longer than a request-scoped one would keep them.)
 impl RoutesPage {
     pub fn new(feed: Entity<ActivityFeed>, cx: &mut Context<Self>) -> Self {
-        let mut this = Self {
+        let this = Self {
             state: LoadState::Loading,
             generation: 0,
             editor: None,
@@ -516,8 +515,7 @@ impl RoutesPage {
             manage_write_in_flight: false,
             stage_drop: None,
             feed,
-            seen_persisted: 0,
-            refresh_pending: false,
+            active: false,
             hub_addr: String::new(),
             phase: 0.0,
             anim_armed: false,
@@ -537,64 +535,39 @@ impl RoutesPage {
             }
         })
         .detach();
-        // Any activity event folds into the client registry and repaints the
-        // stage; Persisted also schedules a debounced reload (the stage's
-        // sections and the client seeding read the ledger). The flow ticker arms
-        // while anything is in flight.
-        // No eager load here: the page opens (and re-opens) on a `resync` —
-        // bumped by the activity stream's connect frame. That keeps opening
-        // the client cheap (the feed subscription carries the bootstrap, and
-        // the stage's first snapshot loads when the stream is up).
+        // Any activity event folds into the visible client registry and repaints
+        // the stage; the flow ticker arms while anything is in flight. No eager
+        // load here: StatusPage explicitly reloads this page when its tab opens
+        // (and re-opens), which restores route state and the client snapshot.
+        // Hiding the page pauses event-driven stage updates.
         let feed = this.feed.clone();
-        cx.observe(&feed, |page, feed, cx| {
-            // Snapshot the live set first: folding it into the registry needs
-            // &mut Context (arm_prune spawns), which conflicts with feed.read(cx).
-            let live_calls: Vec<(String, String)> = feed
-                .read(cx)
-                .live()
-                .map(|attempt| {
-                    (
-                        named_client(attempt.agent.as_deref(), attempt.caller.as_deref()),
-                        attempt.client_model.clone(),
-                    )
-                })
-                .collect();
-            let idle = live_calls.is_empty();
-            page.sync_clients(live_calls, cx);
-            if !idle {
-                page.arm_anim(cx);
+        cx.observe(&feed, |page, _feed, cx| {
+            // Hidden tabs keep the feed subscription but do not fold every live
+            // event into the stage or start animation work. Activation performs
+            // the explicit reload above and restores the snapshot from scratch.
+            if !page.active {
+                return;
             }
-            let persisted = feed.read(cx).persisted();
-            if persisted != page.seen_persisted && !page.refresh_pending {
-                page.seen_persisted = persisted;
-                page.refresh_pending = true;
-                cx.spawn(async move |page, cx| {
-                    cx.background_executor()
-                        .timer(std::time::Duration::from_secs(1))
-                        .await;
-                    page.update(cx, |page, cx| {
-                        page.refresh_pending = false;
-                        // Absorb every Persisted that arrived during the debounce, or
-                        // the next event schedules one redundant reload.
-                        page.seen_persisted = page.feed.read(cx).persisted();
-                        page.reload(cx);
-                    })
-                    .ok();
-                })
-                .detach();
-            }
+            page.sync_live_clients(cx);
             cx.notify();
         })
         .detach();
-        // The connect frame's resync (bumped along with the pushed bootstrap)
-        // may have landed before this page existed: load its first snapshot
-        // now. A later connect fires the observer, so every (re)connect still
-        // reloads.
-        let resync = this.feed.read(cx).resync();
-        if matches!(this.state, LoadState::Loading) && resync > 0 {
-            this.reload(cx);
-        }
         this
+    }
+
+    pub(crate) fn set_active(&mut self, active: bool) {
+        if self.active == active {
+            return;
+        }
+        self.active = active;
+        if !active {
+            // Do not retain a live snapshot while hidden: activation reloads the
+            // ledger/bootstrap and the feed observer then takes a fresh snapshot.
+            self.clients.clear();
+            self.clients_gen += 1;
+            self.prune_armed_until = None;
+            self.anim_armed = false;
+        }
     }
 
     /// Tab-row actions (rendered by the Status container): refresh always;

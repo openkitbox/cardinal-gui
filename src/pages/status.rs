@@ -47,6 +47,7 @@ impl StatusPage {
             if page.active_tab != active {
                 page.active_tab = active;
                 if let Some(tab) = active {
+                    page.set_child_active(tab, cx);
                     page.refresh_child(tab, cx);
                 }
                 cx.notify();
@@ -65,7 +66,7 @@ impl StatusPage {
                 .update(cx, |state, cx| state.set_status_tab(StatusTab::Keys, cx));
         })
         .detach();
-        Self {
+        let mut this = Self {
             providers: cx.new(|cx| ProvidersPage::new(feed.clone(), cx)),
             routes: cx.new(|cx| RoutesPage::new(feed.clone(), cx)),
             requests: cx.new(|cx| RequestsPage::new(feed.clone(), cx)),
@@ -75,12 +76,29 @@ impl StatusPage {
             settings: cx.new(|cx| SettingsPage::new(window, cx)),
             state,
             active_tab: None,
-        }
+        };
+        this.active_tab = Some(StatusTab::Usage);
+        this.set_child_active(StatusTab::Usage, cx);
+        this.refresh_child(StatusTab::Usage, cx);
+        this
+    }
+
+    fn set_child_active(&mut self, active: StatusTab, cx: &mut Context<Self>) {
+        self.providers.update(cx, |page, _| {
+            page.set_active(active == StatusTab::Providers)
+        });
+        self.routes
+            .update(cx, |page, _| page.set_active(active == StatusTab::Routes));
+        self.requests
+            .update(cx, |page, _| page.set_active(active == StatusTab::Requests));
+        self.usage
+            .update(cx, |page, _| page.set_active(active == StatusTab::Usage));
+        self.users
+            .update(cx, |page, _| page.set_active(active == StatusTab::Users));
     }
 
     /// Silently refresh the newly shown tab (switching tabs still re-reads).
-    /// Construction itself does NOT load: each page opens on the activity
-    /// stream's connect frame (the pushed bootstrap or its resync). Settings
+    /// Construction uses this same path for the initial Usage tab. Settings
     /// is read-only with no reload — its data comes from the startup probe.
     fn refresh_child(&mut self, tab: StatusTab, cx: &mut Context<Self>) {
         match tab {

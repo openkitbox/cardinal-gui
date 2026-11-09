@@ -9,11 +9,12 @@
 //! and sweeps ghost rows, and the pages re-query on `persisted` bumps.
 
 use std::collections::{HashMap, VecDeque};
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use gpui::{Context, Hsla};
 
-use gateway::activity::{ActivityEvent, EndMetrics, EndStatus, StartEvent};
+use gateway::activity::{ActivityEvent, EndMetrics, EndStatus, PersistedRequest, StartEvent};
 use gateway::admin_ops::Bootstrap;
 
 use crate::runtime::GatewayRuntime;
@@ -148,9 +149,12 @@ pub(crate) struct ActivityFeed {
     settled: VecDeque<SettledAttempt>,
     /// An event landed since the last ticker beat (drives the slow heal poll).
     dirty: bool,
-    /// Bumped on Persisted (and the dirty ticker beat); pages refresh their
-    /// ledger/aggregates.
+    /// Bumped when a persisted batch lands; pages use it to consume the
+    /// in-memory request projection without treating it as a reload signal.
     persisted: u64,
+    /// The newest batch awaiting the requests page, newest first. Taking it
+    /// moves the summaries once; no cumulative ring is replayed per revision.
+    persisted_requests: Vec<PersistedRequest>,
     /// Bumped whenever a dispatched attempt starts or resolves — i.e. when a
     /// key's concurrency slot is taken or released. Pages showing live
     /// occupancy reload on this (not `persisted`: a settled request has already
@@ -168,7 +172,7 @@ pub(crate) struct ActivityFeed {
     /// snapshots, gateway keys, model-success. Pages render their slice from
     /// it, so opening the client costs one connection instead of a request
     /// per page. None until the frame lands.
-    bootstrap: Option<Bootstrap>,
+    bootstrap: Option<Arc<Bootstrap>>,
     /// Bumped when the gateway announces a finished quota probe round: the
     /// snapshots in the database moved, so quota-showing pages re-read.
     quota_rev: u64,
@@ -184,6 +188,7 @@ impl ActivityFeed {
             settled: VecDeque::new(),
             dirty: false,
             persisted: 0,
+            persisted_requests: Vec::new(),
             slot_changes: 0,
             key_inflight: HashMap::new(),
             resync: 0,
@@ -214,6 +219,12 @@ impl ActivityFeed {
         self.persisted
     }
 
+    /// Move the pending summaries to their sole UI consumer. Bodies and
+    /// credentials are not part of this projection.
+    pub(crate) fn take_persisted_requests(&mut self) -> Vec<PersistedRequest> {
+        std::mem::take(&mut self.persisted_requests)
+    }
+
     /// Slot-change revision: bumped per `slot` event, so a page that mirrors
     /// live concurrency swings repaints when it actually changed.
     pub(crate) fn slot_changes(&self) -> u64 {
@@ -234,7 +245,7 @@ impl ActivityFeed {
 
     /// The pushed bootstrap document, if the connect frame has landed.
     pub(crate) fn bootstrap(&self) -> Option<&Bootstrap> {
-        self.bootstrap.as_ref()
+        self.bootstrap.as_deref()
     }
 
     /// Bootstrap revision: bumped when a pushed document lands, so each page
@@ -255,6 +266,7 @@ impl ActivityFeed {
     /// pages whose loads failed while the gateway was down would stay errored
     /// until real traffic lands.
     pub(crate) fn notify_persisted(&mut self, cx: &mut Context<Self>) {
+        self.persisted_requests.clear();
         self.persisted += 1;
         cx.notify();
     }
@@ -277,7 +289,7 @@ impl ActivityFeed {
                             .map(|inflight| (key.id, inflight.max(0) as u32))
                     })
                     .collect();
-                self.bootstrap = Some(*document);
+                self.bootstrap = Some(document);
                 self.bootstrap_rev += 1;
                 self.slot_changes += 1;
                 cx.notify();
@@ -285,38 +297,38 @@ impl ActivityFeed {
             }
             other => other,
         };
-        match &event {
+        match event {
             ActivityEvent::Persisted => {
+                self.persisted_requests.clear();
                 self.persisted += 1;
                 cx.notify();
-                return;
+            }
+            ActivityEvent::PersistedBatch { requests } => {
+                self.persisted_requests = requests.into_iter().rev().collect();
+                self.persisted += 1;
+                cx.notify();
             }
             ActivityEvent::Slot { key_id, inflight } => {
-                // Absolute value straight from the slot owner: overwrite, never
-                // accumulate, so one dropped frame cannot skew the mirror.
-                self.key_inflight.insert(*key_id, *inflight);
+                self.key_inflight.insert(key_id, inflight);
                 self.slot_changes += 1;
                 cx.notify();
-                return;
             }
             ActivityEvent::QuotaRefreshed => {
                 self.quota_rev += 1;
                 cx.notify();
-                return;
             }
             ActivityEvent::Resync => {
-                // Gap or fresh subscription: drop the mirror and let the pages
-                // re-read once (the ledger pages ride `persisted`).
                 self.key_inflight.clear();
+                self.persisted_requests.clear();
                 self.persisted += 1;
                 self.resync += 1;
                 cx.notify();
-                return;
             }
-            _ => {}
+            other => {
+                self.dirty |= apply_to(&mut self.live, &mut self.order, &mut self.settled, other);
+                cx.notify();
+            }
         }
-        self.dirty |= apply_to(&mut self.live, &mut self.order, &mut self.settled, event);
-        cx.notify();
     }
 
     /// Drain the gateway's activity subscription until the feed (or the
@@ -350,6 +362,7 @@ impl ActivityFeed {
                         let had_events = feed.dirty;
                         if had_events {
                             feed.dirty = false;
+                            feed.persisted_requests.clear();
                             feed.persisted += 1;
                         }
                         // Re-render when there is something to show (or something just
@@ -558,7 +571,7 @@ fn apply_to(
             settled.truncate(SETTLED_CAP);
             true
         }
-        ActivityEvent::Persisted => false,
+        ActivityEvent::Persisted | ActivityEvent::PersistedBatch { .. } => false,
         // Slot / Resync / Bootstrap are applied to the occupancy mirror (and
         // the pushed document) in `apply` before this runs; they carry
         // nothing for the live/settled state machine.

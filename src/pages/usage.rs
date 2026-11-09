@@ -174,10 +174,12 @@ pub struct UsagePage {
     state: LoadState<(UsageWindow, Vec<TrendRow>, ResolvedRange)>,
     /// Live-activity feed: a Persisted event schedules a debounced reload.
     feed: gpui::Entity<crate::activity::ActivityFeed>,
-    /// Last Persisted counter value we reacted to.
+    /// Persisted batches mark the aggregate dirty; a low-frequency refresh
+    /// reconciles it only while this tab is active.
     seen_persisted: u64,
-    /// A trailing-edge debounce timer is already armed.
-    refresh_pending: bool,
+    dirty: bool,
+    active: bool,
+    last_auto_refresh: std::time::Instant,
     /// Stale-overwrite guard: a reload started later always wins over one still in flight.
     generation: u64,
     /// Bumped when a load's result lands in `state` — the trend-cache key must
@@ -223,6 +225,12 @@ pub struct UsagePage {
 }
 
 impl UsagePage {
+    pub(crate) fn set_active(&mut self, active: bool) {
+        if self.active == active {
+            return;
+        }
+        self.active = active;
+    }
     pub(crate) fn new(
         feed: gpui::Entity<crate::activity::ActivityFeed>,
         window: &mut Window,
@@ -250,7 +258,9 @@ impl UsagePage {
         let mut this = Self {
             state: LoadState::Loading,
             seen_persisted: feed.read(cx).persisted(),
-            refresh_pending: false,
+            dirty: false,
+            active: false,
+            last_auto_refresh: std::time::Instant::now(),
             generation: 0,
             data_version: 0,
             range: UsageRange::Today,
@@ -269,49 +279,44 @@ impl UsagePage {
             trend_cache: TrendCache::new(None),
             feed,
         };
-        // Read the connect revision off the page's own clone — `feed` moved in.
-        // Persisted → aggregates changed: reload, debounced trailing-edge so a
-        // settle storm coalesces into one query per second at most. Any feed
-        // change also repaints: the 动态 card below the trend renders live rows,
-        // whose phase/elapsed labels move without a persisted bump. The notify is
-        // unconditional; the reload stays gated on the persisted counter.
+        // Persisted batches only mark aggregates dirty. An active page may
+        // reconcile after the five-minute interval; a hidden page never reads
+        // automatically. Other events still repaint the live block.
         cx.observe(&this.feed.clone(), |page, feed, cx| {
-            // A pushed bootstrap landed: the page's first connect — seed the
-            // dropdown from it and open the aggregates (no eager load at
-            // construction, so starting the client stays cheap).
+            // Seed the dropdown from the pushed document. The Status container
+            // owns the initial aggregate load; bootstrap only refreshes labels.
             let bootstrap_rev = feed.read(cx).bootstrap_rev();
             if bootstrap_rev != page.seen_bootstrap {
                 page.seen_bootstrap = bootstrap_rev;
                 if let Some(document) = feed.read(cx).bootstrap() {
                     page.keys = owner_key_options(&document.gateway_keys);
                 }
-                page.reload_users(cx);
-                page.reload(cx);
+                if page.active {
+                    page.reload_users(cx);
+                }
             }
             // A stream-continuity gap: the mirrors may be stale — fall back to
             // pulling (labels AND aggregates).
             let resync = feed.read(cx).resync();
             if resync != page.seen_resync {
                 page.seen_resync = resync;
-                page.reload_keys(cx);
-                page.reload_users(cx);
-                page.reload(cx);
+                if page.active {
+                    page.reload_keys(cx);
+                    page.reload_users(cx);
+                    page.reload(cx);
+                }
             }
             let persisted = feed.read(cx).persisted();
-            if persisted != page.seen_persisted && !page.refresh_pending {
+            if persisted != page.seen_persisted {
                 page.seen_persisted = persisted;
-                page.refresh_pending = true;
-                cx.spawn(async move |page, cx| {
-                    cx.background_executor()
-                        .timer(std::time::Duration::from_secs(1))
-                        .await;
-                    page.update(cx, |page, cx| {
-                        page.refresh_pending = false;
-                        page.reload(cx);
-                    })
-                    .ok();
-                })
-                .detach();
+                page.dirty = true;
+                if page.active
+                    && page.last_auto_refresh.elapsed() >= std::time::Duration::from_secs(300)
+                {
+                    page.last_auto_refresh = std::time::Instant::now();
+                    page.dirty = false;
+                    page.reload(cx);
+                }
             }
             cx.notify();
         })
@@ -325,8 +330,6 @@ impl UsagePage {
             && let Some(document) = this.feed.read(cx).bootstrap()
         {
             this.keys = owner_key_options(&document.gateway_keys);
-            this.reload_users(cx);
-            this.reload(cx);
         }
         this
     }
