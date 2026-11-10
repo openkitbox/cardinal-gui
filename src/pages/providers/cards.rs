@@ -968,10 +968,13 @@ impl ProvidersPage {
                 account_row(
                     key,
                     self.revealed_accounts.contains(&key_id),
-                    card_data
-                        .quota
-                        .as_ref()
-                        .and_then(|quota| quota.plan.as_deref()),
+                    account_plan(
+                        key,
+                        card_data
+                            .quota
+                            .as_ref()
+                            .and_then(|quota| quota.plan.as_deref()),
+                    ),
                     cx,
                 ),
                 |this, row| this.child(row),
@@ -2022,8 +2025,8 @@ fn tag_row(key_id: i64, provider: &ProviderRow, groups: &[KeyGroupView], cx: &Ap
 
 /// The credential line of an account card, where a pasted key's preview would
 /// otherwise sit. `None` for static-key rows — they add nothing beyond the key
-/// itself. `plan` is the vendor's name for the account's plan ("Pro"), from
-/// the quota reading, rendered as a tag beside the account.
+/// itself. `plan` is the vendor's account plan, preferring the OAuth identity
+/// plan for OpenAI Codex and otherwise using the quota reading.
 fn account_row(
     key: &ProviderKeyView,
     revealed: bool,
@@ -2032,12 +2035,34 @@ fn account_row(
 ) -> Option<Div> {
     match key.auth_kind.as_str() {
         "static" => None,
-        // An OpenCode, Cursor or ChatGPT login is identified by its email alone: the
-        // login badge and the workspace/team say nothing about which account
-        // is in use, and the address is masked until the eye is clicked.
-        "opencode_oauth" => Some(oauth_account_row(key, revealed, "OpenCode 账号", plan, cx)),
-        "cursor_oauth" => Some(oauth_account_row(key, revealed, "Cursor 账号", plan, cx)),
-        "openai_oauth" => Some(oauth_account_row(key, revealed, "ChatGPT 账号", plan, cx)),
+        // An OpenCode or Cursor login is identified by its email and badge;
+        // Codex intentionally has no badge. The workspace/team says nothing
+        // about which account is in use, and the address is masked until the
+        // eye is clicked.
+        "opencode_oauth" => Some(oauth_account_row(
+            key,
+            key.account.as_deref(),
+            revealed,
+            "OpenCode 账号",
+            plan,
+            cx,
+        )),
+        "cursor_oauth" => Some(oauth_account_row(
+            key,
+            key.account.as_deref(),
+            revealed,
+            "Cursor 账号",
+            plan,
+            cx,
+        )),
+        "openai_oauth" => Some(oauth_account_row(
+            key,
+            key.email.as_deref(),
+            revealed,
+            "",
+            plan,
+            cx,
+        )),
         // A Kiro import (and any kind this build does not know yet — shown
         // rather than hidden, so the card still says the credential is
         // login-maintained) keeps the badge, then account and organization.
@@ -2075,25 +2100,33 @@ fn account_row(
     }
 }
 
+fn account_plan<'a>(key: &'a ProviderKeyView, quota_plan: Option<&'a str>) -> Option<&'a str> {
+    if key.auth_kind == "openai_oauth" {
+        key.plan_type.as_deref().or(quota_plan)
+    } else {
+        quota_plan
+    }
+}
+
 /// A logged-in account's email — masked by default — and the eye that toggles
 /// between the mask and the address in clear, then the organization/team tag
-/// when the login recorded one and the plan tag when the quota probe read one.
+/// when the login recorded one and the plan tag when the account or quota read one.
 /// A login that recorded no address falls back to the login badge `kind`:
 /// there is nothing to reveal.
 fn oauth_account_row(
     key: &ProviderKeyView,
+    account: Option<&str>,
     revealed: bool,
     kind: &'static str,
     plan: Option<&str>,
     cx: &mut Context<ProvidersPage>,
 ) -> Div {
     let key_id = key.id;
-    let Some(account) = key.account.as_deref() else {
-        let mut row = gpui::div()
-            .flex()
-            .items_center()
-            .gap_1()
-            .child(Tag::secondary().child(kind));
+    let Some(account) = account else {
+        let mut row = gpui::div().flex().items_center().gap_1();
+        if !kind.is_empty() {
+            row = row.child(Tag::secondary().child(kind));
+        }
         if let Some(organization) = key.organization.as_deref() {
             row = row.child(Tag::secondary().child(organization.to_string()));
         }
