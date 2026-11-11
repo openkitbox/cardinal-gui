@@ -91,8 +91,9 @@ impl StatusPage {
             .update(cx, |page, _| page.set_active(active == StatusTab::Routes));
         self.requests
             .update(cx, |page, _| page.set_active(active == StatusTab::Requests));
-        self.usage
-            .update(cx, |page, _| page.set_active(active == StatusTab::Usage));
+        self.usage.update(cx, |page, cx| {
+            page.set_active(active == StatusTab::Usage, cx)
+        });
         self.users
             .update(cx, |page, _| page.set_active(active == StatusTab::Users));
     }

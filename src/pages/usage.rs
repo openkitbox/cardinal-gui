@@ -34,6 +34,17 @@ use crate::runtime::GatewayRuntime;
 /// the same span so the chart grid and the SQL cover identical instants.
 const MAX_SPAN_DAYS: i64 = 370;
 
+/// How often the 动态 feed's in-flight elapsed labels repaint: half a second
+/// keeps the count-up live without polling or re-reading the ledger.
+const ELAPSED_TICK: std::time::Duration = std::time::Duration::from_millis(500);
+
+/// Whether the overview page should arm its elapsed repaint timer: only while
+/// the page is active, no timer is already armed, and the feed has a live row
+/// under the page's own client scope.
+fn should_arm_elapsed(active: bool, armed: bool, has_live_rows: bool) -> bool {
+    active && !armed && has_live_rows
+}
+
 /// The window the page shows — the tab-row chips or the date picker's custom
 /// range.
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -104,6 +115,19 @@ fn local_midnight(tz: chrono::FixedOffset, date: NaiveDate) -> DateTime<Utc> {
         LocalResult::Single(local) => local.with_timezone(&Utc),
         LocalResult::Ambiguous(earliest, _) => earliest.with_timezone(&Utc),
         LocalResult::None => midnight.and_utc(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::should_arm_elapsed;
+
+    #[test]
+    fn elapsed_timer_arms_only_for_active_non_idle_unarmed_feed() {
+        assert!(should_arm_elapsed(true, false, true));
+        assert!(!should_arm_elapsed(false, false, true));
+        assert!(!should_arm_elapsed(true, true, true));
+        assert!(!should_arm_elapsed(true, false, false));
     }
 }
 
@@ -180,6 +204,8 @@ pub struct UsagePage {
     dirty: bool,
     active: bool,
     last_auto_refresh: std::time::Instant,
+    /// Whether the overview's single elapsed-label repaint timer is in flight.
+    elapsed_armed: bool,
     /// Stale-overwrite guard: a reload started later always wins over one still in flight.
     generation: u64,
     /// Bumped when a load's result lands in `state` — the trend-cache key must
@@ -208,9 +234,10 @@ pub struct UsagePage {
     users: Vec<(i64, String)>,
     /// Last seen activity-feed revisions: `bootstrap_rev` seeds the key list
     /// from the pushed document; `resync` (a stream-continuity gap) falls back
-    /// to the pull reloads.
+    /// to the pull reloads; `live_revision` is the render-only lifecycle signal.
     seen_bootstrap: u64,
     seen_resync: u64,
+    seen_live_revision: u64,
     /// Whether the 客户端 dropdown is open.
     client_list_open: bool,
     /// Bucket under the cursor (the hot band + tooltip).
@@ -225,11 +252,55 @@ pub struct UsagePage {
 }
 
 impl UsagePage {
-    pub(crate) fn set_active(&mut self, active: bool) {
+    pub(crate) fn set_active(&mut self, active: bool, cx: &mut Context<Self>) {
         if self.active == active {
             return;
         }
         self.active = active;
+        if active {
+            self.arm_elapsed(cx);
+        }
+    }
+
+    /// Arm the one 500 ms elapsed-label repaint timer for the 动态 feed. It is
+    /// self-extending while this page stays active and the feed still has a
+    /// live attempt under the current 客户端 filter; otherwise it clears the
+    /// arm and exits. One timer per live stretch — never one task per event,
+    /// and it only notifies the page (no HTTP, no snapshot copies).
+    fn arm_elapsed(&mut self, cx: &mut Context<Self>) {
+        let has_live =
+            crate::pages::feed::has_live_rows(self.feed.read(cx), self.client_filter.scope());
+        if !should_arm_elapsed(self.active, self.elapsed_armed, has_live) {
+            return;
+        }
+        self.elapsed_armed = true;
+        cx.spawn(async move |this, cx| {
+            loop {
+                cx.background_executor().timer(ELAPSED_TICK).await;
+                let keep = this
+                    .update(cx, |page, cx| {
+                        if !page.active {
+                            page.elapsed_armed = false;
+                            return false;
+                        }
+                        let has_live = crate::pages::feed::has_live_rows(
+                            page.feed.read(cx),
+                            page.client_filter.scope(),
+                        );
+                        if !has_live {
+                            page.elapsed_armed = false;
+                            return false;
+                        }
+                        cx.notify();
+                        true
+                    })
+                    .unwrap_or(false);
+                if !keep {
+                    return;
+                }
+            }
+        })
+        .detach();
     }
     pub(crate) fn new(
         feed: gpui::Entity<crate::activity::ActivityFeed>,
@@ -261,6 +332,7 @@ impl UsagePage {
             dirty: false,
             active: false,
             last_auto_refresh: std::time::Instant::now(),
+            elapsed_armed: false,
             generation: 0,
             data_version: 0,
             range: UsageRange::Today,
@@ -272,6 +344,7 @@ impl UsagePage {
             users: Vec::new(),
             seen_bootstrap: feed.read(cx).bootstrap_rev(),
             seen_resync: feed.read(cx).resync(),
+            seen_live_revision: feed.read(cx).live_revision(),
             client_list_open: false,
             trend_hover: None,
             trend_emphasize: None,
@@ -318,6 +391,12 @@ impl UsagePage {
                     page.reload(cx);
                 }
             }
+            let live_revision = feed.read(cx).live_revision();
+            if live_revision != page.seen_live_revision {
+                page.seen_live_revision = live_revision;
+                page.arm_elapsed(cx);
+            }
+            page.arm_elapsed(cx);
             cx.notify();
         })
         .detach();
@@ -529,6 +608,8 @@ impl UsagePage {
                 if this.client_filter != option {
                     this.client_filter = option.clone();
                     this.reload(cx);
+                    this.arm_elapsed(cx);
+                    cx.notify();
                 } else {
                     cx.notify();
                 }
@@ -653,11 +734,10 @@ impl Render for UsagePage {
             }
         };
 
-        // The feed card is always the last child. This page has no wire-flow
-        // ticker, and the feed adds none: live rows render steady, and no repaint
-        // happens for animation's sake (the dots carry the client's colour). It
-        // reads the SAME scope the aggregates were queried with, so selecting a
-        // client narrows the live rows with the numbers above them.
+        // The feed card is always the last child. Its one page-owned 500 ms
+        // repaint timer keeps live elapsed labels current while the overview is
+        // active; it reads the SAME scope the aggregates were queried with, so
+        // selecting a client narrows the live rows with the numbers above them.
         body.child(crate::pages::feed::feed_card(
             &self.feed,
             self.client_filter.scope(),

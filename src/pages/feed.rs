@@ -88,6 +88,13 @@ pub(crate) fn feed_rows(feed: &ActivityFeed, scope: UsageScope) -> Vec<FeedRow> 
     rows
 }
 
+/// Whether the feed has any in-flight attempt in `scope` — the arm condition
+/// for the overview's elapsed-label ticker. Borrows only (no snapshot clone).
+pub(crate) fn has_live_rows(feed: &ActivityFeed, scope: UsageScope) -> bool {
+    feed.live()
+        .any(|attempt| in_scope(attempt.caller_key_id, attempt.caller_user_id, scope))
+}
+
 /// The 动态 feed card: in-flight attempts (client dot, phase + bytes) over the
 /// newest settled attempts (timestamp, status · duration · speed), most recent
 /// first, the settled rows capped by [`FEED_LIMIT`] and every row filtered to

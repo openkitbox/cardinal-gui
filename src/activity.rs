@@ -155,6 +155,10 @@ pub(crate) struct ActivityFeed {
     /// The newest batch awaiting the requests page, newest first. Taking it
     /// moves the summaries once; no cumulative ring is replayed per revision.
     persisted_requests: Vec<PersistedRequest>,
+    /// Bumped whenever the live attempt projection changes. Pages use this
+    /// revision to distinguish a lifecycle update from persisted-only events;
+    /// the feed remains the sole owner of live state.
+    live_revision: u64,
     /// Bumped whenever a dispatched attempt starts or resolves — i.e. when a
     /// key's concurrency slot is taken or released. Pages showing live
     /// occupancy reload on this (not `persisted`: a settled request has already
@@ -189,6 +193,7 @@ impl ActivityFeed {
             dirty: false,
             persisted: 0,
             persisted_requests: Vec::new(),
+            live_revision: 0,
             slot_changes: 0,
             key_inflight: HashMap::new(),
             resync: 0,
@@ -217,6 +222,12 @@ impl ActivityFeed {
 
     pub(crate) fn persisted(&self) -> u64 {
         self.persisted
+    }
+
+    /// Live-projection revision: bumped for Start, First, Progress, End and
+    /// stale-row sweeps. It is a render signal only; it never triggers I/O.
+    pub(crate) fn live_revision(&self) -> u64 {
+        self.live_revision
     }
 
     /// Move the pending summaries to their sole UI consumer. Bodies and
@@ -326,6 +337,7 @@ impl ActivityFeed {
             }
             other => {
                 self.dirty |= apply_to(&mut self.live, &mut self.order, &mut self.settled, other);
+                self.live_revision = self.live_revision.wrapping_add(1);
                 cx.notify();
             }
         }
@@ -364,6 +376,9 @@ impl ActivityFeed {
                             feed.dirty = false;
                             feed.persisted_requests.clear();
                             feed.persisted += 1;
+                        }
+                        if swept {
+                            feed.live_revision = feed.live_revision.wrapping_add(1);
                         }
                         // Re-render when there is something to show (or something just
                         // left); an idle feed needs no repaint.
@@ -579,5 +594,85 @@ fn apply_to(
         // QuotaRefreshed is applied in `apply` (it bumps `quota_rev`); the
         // live/settled state machine has nothing to do for it.
         ActivityEvent::QuotaRefreshed => false,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{LiveAttempt, apply_to};
+    use gateway::activity::{ActivityEvent, EndStatus, StartEvent};
+
+    fn start_event() -> ActivityEvent {
+        ActivityEvent::Start(Box::new(StartEvent {
+            origin: 7,
+            seq: 11,
+            client_model: "route/model".to_string(),
+            route: Some("route".to_string()),
+            account: Some("account".to_string()),
+            served_model: "model".to_string(),
+            protocol: "openai_chat".to_string(),
+            client_protocol: None,
+            effort: None,
+            caller: Some("caller".to_string()),
+            caller_key_id: Some(3),
+            caller_user_id: Some(4),
+            agent: Some("agent".to_string()),
+            key_id: Some(5),
+            stream: true,
+        }))
+    }
+
+    #[test]
+    fn progress_replaces_live_byte_snapshot_without_copying_chunks() {
+        let mut live = std::collections::HashMap::new();
+        let mut order = Vec::new();
+        let mut settled = std::collections::VecDeque::new();
+
+        assert!(apply_to(&mut live, &mut order, &mut settled, start_event(),));
+        assert!(apply_to(
+            &mut live,
+            &mut order,
+            &mut settled,
+            ActivityEvent::First { origin: 7, seq: 11 },
+        ));
+        assert!(apply_to(
+            &mut live,
+            &mut order,
+            &mut settled,
+            ActivityEvent::Progress {
+                origin: 7,
+                seq: 11,
+                bytes: 128,
+                frames: 2,
+            },
+        ));
+        let attempt: &LiveAttempt = live.get(&(7, 11)).expect("start inserted live row");
+        assert!(attempt.streaming);
+        assert_eq!(attempt.bytes, 128);
+        assert!(!apply_to(
+            &mut live,
+            &mut order,
+            &mut settled,
+            ActivityEvent::Progress {
+                origin: 7,
+                seq: 99,
+                bytes: 256,
+                frames: 3,
+            },
+        ));
+        assert_eq!(live.get(&(7, 11)).map(|attempt| attempt.bytes), Some(128));
+        assert!(apply_to(
+            &mut live,
+            &mut order,
+            &mut settled,
+            ActivityEvent::End {
+                origin: 7,
+                seq: 11,
+                status: EndStatus::Ok,
+                metrics: Default::default(),
+            },
+        ));
+        assert!(live.is_empty());
+        assert_eq!(settled.len(), 1);
     }
 }
