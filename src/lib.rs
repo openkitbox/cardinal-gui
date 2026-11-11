@@ -111,6 +111,111 @@ fn set_dock_icon() {
 #[cfg(not(target_os = "macos"))]
 fn set_dock_icon() {}
 
+#[cfg(target_os = "macos")]
+struct MotionObserver {
+    center: objc2::rc::Retained<objc2_foundation::NSNotificationCenter>,
+    token:
+        objc2::rc::Retained<objc2::runtime::ProtocolObject<dyn objc2_foundation::NSObjectProtocol>>,
+}
+
+#[cfg(target_os = "macos")]
+impl Drop for MotionObserver {
+    fn drop(&mut self) {
+        // SAFETY: The token was returned by this center's observer registration.
+        unsafe { self.center.removeObserver(self.token.as_ref()) };
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn observe_reduced_motion() -> (MotionObserver, tokio::sync::mpsc::UnboundedReceiver<()>) {
+    use block2::RcBlock;
+    use objc2_app_kit::{NSWorkspace, NSWorkspaceAccessibilityDisplayOptionsDidChangeNotification};
+    use objc2_foundation::NSNotification;
+
+    let center = NSWorkspace::sharedWorkspace().notificationCenter();
+    let (sender, receiver) = tokio::sync::mpsc::unbounded_channel();
+    let callback = RcBlock::new(move |_: std::ptr::NonNull<NSNotification>| {
+        let _ = sender.send(());
+    });
+    // SAFETY: The block is sendable (it captures only a thread-safe sender),
+    // and no object or operation queue is supplied.
+    let token = unsafe {
+        center.addObserverForName_object_queue_usingBlock(
+            Some(NSWorkspaceAccessibilityDisplayOptionsDidChangeNotification),
+            None,
+            None,
+            &callback,
+        )
+    };
+    (MotionObserver { center, token }, receiver)
+}
+
+#[cfg(target_os = "macos")]
+struct MotionSync {
+    _task: gpui::Task<()>,
+}
+
+#[cfg(target_os = "macos")]
+impl gpui::Global for MotionSync {}
+
+#[cfg(target_os = "macos")]
+fn sync_reduced_motion(cx: &mut gpui::App) {
+    use objc2_app_kit::NSWorkspace;
+
+    let (observer, mut changes) = observe_reduced_motion();
+    cx.set_reduce_motion(NSWorkspace::sharedWorkspace().accessibilityDisplayShouldReduceMotion());
+    let task = cx.spawn(async move |cx| {
+        let _observer = observer;
+        while changes.recv().await.is_some() {
+            cx.update(|cx| {
+                cx.set_reduce_motion(
+                    NSWorkspace::sharedWorkspace().accessibilityDisplayShouldReduceMotion(),
+                );
+            });
+        }
+    });
+    cx.set_global(MotionSync { _task: task });
+}
+
+#[cfg(not(target_os = "macos"))]
+fn sync_reduced_motion(_cx: &mut gpui::App) {}
+
+#[cfg(all(test, target_os = "macos"))]
+mod reduced_motion_tests {
+    #[test]
+    fn workspace_notification_stops_after_observer_drop() {
+        use objc2_app_kit::{
+            NSWorkspace, NSWorkspaceAccessibilityDisplayOptionsDidChangeNotification,
+        };
+
+        let (observer, mut changes) = super::observe_reduced_motion();
+        let center = NSWorkspace::sharedWorkspace().notificationCenter();
+        // SAFETY: This notification has no required object and is sent to its workspace center.
+        unsafe {
+            center.postNotificationName_object(
+                NSWorkspaceAccessibilityDisplayOptionsDidChangeNotification,
+                None,
+            );
+        }
+        assert!(
+            changes.try_recv().is_ok(),
+            "workspace notification must be delivered"
+        );
+        drop(observer);
+        // SAFETY: As above, no object is required for this notification.
+        unsafe {
+            center.postNotificationName_object(
+                NSWorkspaceAccessibilityDisplayOptionsDidChangeNotification,
+                None,
+            );
+        }
+        assert!(
+            changes.try_recv().is_err(),
+            "dropping the observer must unregister it"
+        );
+    }
+}
+
 /// Per-feature configs handed to the GUI by the caller: each leaf feature
 /// owns a section of the main config file (`~/.ox/config.toml`).
 pub struct Configs {
@@ -150,6 +255,7 @@ pub fn run(configs: Configs) {
             init(cx);
             apply_light_theme(cx);
             set_dock_icon();
+            sync_reduced_motion(cx);
 
             // Probe the standalone gateway on its own tokio thread before any page
             // can ask for data; an unreachable gateway is a rendered state, never a

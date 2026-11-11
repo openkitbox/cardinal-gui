@@ -124,7 +124,7 @@ fn local_midnight(tz: chrono::FixedOffset, date: NaiveDate) -> DateTime<Utc> {
 
 #[cfg(test)]
 mod tests {
-    use super::should_arm_elapsed;
+    use super::{KpiAnimation, interpolated_integer_value, interpolated_value, should_arm_elapsed};
 
     #[test]
     fn elapsed_timer_arms_only_for_active_non_idle_unarmed_feed() {
@@ -132,6 +132,334 @@ mod tests {
         assert!(!should_arm_elapsed(false, false, true));
         assert!(!should_arm_elapsed(true, true, true));
         assert!(!should_arm_elapsed(true, false, false));
+    }
+
+    #[test]
+    fn interpolated_value_preserves_fractional_precision() {
+        assert_eq!(interpolated_value(100.0, 105.0, 0.0), 100.0);
+        assert!((interpolated_value(100.0, 105.0, 0.3) - 101.5).abs() < 0.0001);
+        assert!((interpolated_value(100.0, 105.0, 0.8) - 104.0).abs() < 0.0001);
+        assert_eq!(interpolated_value(100.0, 105.0, 1.0), 105.0);
+    }
+
+    #[test]
+    fn interpolated_integer_value_rounds_and_clamps_without_f64_conversion() {
+        assert_eq!(interpolated_integer_value(100, 105, 0.3), 102);
+        assert_eq!(interpolated_integer_value(105, 100, 0.5), 103);
+        assert_eq!(
+            interpolated_integer_value(i64::MAX, i64::MAX - 1, 1.0),
+            i64::MAX - 1
+        );
+        assert_eq!(interpolated_integer_value(100, 105, -1.0), 100);
+        assert_eq!(interpolated_integer_value(100, 105, 2.0), 105);
+    }
+
+    #[test]
+    fn decimal_values_keep_fractional_precision() {
+        assert_eq!(interpolated_value(12.1, 12.9, 1.0), 12.9);
+        assert_eq!(interpolated_value(1.25, 1.75, 0.5), 1.5);
+        assert_eq!(
+            format!("{:.1}%", interpolated_value(12.1, 12.9, 0.5)),
+            "12.5%"
+        );
+        assert_eq!(
+            format!("${:.2}", interpolated_value(1.25, 1.75, 0.5)),
+            "$1.50"
+        );
+    }
+
+    #[test]
+    fn small_integer_steps_are_all_reachable_in_both_directions() {
+        for step in 0..=5 {
+            let progress = step as f32 / 5.0;
+            assert_eq!(
+                interpolated_integer_value(100, 105, progress),
+                100 + i64::from(step)
+            );
+            assert_eq!(
+                interpolated_integer_value(105, 100, progress),
+                105 - i64::from(step)
+            );
+        }
+    }
+
+    #[test]
+    fn interrupted_snapshot_starts_at_current_visible_values() {
+        let from = super::KpiValues {
+            tokens: 100,
+            requests: 100,
+            charged_microus: 100,
+            cache_rate: Some(0.1),
+            cost_usd: Some(1.0),
+            speed: None,
+        };
+        let to = super::KpiValues {
+            tokens: 105,
+            requests: 105,
+            charged_microus: 105,
+            cache_rate: Some(0.2),
+            cost_usd: Some(2.0),
+            speed: Some(5.0),
+        };
+        let visible = from.interpolate(to, 0.5);
+        assert_eq!(visible.requests, 103);
+        assert_eq!(visible.cost_usd, Some(1.5));
+        assert_eq!(visible.speed, Some(5.0));
+    }
+
+    fn values(requests: i64) -> super::KpiValues {
+        super::KpiValues {
+            tokens: requests,
+            requests,
+            charged_microus: requests,
+            cache_rate: None,
+            cost_usd: None,
+            speed: None,
+        }
+    }
+
+    #[test]
+    fn cache_meter_uses_the_same_visible_rate_as_the_text() {
+        assert_eq!(
+            super::visible_cache_rate(Some(0.25), Some(0.75)),
+            Some(0.25)
+        );
+        assert_eq!(super::visible_cache_rate(None, Some(0.75)), Some(0.75));
+        assert_eq!(super::visible_cache_rate(Some(0.25), None), None);
+        assert_eq!(super::visible_cache_rate(None, None), None);
+        let source = include_str!("usage.rs");
+        let card = source
+            .split("\nfn hit_rate_card(")
+            .nth(1)
+            .expect("card exists");
+        let card = card
+            .split("\nfn animated_value(")
+            .next()
+            .expect("card ends");
+        assert!(
+            card.contains("let pct = rate.unwrap_or(0.) as f32")
+                && card.contains("rate.map(|rate| format!"),
+            "the meter and text must use the same visible cache rate"
+        );
+    }
+
+    #[test]
+    fn interrupted_animation_uses_the_last_rendered_frame() {
+        let start = std::time::Instant::now();
+        let mut animation = KpiAnimation::default();
+        animation.update(Some(values(100)), start, true, false);
+        assert_eq!(animation.render(start, false), Some(values(100)));
+        animation.update(Some(values(200)), start, true, false);
+        let frame = animation.render(start + std::time::Duration::from_millis(90), false);
+        animation.update(
+            Some(values(300)),
+            start + std::time::Duration::from_millis(100),
+            true,
+            false,
+        );
+        assert_eq!(
+            animation.render(start + std::time::Duration::from_millis(100), false),
+            frame
+        );
+    }
+
+    #[test]
+    fn empty_hidden_and_reduced_motion_discard_animation() {
+        let start = std::time::Instant::now();
+        let mut animation = KpiAnimation::default();
+        animation.update(Some(values(100)), start, true, false);
+        animation.update(None, start, true, false);
+        animation.update(Some(values(200)), start, true, false);
+        assert_eq!(animation.render(start, false), Some(values(200)));
+        animation.update(Some(values(300)), start, true, false);
+        animation.hide();
+        assert_eq!(animation.render(start, false), Some(values(300)));
+        animation.update(Some(values(400)), start, true, true);
+        assert_eq!(animation.render(start, false), Some(values(400)));
+    }
+
+    #[test]
+    fn delayed_first_frame_does_not_replay() {
+        let start = std::time::Instant::now();
+        let mut animation = KpiAnimation::default();
+        animation.update(Some(values(100)), start, true, false);
+        assert_eq!(animation.render(start, false), Some(values(100)));
+        animation.update(Some(values(200)), start, true, false);
+        assert_eq!(
+            animation.render(start + std::time::Duration::from_secs(1), false),
+            Some(values(200))
+        );
+        assert_eq!(
+            animation.render(start + std::time::Duration::from_secs(2), false),
+            Some(values(200))
+        );
+    }
+}
+
+/// Interpolate a fractional KPI value without rounding before formatting.
+fn interpolated_value(from: f64, to: f64, progress: f32) -> f64 {
+    let progress = f64::from(progress.clamp(0.0, 1.0));
+    if progress == 1.0 {
+        return to;
+    }
+    from + (to - from) * progress
+}
+
+/// Interpolate integer counters using fixed-point arithmetic. Converting an
+/// `i64` endpoint to `f64` would skip values near the top of the integer range.
+fn interpolated_integer_value(from: i64, to: i64, progress: f32) -> i64 {
+    const SCALE: i128 = 1_000_000;
+    let progress = i128::from((progress.clamp(0.0, 1.0) * SCALE as f32).round() as i64);
+    let delta = i128::from(to) - i128::from(from);
+    let scaled = i128::from(from) * SCALE + delta * progress;
+    let rounded = if scaled >= 0 {
+        (scaled + SCALE / 2) / SCALE
+    } else {
+        (scaled - SCALE / 2) / SCALE
+    };
+    rounded as i64
+}
+
+/// Numeric values shown by the overview cards. Keeping only scalar display
+/// inputs avoids retaining or cloning the complete usage snapshot for an
+/// animation.
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct KpiValues {
+    tokens: i64,
+    requests: i64,
+    charged_microus: i64,
+    cache_rate: Option<f64>,
+    cost_usd: Option<f64>,
+    speed: Option<f64>,
+}
+
+const KPI_ANIMATION_DURATION: std::time::Duration = std::time::Duration::from_millis(450);
+
+/// Owns the one page-level animation clock. Rendering samples this state
+/// directly instead of delegating timing to an element, so an element being
+/// hidden or remounted cannot restart the animation.
+#[derive(Default)]
+struct KpiAnimation {
+    from: Option<KpiValues>,
+    target: Option<KpiValues>,
+    started: Option<std::time::Instant>,
+    displayed: Option<KpiValues>,
+}
+
+impl KpiAnimation {
+    fn update(
+        &mut self,
+        target: Option<KpiValues>,
+        now: std::time::Instant,
+        animate: bool,
+        reduce_motion: bool,
+    ) {
+        let Some(target) = target else {
+            self.from = None;
+            self.target = None;
+            self.started = None;
+            self.displayed = None;
+            return;
+        };
+        if !animate || reduce_motion || self.target.is_none() {
+            self.from = None;
+            self.target = Some(target);
+            self.started = None;
+            self.displayed = None;
+            return;
+        }
+        if self.target == Some(target) {
+            return;
+        }
+        let Some(from) = self.displayed else {
+            self.target = Some(target);
+            self.from = None;
+            self.started = None;
+            return;
+        };
+        if from == target {
+            self.from = None;
+            self.target = Some(target);
+            self.started = None;
+        } else {
+            self.from = Some(from);
+            self.target = Some(target);
+            self.started = Some(now);
+        }
+    }
+
+    fn render(&mut self, now: std::time::Instant, reduce_motion: bool) -> Option<KpiValues> {
+        let target = self.target?;
+        let Some(from) = self.from else {
+            self.displayed = Some(target);
+            return Some(target);
+        };
+        let Some(started) = self.started else {
+            return Some(target);
+        };
+        if reduce_motion {
+            self.from = None;
+            self.started = None;
+            self.displayed = Some(target);
+            return Some(target);
+        }
+        let progress = now.saturating_duration_since(started).as_secs_f32()
+            / KPI_ANIMATION_DURATION.as_secs_f32();
+        if progress >= 1.0 {
+            self.from = None;
+            self.started = None;
+            self.displayed = Some(target);
+            return Some(target);
+        }
+        let value = from.interpolate(target, progress);
+        self.displayed = Some(value);
+        Some(value)
+    }
+
+    fn is_active(&self) -> bool {
+        self.started.is_some()
+    }
+
+    fn hide(&mut self) {
+        self.from = None;
+        self.started = None;
+        self.displayed = None;
+    }
+}
+
+impl KpiValues {
+    fn from_window(window: &UsageWindow) -> Self {
+        Self {
+            tokens: window.input_tokens + window.output_tokens,
+            requests: window.requests,
+            charged_microus: window.charged_microus,
+            cache_rate: hit_rate(window),
+            cost_usd: window.cost_usd,
+            speed: speed_tokens_per_second(window),
+        }
+    }
+
+    fn interpolate(self, target: Self, progress: f32) -> Self {
+        fn optional(from: Option<f64>, to: Option<f64>, progress: f32) -> Option<f64> {
+            match (from, to) {
+                (Some(from), Some(to)) if from.is_finite() && to.is_finite() => {
+                    Some(interpolated_value(from, to, progress))
+                }
+                (_, to) => to,
+            }
+        }
+        Self {
+            tokens: interpolated_integer_value(self.tokens, target.tokens, progress),
+            requests: interpolated_integer_value(self.requests, target.requests, progress),
+            charged_microus: interpolated_integer_value(
+                self.charged_microus,
+                target.charged_microus,
+                progress,
+            ),
+            cache_rate: optional(self.cache_rate, target.cache_rate, progress),
+            cost_usd: optional(self.cost_usd, target.cost_usd, progress),
+            speed: optional(self.speed, target.speed, progress),
+        }
     }
 }
 
@@ -213,6 +541,9 @@ pub struct UsagePage {
     /// track data arrival, not request start (hover frames render mid-flight
     /// and would otherwise cache old rows under the new generation).
     pub(super) data_version: u64,
+    /// Page-owned KPI clock and the last rendered values.
+    kpi_animation: KpiAnimation,
+    kpi_timer_armed: bool,
     /// Active window (a chip preset or the picker's custom range).
     pub(super) range: UsageRange,
     /// The custom-range date picker in the tab row.
@@ -262,7 +593,10 @@ impl UsagePage {
             .reduce(false, LedgerReloadEvent::TabInvalidation);
         if active {
             self.arm_elapsed(cx);
+        } else {
+            self.kpi_animation.hide();
         }
+        cx.notify();
     }
 
     /// Hand one reload decision to the reducer and do the HTTP work it asks
@@ -333,6 +667,47 @@ impl UsagePage {
         })
         .detach();
     }
+
+    fn arm_kpi_timer(&mut self, cx: &mut Context<Self>) {
+        if !self.active || self.kpi_timer_armed || !self.kpi_animation.is_active() {
+            return;
+        }
+        self.kpi_timer_armed = true;
+        cx.spawn(async move |this, cx| {
+            loop {
+                cx.background_executor()
+                    .timer(std::time::Duration::from_millis(16))
+                    .await;
+                let keep = this
+                    .update(cx, |page, cx| {
+                        if !page.active || cx.reduce_motion() || !page.kpi_animation.is_active() {
+                            if cx.reduce_motion() {
+                                page.kpi_animation.hide();
+                                cx.notify();
+                            }
+                            page.kpi_timer_armed = false;
+                            return false;
+                        }
+                        if page
+                            .kpi_animation
+                            .started
+                            .is_some_and(|start| start.elapsed() >= KPI_ANIMATION_DURATION)
+                        {
+                            page.kpi_timer_armed = false;
+                            cx.notify();
+                            return false;
+                        }
+                        cx.notify();
+                        true
+                    })
+                    .unwrap_or(false);
+                if !keep {
+                    return;
+                }
+            }
+        })
+        .detach();
+    }
     pub(crate) fn new(
         feed: gpui::Entity<crate::activity::ActivityFeed>,
         window: &mut Window,
@@ -364,6 +739,8 @@ impl UsagePage {
             elapsed_armed: false,
             generation: 0,
             data_version: 0,
+            kpi_animation: KpiAnimation::default(),
+            kpi_timer_armed: false,
             range: UsageRange::Today,
             range_picker,
             trend_metric: TrendMetric::Tokens,
@@ -513,9 +890,22 @@ impl UsagePage {
                     return; // a newer reload is in flight; this snapshot is stale
                 }
                 page.state = match result {
-                    Ok(rows) => LoadState::Loaded(rows),
-                    Err(error) => LoadState::Failed(error),
+                    Ok(rows) => {
+                        page.kpi_animation.update(
+                            (rows.0.requests != 0).then(|| KpiValues::from_window(&rows.0)),
+                            std::time::Instant::now(),
+                            page.active,
+                            cx.reduce_motion(),
+                        );
+                        LoadState::Loaded(rows)
+                    }
+                    Err(error) => {
+                        page.kpi_animation
+                            .update(None, std::time::Instant::now(), false, false);
+                        LoadState::Failed(error)
+                    }
                 };
+                page.arm_kpi_timer(cx);
                 page.data_version += 1;
                 cx.notify();
             })
@@ -721,6 +1111,10 @@ impl Render for UsagePage {
                 // Read once: the 营收 card follows it, and the trend card coerces
                 // its metric under it.
                 let sales = crate::sales_mode::enabled();
+                let kpi = KpiValues::from_window(window);
+                let visible = self
+                    .kpi_animation
+                    .render(std::time::Instant::now(), cx.reduce_motion());
                 frame
                     .child(
                         gpui::div()
@@ -728,13 +1122,27 @@ impl Render for UsagePage {
                             .gap_4()
                             .child(kpi_card(
                                 "Token",
-                                humanize_count(window.input_tokens + window.output_tokens),
+                                animated_integer_value(
+                                    "tokens",
+                                    visible.map(|values| values.tokens),
+                                    kpi.tokens,
+                                    humanize_count,
+                                    humanize_count(kpi.tokens),
+                                    cx,
+                                ),
                                 token_sub(window),
                                 cx,
                             ))
                             .child(kpi_card(
                                 "请求",
-                                window.requests.to_string(),
+                                animated_integer_value(
+                                    "requests",
+                                    visible.map(|values| values.requests),
+                                    kpi.requests,
+                                    |value| value.to_string(),
+                                    kpi.requests.to_string(),
+                                    cx,
+                                ),
                                 requests_sub(window),
                                 cx,
                             ))
@@ -743,16 +1151,42 @@ impl Render for UsagePage {
                             .when(sales, |this| {
                                 this.child(kpi_card(
                                     "营收",
-                                    usd_microus(window.charged_microus),
+                                    animated_integer_value(
+                                        "charged",
+                                        visible.map(|values| values.charged_microus),
+                                        kpi.charged_microus,
+                                        usd_microus,
+                                        usd_microus(kpi.charged_microus),
+                                        cx,
+                                    ),
                                     "扣费合计".to_string(),
                                     cx,
                                 ))
                             })
-                            .child(hit_rate_card(window, cx))
-                            .child(kpi_card("金额", cost_value(window), cost_sub(window), cx))
+                            .child(hit_rate_card(visible, kpi, cx))
+                            .child(kpi_card(
+                                "金额",
+                                animated_value(
+                                    "cost",
+                                    visible.and_then(|values| values.cost_usd),
+                                    kpi.cost_usd,
+                                    |value| format!("${value:.2}"),
+                                    cost_value(window),
+                                    cx,
+                                ),
+                                cost_sub(window),
+                                cx,
+                            ))
                             .child(kpi_card(
                                 "输出速度",
-                                speed_value(window),
+                                animated_value(
+                                    "speed",
+                                    visible.and_then(|values| values.speed),
+                                    kpi.speed,
+                                    |value| format!("{} token/秒", value.round() as i64),
+                                    speed_value(window),
+                                    cx,
+                                ),
                                 speed_sub(window),
                                 cx,
                             )),
@@ -775,7 +1209,12 @@ impl Render for UsagePage {
 
 /// One KPI card: small muted label, big value,
 /// small muted sub line.
-fn kpi_card(label: &'static str, value: String, sub: String, cx: &gpui::App) -> gpui::Div {
+fn kpi_card(
+    label: &'static str,
+    value: gpui::AnyElement,
+    sub: String,
+    cx: &gpui::App,
+) -> gpui::Div {
     card(cx)
         .flex_1()
         .child(
@@ -784,13 +1223,7 @@ fn kpi_card(label: &'static str, value: String, sub: String, cx: &gpui::App) -> 
                 .text_color(cx.theme().muted_foreground)
                 .child(label),
         )
-        .child(
-            gpui::div()
-                .text_size(px(22.))
-                .font_weight(gpui::FontWeight::SEMIBOLD)
-                .text_color(cx.theme().foreground)
-                .child(value),
-        )
+        .child(value)
         .child(
             gpui::div()
                 .text_size(px(11.))
@@ -799,13 +1232,21 @@ fn kpi_card(label: &'static str, value: String, sub: String, cx: &gpui::App) -> 
         )
 }
 
-/// The cache hit rate card: same block shape, but a meter under the value
-/// instead of a sub line.
-fn hit_rate_card(window: &UsageWindow, cx: &gpui::App) -> gpui::Div {
-    let (value, pct) = match hit_rate(window) {
-        Some(rate) => (format!("{:.1}%", rate * 100.), rate as f32),
-        None => ("—".to_string(), 0.),
-    };
+/// Select the rate displayed for this frame, falling back to the current snapshot.
+fn visible_cache_rate(visible: Option<f64>, current: Option<f64>) -> Option<f64> {
+    match visible.zip(current) {
+        Some((visible, current)) if visible.is_finite() && current.is_finite() => Some(visible),
+        _ => current,
+    }
+}
+
+/// The cache hit rate card has a meter under the value instead of a sub line.
+fn hit_rate_card(visible: Option<KpiValues>, current: KpiValues, cx: &gpui::App) -> gpui::Div {
+    let rate = visible_cache_rate(
+        visible.and_then(|values| values.cache_rate),
+        current.cache_rate,
+    );
+    let pct = rate.unwrap_or(0.) as f32;
     card(cx)
         .flex_1()
         .child(
@@ -814,13 +1255,11 @@ fn hit_rate_card(window: &UsageWindow, cx: &gpui::App) -> gpui::Div {
                 .text_color(cx.theme().muted_foreground)
                 .child("缓存命中率"),
         )
-        .child(
-            gpui::div()
-                .text_size(px(22.))
-                .font_weight(gpui::FontWeight::SEMIBOLD)
-                .text_color(cx.theme().foreground)
-                .child(value),
-        )
+        .child(kpi_value(
+            rate.map(|rate| format!("{:.1}%", rate * 100.))
+                .unwrap_or_else(|| "—".to_string()),
+            cx,
+        ))
         .child(
             gpui::div()
                 .h(px(4.))
@@ -834,6 +1273,46 @@ fn hit_rate_card(window: &UsageWindow, cx: &gpui::App) -> gpui::Div {
                         .w(relative(pct)),
                 ),
         )
+}
+
+/// Render a KPI value, animating only when both snapshots contain a changed
+/// numeric value. The final string remains authoritative for unavailable or
+/// non-numeric values such as `—`.
+fn animated_value(
+    _name: &'static str,
+    from: Option<f64>,
+    to: Option<f64>,
+    format: impl Fn(f64) -> String + 'static,
+    final_value: String,
+    cx: &gpui::App,
+) -> gpui::AnyElement {
+    let value = match from.zip(to) {
+        Some((from, to)) if from.is_finite() && to.is_finite() => format(from),
+        _ => final_value,
+    };
+    kpi_value(value, cx)
+}
+
+fn animated_integer_value(
+    _name: &'static str,
+    from: Option<i64>,
+    to: i64,
+    format: impl Fn(i64) -> String + 'static,
+    final_value: String,
+    cx: &gpui::App,
+) -> gpui::AnyElement {
+    let _ = to;
+    kpi_value(from.map(format).unwrap_or(final_value), cx)
+}
+
+fn kpi_value(value: String, cx: &gpui::App) -> gpui::AnyElement {
+    gpui::div()
+        .text_size(px(22.))
+        .font_weight(gpui::FontWeight::SEMIBOLD)
+        .font_family("Avenir Next")
+        .text_color(cx.theme().foreground)
+        .child(value)
+        .into_any_element()
 }
 
 /// Sub line for the Token card: the breakdown. Cached is already contained
@@ -883,17 +1362,17 @@ fn hit_rate(window: &UsageWindow) -> Option<f64> {
         .then(|| window.cached_input_tokens as f64 / window.input_tokens as f64)
 }
 
-/// Output speed value: output tokens a second over successful rows'
+/// Output speed as output tokens per second over successful rows'
 /// decode windows (total_ms - ttft_ms).
+fn speed_tokens_per_second(window: &UsageWindow) -> Option<f64> {
+    (window.decode_ms > 0).then(|| window.timed_output as f64 / (window.decode_ms as f64 / 1000.))
+}
+
+/// Output speed display value.
 fn speed_value(window: &UsageWindow) -> String {
-    if window.decode_ms > 0 {
-        format!(
-            "{} token/秒",
-            (window.timed_output as f64 / (window.decode_ms as f64 / 1000.)).round() as i64
-        )
-    } else {
-        "—".to_string()
-    }
+    speed_tokens_per_second(window)
+        .map(|speed| format!("{} token/秒", speed.round() as i64))
+        .unwrap_or_else(|| "—".to_string())
 }
 
 /// Speed card sub: average whole-request duration over successful rows.
