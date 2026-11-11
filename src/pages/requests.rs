@@ -19,6 +19,10 @@ use gateway::body_log::CapturedBodies;
 use gateway::relay::trace::{DispatchTrace, SkipReason};
 use gateway::store::RequestRow;
 
+use crate::activity::{
+    LedgerReloadAction, LedgerReloadEvent, LedgerReloadState, LedgerRevisionChange,
+    LedgerRevisionObserver,
+};
 use crate::fmt::format_cost;
 use crate::fmt::usd_microus;
 use crate::pages::{LoadState, empty_card, error_card, loading_card, page_frame, refresh_button};
@@ -64,6 +68,25 @@ const PAGE_SIZE: i64 = 50;
 /// negative id is a UI-only identity, never a key for a ledger read.
 fn is_live_projection(id: i64) -> bool {
     id < 0
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum PersistedRefresh {
+    None,
+    PreviewAndReload,
+    ReloadOnly,
+}
+
+fn persisted_refresh(active: bool, has_older_cursor: bool, has_preview: bool) -> PersistedRefresh {
+    if !active {
+        PersistedRefresh::None
+    } else if has_older_cursor {
+        PersistedRefresh::ReloadOnly
+    } else if has_preview {
+        PersistedRefresh::PreviewAndReload
+    } else {
+        PersistedRefresh::ReloadOnly
+    }
 }
 
 /// Short display name for a stored protocol id (`openai_chat` → `chat`).
@@ -126,8 +149,8 @@ pub struct RequestsPage {
     /// Live-activity feed supplies persisted summaries; no automatic ledger
     /// reload is needed on the newest page.
     feed: gpui::Entity<crate::activity::ActivityFeed>,
-    seen_persisted: u64,
-    seen_resync: u64,
+    persisted_reload: LedgerReloadState,
+    revision_observer: LedgerRevisionObserver,
     active: bool,
     next_local_id: i64,
     /// Cursor of the page being loaded: None = newest page, Some(id) = rows
@@ -228,8 +251,11 @@ impl RequestsPage {
     ) -> Self {
         let this = Self {
             state: LoadState::Loading,
-            seen_persisted: feed.read(cx).persisted(),
-            seen_resync: feed.read(cx).resync(),
+            persisted_reload: LedgerReloadState::default(),
+            revision_observer: LedgerRevisionObserver::new(
+                feed.read(cx).resync(),
+                feed.read(cx).persisted(),
+            ),
             active: false,
             next_local_id: -1,
             cursor: None,
@@ -246,18 +272,29 @@ impl RequestsPage {
                 let feed = feed.read(cx);
                 (feed.persisted(), feed.resync())
             };
-            if persisted != page.seen_persisted {
-                page.seen_persisted = persisted;
-                let requests = feed.update(cx, |feed, _| feed.take_persisted_requests());
-                if page.active && page.cursor.is_none() {
-                    page.merge_persisted_rows(requests, cx);
+            match page.revision_observer.observe(resync, persisted) {
+                LedgerRevisionChange::Resync => {
+                    // Resync reloads the authoritative request page and also
+                    // consumes the current persisted revision. Do not take the
+                    // feed preview in this pass: resync already cleared it.
+                    page.apply_reload(LedgerReloadEvent::Resync, cx);
                 }
-            }
-            if resync != page.seen_resync {
-                page.seen_resync = resync;
-                if page.active {
-                    page.reload(cx);
+                LedgerRevisionChange::Persisted(revision) => {
+                    let requests = feed.update(cx, |feed, _| feed.take_persisted_requests());
+                    let refresh =
+                        persisted_refresh(page.active, page.cursor.is_some(), !requests.is_empty());
+                    match refresh {
+                        PersistedRefresh::None => {}
+                        PersistedRefresh::PreviewAndReload => {
+                            page.merge_persisted_rows(requests, cx);
+                            page.apply_reload(LedgerReloadEvent::PersistedBatch { revision }, cx);
+                        }
+                        PersistedRefresh::ReloadOnly => {
+                            page.apply_reload(LedgerReloadEvent::Persisted { revision }, cx);
+                        }
+                    }
                 }
+                LedgerRevisionChange::None => {}
             }
             cx.notify();
         })
@@ -272,11 +309,40 @@ impl RequestsPage {
             return;
         }
         self.active = active;
+        let _ = self
+            .persisted_reload
+            .reduce(false, LedgerReloadEvent::TabInvalidation);
+    }
+
+    fn apply_reload(&mut self, event: LedgerReloadEvent, cx: &mut Context<Self>) {
+        match self.persisted_reload.reduce(self.active, event) {
+            LedgerReloadAction::None => {}
+            LedgerReloadAction::ReloadNow => self.reload(cx),
+            LedgerReloadAction::Schedule(token) => {
+                cx.spawn(async move |this, cx| {
+                    cx.background_executor()
+                        .timer(crate::activity::PERSISTED_RELOAD_DEBOUNCE)
+                        .await;
+                    this.update(cx, |page, cx| {
+                        if matches!(
+                            page.persisted_reload
+                                .reduce(page.active, LedgerReloadEvent::TimerComplete(token)),
+                            LedgerReloadAction::ReloadNow
+                        ) {
+                            page.reload(cx);
+                        }
+                    })
+                    .ok();
+                })
+                .detach();
+            }
+        }
     }
 
     /// (Re)load the page at the current cursor over the HTTP admin API.
     pub(super) fn reload(&mut self, cx: &mut Context<Self>) {
         crate::pages::begin_load(&mut self.state);
+        self.persisted_reload.cancel();
         self.generation += 1;
         let generation = self.generation;
         let cursor = self.cursor;
@@ -363,7 +429,7 @@ impl RequestsPage {
             return;
         };
         self.cursor = Some(oldest);
-        self.reload(cx);
+        self.apply_reload(LedgerReloadEvent::CursorInvalidation, cx);
     }
 
     /// Back to the newest page.
@@ -372,7 +438,7 @@ impl RequestsPage {
             return;
         }
         self.cursor = None;
-        self.reload(cx);
+        self.apply_reload(LedgerReloadEvent::CursorInvalidation, cx);
     }
 
     /// Expand/collapse one row; expanding fetches the captured bodies and the
@@ -558,7 +624,9 @@ impl RequestsPage {
         vec![
             refresh_button(
                 "requests-refresh",
-                cx.listener(|this, _, _, cx| this.reload(cx)),
+                cx.listener(|this, _, _, cx| {
+                    this.apply_reload(LedgerReloadEvent::ManualReload, cx)
+                }),
             )
             .into_any_element(),
         ]
@@ -1464,5 +1532,68 @@ fn pretty_body(text: &str) -> (String, bool) {
     {
         Ok(pretty) => (pretty, true),
         Err(_) => (text.to_owned(), false),
+    }
+}
+
+#[cfg(test)]
+mod realtime_tests {
+    use super::{PersistedRefresh, persisted_refresh};
+    use crate::activity::{LedgerReloadAction, LedgerReloadEvent, LedgerReloadState};
+
+    #[test]
+    fn persisted_events_preview_newest_and_reload_active_pages() {
+        assert_eq!(
+            persisted_refresh(false, false, true),
+            PersistedRefresh::None
+        );
+        assert_eq!(
+            persisted_refresh(true, false, true),
+            PersistedRefresh::PreviewAndReload
+        );
+        assert_eq!(
+            persisted_refresh(true, true, true),
+            PersistedRefresh::ReloadOnly
+        );
+    }
+
+    #[test]
+    fn plain_persisted_reload_is_scheduled_on_newest_page() {
+        assert_eq!(
+            persisted_refresh(true, false, false),
+            PersistedRefresh::ReloadOnly
+        );
+    }
+
+    #[test]
+    fn hidden_persisted_event_skips_reload_and_older_cursor_keeps_reload_cursor() {
+        assert_eq!(
+            persisted_refresh(false, false, false),
+            PersistedRefresh::None
+        );
+        assert_eq!(
+            persisted_refresh(true, true, true),
+            PersistedRefresh::ReloadOnly
+        );
+    }
+
+    #[test]
+    fn persisted_reload_burst_coalesces_and_invalidation_cancels_stale_timer() {
+        let mut state = LedgerReloadState::default();
+        let first = match state.reduce(true, LedgerReloadEvent::Persisted { revision: 1 }) {
+            LedgerReloadAction::Schedule(token) => token,
+            action => panic!("expected scheduled reload, got {action:?}"),
+        };
+        assert_eq!(
+            state.reduce(true, LedgerReloadEvent::Persisted { revision: 2 },),
+            LedgerReloadAction::None,
+        );
+        assert_eq!(
+            state.reduce(true, LedgerReloadEvent::ManualReload),
+            LedgerReloadAction::ReloadNow,
+        );
+        assert_eq!(
+            state.reduce(true, LedgerReloadEvent::TimerComplete(first)),
+            LedgerReloadAction::None,
+        );
     }
 }

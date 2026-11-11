@@ -25,6 +25,177 @@ use crate::runtime::GatewayRuntime;
 const LIVE_TTL: Duration = Duration::from_secs(600);
 /// Safety-net poll interval: heals dropped events and ages the live labels.
 const POLL: Duration = Duration::from_secs(15);
+/// Short trailing debounce before pages reconcile persisted previews with the
+/// authoritative ledger.
+pub(crate) const PERSISTED_RELOAD_DEBOUNCE: Duration = Duration::from_millis(100);
+
+/// State token for a debounced persisted reload. Replacing or invalidating the
+/// token makes an already sleeping timer a no-op when it wakes.
+#[derive(Default)]
+pub(crate) struct PersistedReloadGuard {
+    next: u64,
+    armed: Option<u64>,
+}
+
+impl PersistedReloadGuard {
+    pub(crate) fn arm(&mut self) -> Option<u64> {
+        if self.armed.is_some() {
+            return None;
+        }
+        self.next = self.next.wrapping_add(1);
+        self.armed = Some(self.next);
+        Some(self.next)
+    }
+
+    pub(crate) fn invalidate(&mut self) {
+        self.armed = None;
+    }
+
+    pub(crate) fn complete(&mut self, token: u64) -> bool {
+        if self.armed == Some(token) {
+            self.armed = None;
+            true
+        } else {
+            false
+        }
+    }
+}
+
+/// A feed revision observed by a ledger-backed page. Resync is a separate
+/// stream-continuity signal; it does not imply a persisted ledger event.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum LedgerReloadEvent {
+    Resync,
+    Persisted {
+        revision: u64,
+    },
+    PersistedBatch {
+        revision: u64,
+    },
+    /// The page itself reloaded: the pending debounce is stale and must not
+    /// fire a second read.
+    ManualReload,
+    CursorInvalidation,
+    FilterInvalidation,
+    TabInvalidation,
+    TimerComplete(u64),
+}
+
+/// What the page must do with its HTTP reload after one [`LedgerReloadEvent`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum LedgerReloadAction {
+    None,
+    ReloadNow,
+    Schedule(u64),
+}
+
+/// The revision change a ledger-backed page should consume from one observer
+/// pass. A resync is authoritative for the persisted revision visible in that
+/// same pass, so it suppresses a second persisted action; a later persisted
+/// revision is still returned normally.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum LedgerRevisionChange {
+    None,
+    Resync,
+    Persisted(u64),
+}
+
+/// Tracks the revisions covered by each observer pass without allowing an old
+/// persisted snapshot to look new after a resync.
+#[derive(Default)]
+pub(crate) struct LedgerRevisionObserver {
+    seen_resync: u64,
+    resync_baseline: u64,
+}
+
+impl LedgerRevisionObserver {
+    pub(crate) fn new(seen_resync: u64, persisted_baseline: u64) -> Self {
+        Self {
+            seen_resync,
+            resync_baseline: persisted_baseline,
+        }
+    }
+
+    pub(crate) fn observe(&mut self, resync: u64, persisted: u64) -> LedgerRevisionChange {
+        if resync != self.seen_resync {
+            self.seen_resync = resync;
+            // The resync read is authoritative for the persisted revision visible
+            // in this same pass, but its snapshot may be older than the current
+            // baseline. Keep the upper bound so repeating that old snapshot is
+            // ignored rather than emitted as a new persisted revision.
+            self.resync_baseline = self.resync_baseline.max(persisted);
+            return LedgerRevisionChange::Resync;
+        }
+        if persisted > self.resync_baseline {
+            self.resync_baseline = persisted;
+            return LedgerRevisionChange::Persisted(persisted);
+        }
+        LedgerRevisionChange::None
+    }
+}
+
+/// Pure decision state for feed-driven ledger reloads: the pages own the HTTP
+/// orchestration, this state machine owns coalescing and cancellation.
+#[derive(Default)]
+pub(crate) struct LedgerReloadState {
+    guard: PersistedReloadGuard,
+    last_persisted_revision: Option<u64>,
+}
+
+impl LedgerReloadState {
+    pub(crate) fn cancel(&mut self) {
+        self.guard.invalidate();
+    }
+
+    pub(crate) fn reduce(&mut self, active: bool, event: LedgerReloadEvent) -> LedgerReloadAction {
+        match event {
+            LedgerReloadEvent::Resync => {
+                self.guard.invalidate();
+                if active {
+                    LedgerReloadAction::ReloadNow
+                } else {
+                    LedgerReloadAction::None
+                }
+            }
+            LedgerReloadEvent::Persisted { revision }
+            | LedgerReloadEvent::PersistedBatch { revision } => {
+                if self
+                    .last_persisted_revision
+                    .is_some_and(|last| revision <= last)
+                {
+                    return LedgerReloadAction::None;
+                }
+                self.last_persisted_revision = Some(revision);
+                if active {
+                    self.guard
+                        .arm()
+                        .map_or(LedgerReloadAction::None, LedgerReloadAction::Schedule)
+                } else {
+                    LedgerReloadAction::None
+                }
+            }
+            LedgerReloadEvent::ManualReload
+            | LedgerReloadEvent::CursorInvalidation
+            | LedgerReloadEvent::FilterInvalidation
+            | LedgerReloadEvent::TabInvalidation => {
+                self.guard.invalidate();
+                if active {
+                    LedgerReloadAction::ReloadNow
+                } else {
+                    LedgerReloadAction::None
+                }
+            }
+            LedgerReloadEvent::TimerComplete(token) => {
+                if self.guard.complete(token) && active {
+                    LedgerReloadAction::ReloadNow
+                } else {
+                    LedgerReloadAction::None
+                }
+            }
+        }
+    }
+}
+
 /// How many finished attempts the settled ring retains (newest first); the
 /// oldest are dropped past the cap. An End moves the attempt out of `live`
 /// into this buffer instead of dropping it.
@@ -248,8 +419,9 @@ impl ActivityFeed {
         &self.key_inflight
     }
 
-    /// Resync revision: bumped on a gap or a fresh subscription. Pages that
-    /// depend on a mirror re-read their source once when this changes.
+    /// A resync invalidates all client-side mirrors but does not represent a
+    /// persisted ledger update. The next independent persisted event has its
+    /// own revision and is handled normally by page observers.
     pub(crate) fn resync(&self) -> u64 {
         self.resync
     }
@@ -331,7 +503,6 @@ impl ActivityFeed {
             ActivityEvent::Resync => {
                 self.key_inflight.clear();
                 self.persisted_requests.clear();
-                self.persisted += 1;
                 self.resync += 1;
                 cx.notify();
             }
@@ -599,8 +770,268 @@ fn apply_to(
 
 #[cfg(test)]
 mod tests {
-    use super::{LiveAttempt, apply_to};
+    use super::{LedgerReloadAction, LedgerReloadEvent, LedgerReloadState, LiveAttempt, apply_to};
     use gateway::activity::{ActivityEvent, EndStatus, StartEvent};
+
+    #[test]
+    fn resync_does_not_consume_persisted_revision_namespace() {
+        let mut state = LedgerReloadState::default();
+
+        assert_eq!(
+            state.reduce(true, LedgerReloadEvent::Persisted { revision: 1 }),
+            LedgerReloadAction::Schedule(1),
+        );
+        assert_eq!(
+            state.reduce(true, LedgerReloadEvent::TimerComplete(1)),
+            LedgerReloadAction::ReloadNow,
+        );
+        assert_eq!(
+            state.reduce(true, LedgerReloadEvent::Resync),
+            LedgerReloadAction::ReloadNow,
+        );
+        assert_eq!(
+            state.reduce(true, LedgerReloadEvent::Persisted { revision: 2 }),
+            LedgerReloadAction::Schedule(2),
+        );
+    }
+
+    #[test]
+    fn persisted_revision_ordering_rejects_duplicate_old_and_out_of_order_events() {
+        let mut state = LedgerReloadState::default();
+
+        assert_eq!(
+            state.reduce(true, LedgerReloadEvent::Persisted { revision: 1 }),
+            LedgerReloadAction::Schedule(1),
+        );
+        assert_eq!(
+            state.reduce(true, LedgerReloadEvent::TimerComplete(1)),
+            LedgerReloadAction::ReloadNow,
+        );
+        assert_eq!(
+            state.reduce(true, LedgerReloadEvent::Persisted { revision: 1 }),
+            LedgerReloadAction::None,
+        );
+        assert_eq!(
+            state.reduce(true, LedgerReloadEvent::Persisted { revision: 0 }),
+            LedgerReloadAction::None,
+        );
+        assert_eq!(
+            state.reduce(true, LedgerReloadEvent::Persisted { revision: 2 }),
+            LedgerReloadAction::Schedule(2),
+        );
+        assert_eq!(
+            state.reduce(true, LedgerReloadEvent::TimerComplete(2)),
+            LedgerReloadAction::ReloadNow,
+        );
+        assert_eq!(
+            state.reduce(true, LedgerReloadEvent::Persisted { revision: 4 }),
+            LedgerReloadAction::Schedule(3),
+        );
+        assert_eq!(
+            state.reduce(true, LedgerReloadEvent::PersistedBatch { revision: 3 }),
+            LedgerReloadAction::None,
+        );
+        assert_eq!(
+            state.reduce(true, LedgerReloadEvent::TimerComplete(3)),
+            LedgerReloadAction::ReloadNow,
+        );
+    }
+
+    #[test]
+    fn persisted_then_resync_reloads_once_and_drops_the_timer() {
+        let mut state = LedgerReloadState::default();
+
+        assert_eq!(
+            state.reduce(true, LedgerReloadEvent::Persisted { revision: 1 }),
+            LedgerReloadAction::Schedule(1),
+        );
+        assert_eq!(
+            state.reduce(true, LedgerReloadEvent::Resync),
+            LedgerReloadAction::ReloadNow,
+            "the gap read also subsumes the pending debounced read",
+        );
+        assert_eq!(
+            state.reduce(true, LedgerReloadEvent::TimerComplete(1)),
+            LedgerReloadAction::None,
+        );
+    }
+
+    #[test]
+    fn coalesced_resync_and_persisted_revision_reloads_once_without_schedule() {
+        use super::{LedgerRevisionChange, LedgerRevisionObserver};
+
+        let mut observer = LedgerRevisionObserver::new(0, 0);
+        let mut state = LedgerReloadState::default();
+
+        assert_eq!(observer.observe(1, 1), LedgerRevisionChange::Resync,);
+        assert_eq!(
+            state.reduce(true, LedgerReloadEvent::Resync),
+            LedgerReloadAction::ReloadNow,
+        );
+        assert_eq!(
+            observer.observe(1, 1),
+            LedgerRevisionChange::None,
+            "the persisted revision observed in the same pass is already covered by resync",
+        );
+        assert_eq!(
+            observer.observe(1, 2),
+            LedgerRevisionChange::Persisted(2),
+            "a later observer pass still schedules a newer persisted revision",
+        );
+        assert_eq!(
+            state.reduce(true, LedgerReloadEvent::Persisted { revision: 2 }),
+            LedgerReloadAction::Schedule(1),
+        );
+    }
+
+    #[test]
+    fn repeated_resync_snapshot_does_not_reload_persisted_twice() {
+        use super::{LedgerRevisionChange, LedgerRevisionObserver};
+
+        let mut observer = LedgerRevisionObserver::new(0, 0);
+
+        assert_eq!(observer.observe(1, 4), LedgerRevisionChange::Resync,);
+        assert_eq!(
+            observer.observe(1, 4),
+            LedgerRevisionChange::None,
+            "the same resync/persisted snapshot must not emit a second reload",
+        );
+    }
+
+    #[test]
+    fn independent_persisted_revision_after_resync_is_scheduled_once() {
+        use super::{LedgerRevisionChange, LedgerRevisionObserver};
+
+        let mut observer = LedgerRevisionObserver::new(0, 0);
+
+        assert_eq!(observer.observe(1, 4), LedgerRevisionChange::Resync,);
+        assert_eq!(observer.observe(1, 5), LedgerRevisionChange::Persisted(5),);
+        assert_eq!(observer.observe(1, 5), LedgerRevisionChange::None,);
+    }
+
+    #[test]
+    fn resync_does_not_regress_persisted_baseline() {
+        use super::{LedgerRevisionChange, LedgerRevisionObserver};
+
+        let mut observer = LedgerRevisionObserver::new(0, 4);
+
+        assert_eq!(observer.observe(1, 3), LedgerRevisionChange::Resync,);
+        assert_eq!(
+            observer.observe(1, 4),
+            LedgerRevisionChange::None,
+            "a resync snapshot must not make an already observed revision look new",
+        );
+    }
+
+    #[test]
+    fn repeated_old_resync_snapshot_does_not_emit_persisted_revision() {
+        use super::{LedgerRevisionChange, LedgerRevisionObserver};
+
+        let mut observer = LedgerRevisionObserver::new(0, 4);
+
+        assert_eq!(observer.observe(1, 3), LedgerRevisionChange::Resync,);
+        assert_eq!(
+            observer.observe(1, 3),
+            LedgerRevisionChange::None,
+            "repeating the old resync snapshot must not emit its lower persisted revision",
+        );
+    }
+
+    #[test]
+    fn hidden_page_consumes_resync_and_persisted_without_reading() {
+        let mut state = LedgerReloadState::default();
+
+        assert_eq!(
+            state.reduce(false, LedgerReloadEvent::Resync),
+            LedgerReloadAction::None,
+        );
+        assert_eq!(
+            state.reduce(false, LedgerReloadEvent::Persisted { revision: 2 }),
+            LedgerReloadAction::None,
+        );
+        assert_eq!(
+            state.reduce(true, LedgerReloadEvent::Persisted { revision: 3 }),
+            LedgerReloadAction::Schedule(1),
+            "a newer persisted revision schedules one reload after activation",
+        );
+    }
+
+    #[test]
+    fn ledger_reload_reducer_coalesces_feed_and_ui_events() {
+        let mut state = LedgerReloadState::default();
+
+        assert_eq!(
+            state.reduce(true, LedgerReloadEvent::Persisted { revision: 1 },),
+            LedgerReloadAction::Schedule(1),
+        );
+        assert_eq!(
+            state.reduce(true, LedgerReloadEvent::PersistedBatch { revision: 2 },),
+            LedgerReloadAction::None,
+        );
+        assert_eq!(
+            state.reduce(true, LedgerReloadEvent::Resync,),
+            LedgerReloadAction::ReloadNow,
+        );
+        assert_eq!(
+            state.reduce(true, LedgerReloadEvent::Persisted { revision: 3 },),
+            LedgerReloadAction::Schedule(2),
+        );
+        assert_eq!(
+            state.reduce(true, LedgerReloadEvent::TimerComplete(1)),
+            LedgerReloadAction::None,
+        );
+
+        assert_eq!(
+            state.reduce(true, LedgerReloadEvent::Resync),
+            LedgerReloadAction::ReloadNow,
+        );
+        assert_eq!(
+            state.reduce(true, LedgerReloadEvent::Persisted { revision: 4 },),
+            LedgerReloadAction::Schedule(3),
+        );
+
+        assert_eq!(
+            state.reduce(true, LedgerReloadEvent::ManualReload),
+            LedgerReloadAction::ReloadNow,
+        );
+        assert_eq!(
+            state.reduce(true, LedgerReloadEvent::Persisted { revision: 5 },),
+            LedgerReloadAction::Schedule(4),
+        );
+        assert_eq!(
+            state.reduce(true, LedgerReloadEvent::CursorInvalidation),
+            LedgerReloadAction::ReloadNow,
+        );
+        assert_eq!(
+            state.reduce(true, LedgerReloadEvent::TimerComplete(4)),
+            LedgerReloadAction::None,
+        );
+
+        assert_eq!(
+            state.reduce(true, LedgerReloadEvent::Persisted { revision: 6 },),
+            LedgerReloadAction::Schedule(5),
+        );
+        assert_eq!(
+            state.reduce(true, LedgerReloadEvent::FilterInvalidation),
+            LedgerReloadAction::ReloadNow,
+        );
+        assert_eq!(
+            state.reduce(true, LedgerReloadEvent::TimerComplete(5)),
+            LedgerReloadAction::None,
+        );
+        assert_eq!(
+            state.reduce(true, LedgerReloadEvent::Persisted { revision: 7 },),
+            LedgerReloadAction::Schedule(6),
+        );
+        assert_eq!(
+            state.reduce(true, LedgerReloadEvent::TabInvalidation),
+            LedgerReloadAction::ReloadNow,
+        );
+        assert_eq!(
+            state.reduce(true, LedgerReloadEvent::TimerComplete(6)),
+            LedgerReloadAction::None,
+        );
+    }
 
     fn start_event() -> ActivityEvent {
         ActivityEvent::Start(Box::new(StartEvent {

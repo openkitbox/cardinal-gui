@@ -23,6 +23,10 @@ use gpui_kit::component::date_picker::{
 use gateway::http_client::UsageScope;
 use gateway::store::{GatewayKeyRow, OWNER_LOGIN, TrendRow, TrendSplit, UsageWindow, UserRow};
 
+use crate::activity::{
+    LedgerReloadAction, LedgerReloadEvent, LedgerReloadState, LedgerRevisionChange,
+    LedgerRevisionObserver,
+};
 use crate::fmt::{humanize_count, usd_microus};
 use crate::pages::usage_trend::{TrendData, TrendGeometryCell, TrendMetric};
 use crate::pages::{
@@ -198,12 +202,9 @@ pub struct UsagePage {
     state: LoadState<(UsageWindow, Vec<TrendRow>, ResolvedRange)>,
     /// Live-activity feed: a Persisted event schedules a debounced reload.
     feed: gpui::Entity<crate::activity::ActivityFeed>,
-    /// Persisted batches mark the aggregate dirty; a low-frequency refresh
-    /// reconciles it only while this tab is active.
-    seen_persisted: u64,
-    dirty: bool,
     active: bool,
-    last_auto_refresh: std::time::Instant,
+    persisted_reload: LedgerReloadState,
+    revision_observer: LedgerRevisionObserver,
     /// Whether the overview's single elapsed-label repaint timer is in flight.
     elapsed_armed: bool,
     /// Stale-overwrite guard: a reload started later always wins over one still in flight.
@@ -236,7 +237,6 @@ pub struct UsagePage {
     /// from the pushed document; `resync` (a stream-continuity gap) falls back
     /// to the pull reloads; `live_revision` is the render-only lifecycle signal.
     seen_bootstrap: u64,
-    seen_resync: u64,
     seen_live_revision: u64,
     /// Whether the 客户端 dropdown is open.
     client_list_open: bool,
@@ -257,8 +257,39 @@ impl UsagePage {
             return;
         }
         self.active = active;
+        let _ = self
+            .persisted_reload
+            .reduce(false, LedgerReloadEvent::TabInvalidation);
         if active {
             self.arm_elapsed(cx);
+        }
+    }
+
+    /// Hand one reload decision to the reducer and do the HTTP work it asks
+    /// for: `ReloadNow` reads immediately, `Schedule` arms the trailing
+    /// debounce shared by a burst of persisted batches.
+    fn apply_reload(&mut self, event: LedgerReloadEvent, cx: &mut Context<Self>) {
+        match self.persisted_reload.reduce(self.active, event) {
+            LedgerReloadAction::None => {}
+            LedgerReloadAction::ReloadNow => self.reload(cx),
+            LedgerReloadAction::Schedule(token) => {
+                cx.spawn(async move |this, cx| {
+                    cx.background_executor()
+                        .timer(crate::activity::PERSISTED_RELOAD_DEBOUNCE)
+                        .await;
+                    this.update(cx, |page, cx| {
+                        if matches!(
+                            page.persisted_reload
+                                .reduce(page.active, LedgerReloadEvent::TimerComplete(token)),
+                            LedgerReloadAction::ReloadNow
+                        ) {
+                            page.reload(cx);
+                        }
+                    })
+                    .ok();
+                })
+                .detach();
+            }
         }
     }
 
@@ -321,17 +352,15 @@ impl UsagePage {
                 let range = UsageRange::Custom(start.date(), end.date());
                 if page.range != range {
                     page.range = range;
-                    page.reload(cx);
+                    page.apply_reload(LedgerReloadEvent::FilterInvalidation, cx);
                 }
             },
         )
         .detach();
         let mut this = Self {
             state: LoadState::Loading,
-            seen_persisted: feed.read(cx).persisted(),
-            dirty: false,
             active: false,
-            last_auto_refresh: std::time::Instant::now(),
+            persisted_reload: LedgerReloadState::default(),
             elapsed_armed: false,
             generation: 0,
             data_version: 0,
@@ -343,7 +372,10 @@ impl UsagePage {
             keys: Vec::new(),
             users: Vec::new(),
             seen_bootstrap: feed.read(cx).bootstrap_rev(),
-            seen_resync: feed.read(cx).resync(),
+            revision_observer: LedgerRevisionObserver::new(
+                feed.read(cx).resync(),
+                feed.read(cx).persisted(),
+            ),
             seen_live_revision: feed.read(cx).live_revision(),
             client_list_open: false,
             trend_hover: None,
@@ -352,9 +384,8 @@ impl UsagePage {
             trend_cache: TrendCache::new(None),
             feed,
         };
-        // Persisted batches only mark aggregates dirty. An active page may
-        // reconcile after the five-minute interval; a hidden page never reads
-        // automatically. Other events still repaint the live block.
+        // Persisted batches schedule a short trailing authoritative reload only
+        // while this page is active. Other events still repaint the live block.
         cx.observe(&this.feed.clone(), |page, feed, cx| {
             // Seed the dropdown from the pushed document. The Status container
             // owns the initial aggregate load; bootstrap only refreshes labels.
@@ -368,28 +399,23 @@ impl UsagePage {
                     page.reload_users(cx);
                 }
             }
-            // A stream-continuity gap: the mirrors may be stale — fall back to
-            // pulling (labels AND aggregates).
             let resync = feed.read(cx).resync();
-            if resync != page.seen_resync {
-                page.seen_resync = resync;
-                if page.active {
-                    page.reload_keys(cx);
-                    page.reload_users(cx);
-                    page.reload(cx);
-                }
-            }
             let persisted = feed.read(cx).persisted();
-            if persisted != page.seen_persisted {
-                page.seen_persisted = persisted;
-                page.dirty = true;
-                if page.active
-                    && page.last_auto_refresh.elapsed() >= std::time::Duration::from_secs(300)
-                {
-                    page.last_auto_refresh = std::time::Instant::now();
-                    page.dirty = false;
-                    page.reload(cx);
+            match page.revision_observer.observe(resync, persisted) {
+                LedgerRevisionChange::Resync => {
+                    // The resync read is authoritative for the persisted
+                    // revision observed in this pass; a later pass with a
+                    // newer revision can still arm the debounce.
+                    if page.active {
+                        page.reload_keys(cx);
+                        page.reload_users(cx);
+                    }
+                    page.apply_reload(LedgerReloadEvent::Resync, cx);
                 }
+                LedgerRevisionChange::Persisted(revision) => {
+                    page.apply_reload(LedgerReloadEvent::Persisted { revision }, cx);
+                }
+                LedgerRevisionChange::None => {}
             }
             let live_revision = feed.read(cx).live_revision();
             if live_revision != page.seen_live_revision {
@@ -456,6 +482,7 @@ impl UsagePage {
     /// range resolves at call time, so a preset's `now` stays live across
     /// feed-driven reloads.
     pub(super) fn reload(&mut self, cx: &mut Context<Self>) {
+        self.persisted_reload.cancel();
         crate::pages::begin_load(&mut self.state);
         self.generation += 1;
         let generation = self.generation;
@@ -607,7 +634,7 @@ impl UsagePage {
                 this.client_list_open = false;
                 if this.client_filter != option {
                     this.client_filter = option.clone();
-                    this.reload(cx);
+                    this.apply_reload(LedgerReloadEvent::FilterInvalidation, cx);
                     this.arm_elapsed(cx);
                     cx.notify();
                 } else {
@@ -637,7 +664,7 @@ impl UsagePage {
                             this.range_picker.update(cx, |picker, cx| {
                                 picker.set_date(PickerDate::Range(None, None), window, cx)
                             });
-                            this.reload(cx);
+                            this.apply_reload(LedgerReloadEvent::FilterInvalidation, cx);
                         }
                     }));
                     if range == self.range {
@@ -664,7 +691,7 @@ impl UsagePage {
                 cx.listener(|this, _, _, cx| {
                     this.reload_keys(cx);
                     this.reload_users(cx);
-                    this.reload(cx);
+                    this.apply_reload(LedgerReloadEvent::ManualReload, cx);
                 }),
             )
             .into_any_element(),

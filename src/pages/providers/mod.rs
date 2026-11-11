@@ -715,6 +715,12 @@ pub struct ProvidersPage {
     active: bool,
 }
 
+fn consume_resync_revision(active: bool, seen: &mut u64, current: u64) -> bool {
+    let changed = current != *seen;
+    *seen = current;
+    active && changed
+}
+
 impl ProvidersPage {
     pub(crate) fn set_active(&mut self, active: bool) {
         if self.active == active {
@@ -761,8 +767,7 @@ impl ProvidersPage {
                 cx.notify();
             }
             let resync = feed.read(cx).resync();
-            if page.active && resync != page.seen_resync {
-                page.seen_resync = resync;
+            if consume_resync_revision(page.active, &mut page.seen_resync, resync) {
                 page.reload(cx);
             }
             // The gateway's background prober persisted fresh quota snapshots;
@@ -2997,5 +3002,24 @@ fn toggle_selection<T: PartialEq + Clone>(selected: &mut Vec<T>, item: &T) {
         selected.remove(index);
     } else {
         selected.push(item.clone());
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::consume_resync_revision;
+
+    #[test]
+    fn hidden_resync_is_consumed_before_activation() {
+        let mut seen = 0;
+
+        assert!(!consume_resync_revision(false, &mut seen, 1));
+        assert_eq!(seen, 1);
+        assert!(
+            !consume_resync_revision(true, &mut seen, 1),
+            "activation must not replay the hidden resync"
+        );
+        assert!(consume_resync_revision(true, &mut seen, 2));
+        assert!(!consume_resync_revision(true, &mut seen, 2));
     }
 }
