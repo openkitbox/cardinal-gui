@@ -263,6 +263,7 @@ struct ItemDraft {
     /// in one (route, key, model) slot (empty = unlimited at the item level;
     /// the account's own cap still applies).
     cap: Entity<InputState>,
+    weight: Entity<InputState>,
     /// Ordered availability rules (top = highest priority).
     rules: Vec<RuleDraft>,
 }
@@ -326,6 +327,7 @@ struct SelectionDraft {
     account: String,
     label: String,
     cap: String,
+    weight: String,
     rules: Vec<RuleSelection>,
 }
 
@@ -406,9 +408,16 @@ fn route_entries(drafts: &[SelectionDraft]) -> Result<Vec<RouteEntry>, String> {
         } else {
             Some(draft.label.clone())
         };
+        let weight = draft
+            .weight
+            .parse::<u16>()
+            .ok()
+            .filter(|n| (1..=1000).contains(n))
+            .ok_or_else(|| format!("{row} 的权重必须是 1–1000 的整数"))?;
         entries.push(RouteEntry {
             key_id: draft.key_id,
             model: draft.model.clone(),
+            weight,
             label,
             max_concurrency,
             rules,
@@ -444,14 +453,23 @@ fn rule_draft(window: &mut Window, cx: &mut App) -> RuleDraft {
 }
 
 /// Fresh inputs for one route item (defaults; editing pre-fills afterwards).
-fn item_draft(key_id: i64, model: String, window: &mut Window, cx: &mut App) -> ItemDraft {
+fn item_draft(
+    key_id: i64,
+    model: String,
+    window: &mut Window,
+    cx: &mut Context<RoutesPage>,
+) -> ItemDraft {
     let label = cx.new(|cx| InputState::new(window, cx).placeholder("空 = 模型 ID"));
     let cap = cx.new(|cx| InputState::new(window, cx).placeholder("不限"));
+    let weight = cx.new(|cx| InputState::new(window, cx).placeholder("1"));
+    weight.update(cx, |input, cx| input.set_value("1", window, cx));
+    cx.observe(&weight, |_, _, cx| cx.notify()).detach();
     ItemDraft {
         key_id,
         model,
         label,
         cap,
+        weight,
         rules: Vec::new(),
     }
 }
@@ -661,6 +679,9 @@ impl RoutesPage {
                     .iter()
                     .map(|entry| {
                         let mut draft = item_draft(entry.key_id, entry.model.clone(), window, cx);
+                        draft.weight.update(cx, |input, cx| {
+                            input.set_value(entry.weight.to_string(), window, cx)
+                        });
                         if let Some(text) = &entry.label {
                             draft
                                 .label
@@ -892,6 +913,7 @@ impl RoutesPage {
                 account: account_context(accounts, item.key_id),
                 label: item.label.read(cx).value().trim().to_string(),
                 cap: item.cap.read(cx).value().trim().to_string(),
+                weight: item.weight.read(cx).value().trim().to_string(),
                 rules: item
                     .rules
                     .iter()
@@ -1287,12 +1309,13 @@ impl RoutesPage {
           .items_center()
           .gap_2()
           .child(gpui::div().w(px(72.)).flex_shrink_0().text_color(cx.theme().muted_foreground).child("策略"))
-          .children([RouteStrategy::Ordered, RouteStrategy::Smart, RouteStrategy::Rotate].into_iter().map(|strategy| {
+          .children([RouteStrategy::Ordered, RouteStrategy::Smart, RouteStrategy::Rotate, RouteStrategy::Weighted].into_iter().map(|strategy| {
             let selected = editor.strategy == strategy;
             let label = match strategy {
               RouteStrategy::Ordered => "顺序",
               RouteStrategy::Smart => "智能",
               RouteStrategy::Rotate => "交替",
+              RouteStrategy::Weighted => "加权",
             };
             let chip = gpui::div()
               .id(ElementId::from(gpui::SharedString::from(format!("route-strategy-{label}"))))
@@ -1318,10 +1341,13 @@ impl RoutesPage {
               cx.notify();
             }))
           }))
-          .child(gpui::div().text_size(px(12.)).text_color(cx.theme().muted_foreground).child("顺序/智能/交替 决定条目之间的派发先后；每个条目 = 一个账号 × 一个模型")),
+          .child(gpui::div().text_size(px(12.)).text_color(cx.theme().muted_foreground).child("每个条目 = 一个账号 × 一个模型")),
       )
       .when(editor.strategy == RouteStrategy::Ordered, |this| {
         this.child(gpui::div().text_size(px(12.)).text_color(cx.theme().muted_foreground).child("列表顺序 = 派发顺序（用 ▲▼ 或拖拽调整）"))
+      })
+      .when(editor.strategy == RouteStrategy::Weighted, |this| {
+        this.child(gpui::div().text_size(px(12.)).text_color(cx.theme().muted_foreground).child("权重为 1–1000 的整数，默认 1；比例为全部条目的静态首选目标。冷却、并发限制及失败回退会改变实际分配，不代表成功、token 或费用比例。其他策略不使用权重。"))
       })
       // The route itself: one flat list of items, each an account on one model
       // with its own label input and remove button.
@@ -1456,6 +1482,20 @@ impl RoutesPage {
               )
               .child(gpui::div().w(px(72.)).flex_shrink_0().child(Input::new(&item.cap))),
           )
+          .child({
+            let weights: Option<Vec<u16>> = editor.items.iter().map(|entry| {
+              entry.weight.read(cx).value().trim().parse::<u16>().ok().filter(|n| (1..=1000).contains(n))
+            }).collect();
+            let share = weights.as_ref().and_then(|weights| {
+              let total: u64 = weights.iter().map(|&weight| u64::from(weight)).sum();
+              weights.get(index).filter(|_| total > 0).map(|weight| format!("目标 {:.1}%", f64::from(*weight) * 100.0 / total as f64))
+            }).unwrap_or_else(|| "输入有效权重后显示比例".to_string());
+            let hint = if editor.strategy == RouteStrategy::Weighted { share } else { "当前策略不使用权重（保存时保留）".to_string() };
+            gpui::div().flex().items_center().gap_2()
+              .child(field_label("权重", cx))
+              .child(gpui::div().w(px(72.)).flex_shrink_0().child(Input::new(&item.weight)))
+              .child(gpui::div().text_size(px(12.)).text_color(cx.theme().muted_foreground).child(hint))
+          })
           .child(
             gpui::div()
               .flex()

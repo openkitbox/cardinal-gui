@@ -976,6 +976,7 @@ impl RoutesPage {
                 let label = match route.strategy {
                     RouteStrategy::Smart => "智能",
                     RouteStrategy::Rotate => "交替",
+                    RouteStrategy::Weighted => "加权",
                     RouteStrategy::Ordered => unreachable!(),
                 };
                 this.child(Tag::secondary().child(label))
