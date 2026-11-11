@@ -41,11 +41,12 @@ const RECENT_LIMIT: usize = 30;
 
 /// The context-window choices the route editor offers, single-select.
 /// Values are the vendors' declared numbers (OpenAI 128k, Anthropic 200k,
-/// Kimi 256k, Gemini 1M).
-const CONTEXT_PRESETS: [(i64, &str); 4] = [
+/// Kimi 256k, 600k, Gemini 1M).
+const CONTEXT_PRESETS: [(i64, &str); 5] = [
     (128_000, "128k"),
     (200_000, "200k"),
     (262_144, "256k"),
+    (600_000, "600k"),
     (1_048_576, "1M"),
 ];
 
