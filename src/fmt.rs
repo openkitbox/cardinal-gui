@@ -17,9 +17,8 @@ pub(crate) fn mask_api_key(key: &str) -> String {
     }
 }
 
-/// Mask an email for display: keep the first two characters of the local part
-/// and the whole domain (`jo***@qq.com`), so the account stays recognizable
-/// without spelling it out on a shared screen.
+/// Mask an email for display, retaining two local characters, the first domain
+/// character and the domain suffix (`jo***@q***.com`).
 pub(crate) fn mask_email(email: &str) -> String {
     let (local, domain) = match email.split_once('@') {
         Some((local, domain)) => (local, Some(domain)),
@@ -27,7 +26,15 @@ pub(crate) fn mask_email(email: &str) -> String {
     };
     let head: String = local.chars().take(2).collect();
     match domain {
-        Some(domain) => format!("{head}***@{domain}"),
+        Some(domain) => {
+            let (name, suffix) = domain.rsplit_once('.').unwrap_or((domain, ""));
+            let first: String = name.chars().take(1).collect();
+            if suffix.is_empty() {
+                format!("{head}***@{first}***")
+            } else {
+                format!("{head}***@{first}***.{suffix}")
+            }
+        }
         None => format!("{head}***"),
     }
 }

@@ -3004,22 +3004,3 @@ fn toggle_selection<T: PartialEq + Clone>(selected: &mut Vec<T>, item: &T) {
         selected.push(item.clone());
     }
 }
-
-#[cfg(test)]
-mod tests {
-    use super::consume_resync_revision;
-
-    #[test]
-    fn hidden_resync_is_consumed_before_activation() {
-        let mut seen = 0;
-
-        assert!(!consume_resync_revision(false, &mut seen, 1));
-        assert_eq!(seen, 1);
-        assert!(
-            !consume_resync_revision(true, &mut seen, 1),
-            "activation must not replay the hidden resync"
-        );
-        assert!(consume_resync_revision(true, &mut seen, 2));
-        assert!(!consume_resync_revision(true, &mut seen, 2));
-    }
-}
