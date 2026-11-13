@@ -28,6 +28,20 @@ use std::time::Duration;
 use gateway::http_client::{GatewayHttpClient, UNREACHABLE_MESSAGE};
 use tokio::sync::watch;
 
+struct AbortOnDrop(tokio::task::AbortHandle);
+
+impl Drop for AbortOnDrop {
+    fn drop(&mut self) {
+        self.0.abort();
+    }
+}
+
+#[derive(Clone, Copy)]
+enum CancelPolicy {
+    Detach,
+    Abort,
+}
+
 /// How the gateway relates to this process, for the status bar.
 #[derive(Clone)]
 pub(crate) enum RelayMode {
@@ -249,33 +263,91 @@ impl GatewayRuntime {
         let link = self.link.clone();
         let failure = self.failure.clone();
         let link_down = self.link_down.clone();
-        async move {
-            let state = Self::resolved_link(link, failure).await?;
-            let (Some(handle), Some(client)) = (handle, client) else {
-                return Err("admin runtime unavailable".to_string());
-            };
-            if state != Link::Connected {
-                return Err(UNREACHABLE_MESSAGE.to_string());
+        Self::admin_call_inner(
+            handle,
+            client,
+            link,
+            failure,
+            link_down,
+            f,
+            CancelPolicy::Detach,
+        )
+    }
+
+    /// Run one admin read whose Tokio task is aborted when the caller drops the
+    /// returned future. Cancellation is cooperative: aborting the client-side
+    /// future cannot guarantee that a request already received by the gateway
+    /// stops its SQL immediately. Writes deliberately use [`Self::admin_call`]
+    /// instead, so dropping a page task does not cancel a mutation already
+    /// accepted by the gateway.
+    pub(crate) fn admin_call_cancellable<T, F, Fut>(
+        &self,
+        f: F,
+    ) -> impl Future<Output = Result<T, String>> + 'static
+    where
+        T: Send + 'static,
+        F: FnOnce(GatewayHttpClient) -> Fut + Send + 'static,
+        Fut: Future<Output = Result<T, gateway::http_client::ClientError>> + Send + 'static,
+    {
+        let handle = self.handle.clone();
+        let client = self.client.clone();
+        let link = self.link.clone();
+        let failure = self.failure.clone();
+        let link_down = self.link_down.clone();
+        Self::admin_call_inner(
+            handle,
+            client,
+            link,
+            failure,
+            link_down,
+            f,
+            CancelPolicy::Abort,
+        )
+    }
+
+    async fn admin_call_inner<T, F, Fut>(
+        handle: Option<tokio::runtime::Handle>,
+        client: Option<GatewayHttpClient>,
+        link: watch::Receiver<Link>,
+        failure: Option<Arc<str>>,
+        link_down: Arc<AtomicBool>,
+        f: F,
+        cancel_policy: CancelPolicy,
+    ) -> Result<T, String>
+    where
+        T: Send + 'static,
+        F: FnOnce(GatewayHttpClient) -> Fut + Send + 'static,
+        Fut: Future<Output = Result<T, gateway::http_client::ClientError>> + Send + 'static,
+    {
+        let state = Self::resolved_link(link, failure).await?;
+        let (Some(handle), Some(client)) = (handle, client) else {
+            return Err("admin runtime unavailable".to_string());
+        };
+        if state != Link::Connected {
+            return Err(UNREACHABLE_MESSAGE.to_string());
+        }
+        let task = handle.spawn(f(client));
+        let _abort_on_drop = match cancel_policy {
+            CancelPolicy::Detach => None,
+            CancelPolicy::Abort => Some(AbortOnDrop(task.abort_handle())),
+        };
+        match task.await {
+            Ok(Ok(value)) => {
+                link_down.store(false, Ordering::Relaxed); // the link answered; heal the status bar
+                Ok(value)
             }
-            let (tx, rx) = tokio::sync::oneshot::channel();
-            drop(handle.spawn(async move {
-                let _ = tx.send(f(client).await);
-            }));
-            match rx.await {
-                Ok(Ok(value)) => {
-                    link_down.store(false, Ordering::Relaxed); // the link answered; heal the status bar
-                    Ok(value)
-                }
-                Ok(Err(error)) if error.is_unreachable() => {
-                    // The gateway died mid-session: surface the guidance message (not
-                    // a raw "request failed") and flag the link so the status bar
-                    // turns red even though the one-shot probe resolved Connected.
-                    link_down.store(true, Ordering::Relaxed);
-                    Err(UNREACHABLE_MESSAGE.to_string())
-                }
-                Ok(Err(error)) => Err(format!("{error:#}")),
-                Err(_) => Err("admin runtime stopped mid-query".to_string()),
+            Ok(Err(error)) if error.is_unreachable() => {
+                // The gateway died mid-session: surface the guidance message (not
+                // a raw "request failed") and flag the link so the status bar
+                // turns red even though the one-shot probe resolved Connected.
+                link_down.store(true, Ordering::Relaxed);
+                Err(UNREACHABLE_MESSAGE.to_string())
             }
+            Ok(Err(error)) => Err(format!("{error:#}")),
+            Err(error) if matches!(cancel_policy, CancelPolicy::Abort) && error.is_cancelled() => {
+                Err("admin query cancelled".to_string())
+            }
+            Err(_) => Err("admin runtime stopped mid-query".to_string()),
         }
     }
 

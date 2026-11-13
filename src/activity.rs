@@ -25,9 +25,11 @@ use crate::runtime::GatewayRuntime;
 const LIVE_TTL: Duration = Duration::from_secs(600);
 /// Safety-net poll interval: heals dropped events and ages the live labels.
 const POLL: Duration = Duration::from_secs(15);
-/// Short trailing debounce before pages reconcile persisted previews with the
-/// authoritative ledger.
+/// Short debounce before the first persisted Usage reload reconciles its preview
+/// with the authoritative ledger.
 pub(crate) const PERSISTED_RELOAD_DEBOUNCE: Duration = Duration::from_millis(100);
+/// Trailing delay after a Usage load completes before retrying a dirty load.
+pub(crate) const USAGE_TRAILING_RELOAD_DELAY: Duration = Duration::from_secs(15);
 
 /// State token for a debounced persisted reload. Replacing or invalidating the
 /// token makes an already sleeping timer a no-op when it wakes.
@@ -76,7 +78,6 @@ pub(crate) enum LedgerReloadEvent {
     /// fire a second read.
     ManualReload,
     CursorInvalidation,
-    FilterInvalidation,
     TabInvalidation,
     TimerComplete(u64),
 }
@@ -176,7 +177,6 @@ impl LedgerReloadState {
             }
             LedgerReloadEvent::ManualReload
             | LedgerReloadEvent::CursorInvalidation
-            | LedgerReloadEvent::FilterInvalidation
             | LedgerReloadEvent::TabInvalidation => {
                 self.guard.invalidate();
                 if active {
@@ -193,6 +193,118 @@ impl LedgerReloadState {
                 }
             }
         }
+    }
+}
+
+/// A pure single-flight coordinator for the Usage page's heavier aggregate load.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum UsageReloadEvent {
+    Persisted,
+    Manual,
+    Resync,
+    LoadStarted,
+    LoadFinished,
+    Deactivate,
+    TimerComplete(u64),
+}
+
+/// The I/O decision for one Usage reload event.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum UsageReloadAction {
+    None,
+    ReloadNow,
+    Schedule { token: u64, delay: Duration },
+}
+
+/// Pure coordinator for the Usage page's single-flight aggregate query.
+/// RequestsPage deliberately continues to use [`LedgerReloadState`], whose
+/// short persisted debounce is appropriate for its lighter query.
+#[derive(Default)]
+pub(crate) struct UsageReloadState {
+    in_flight: bool,
+    dirty: bool,
+    next_timer: u64,
+    armed_timer: Option<u64>,
+}
+
+impl UsageReloadState {
+    pub(crate) fn reduce(&mut self, active: bool, event: UsageReloadEvent) -> UsageReloadAction {
+        match event {
+            UsageReloadEvent::Persisted => {
+                if self.in_flight {
+                    self.dirty = true;
+                    return UsageReloadAction::None;
+                }
+                if !active || self.armed_timer.is_some() {
+                    return UsageReloadAction::None;
+                }
+                let token = self.arm_timer();
+                UsageReloadAction::Schedule {
+                    token,
+                    delay: PERSISTED_RELOAD_DEBOUNCE,
+                }
+            }
+            UsageReloadEvent::Manual | UsageReloadEvent::Resync => {
+                self.invalidate_timer();
+                self.dirty = false;
+                if !active {
+                    return UsageReloadAction::None;
+                }
+                let token = self.arm_timer();
+                UsageReloadAction::Schedule {
+                    token,
+                    delay: PERSISTED_RELOAD_DEBOUNCE,
+                }
+            }
+            UsageReloadEvent::Deactivate => {
+                self.in_flight = false;
+                self.dirty = false;
+                self.invalidate_timer();
+                UsageReloadAction::None
+            }
+            UsageReloadEvent::LoadStarted => {
+                self.in_flight = true;
+                self.dirty = false;
+                UsageReloadAction::None
+            }
+            UsageReloadEvent::LoadFinished => {
+                self.in_flight = false;
+                if !active || !self.dirty || self.armed_timer.is_some() {
+                    return UsageReloadAction::None;
+                }
+                let token = self.arm_timer();
+                UsageReloadAction::Schedule {
+                    token,
+                    delay: USAGE_TRAILING_RELOAD_DELAY,
+                }
+            }
+            UsageReloadEvent::TimerComplete(token) => {
+                if self.armed_timer != Some(token) {
+                    return UsageReloadAction::None;
+                }
+                self.armed_timer = None;
+                self.dirty = false;
+                if active {
+                    UsageReloadAction::ReloadNow
+                } else {
+                    UsageReloadAction::None
+                }
+            }
+        }
+    }
+
+    fn arm_timer(&mut self) -> u64 {
+        self.next_timer = self.next_timer.wrapping_add(1);
+        self.armed_timer = Some(self.next_timer);
+        self.next_timer
+    }
+
+    pub(crate) fn timer_matches(&self, token: u64) -> bool {
+        self.armed_timer == Some(token)
+    }
+
+    pub(crate) fn invalidate_timer(&mut self) {
+        self.armed_timer = None;
     }
 }
 

@@ -24,8 +24,8 @@ use gateway::http_client::UsageScope;
 use gateway::store::{GatewayKeyRow, OWNER_LOGIN, TrendRow, TrendSplit, UsageWindow, UserRow};
 
 use crate::activity::{
-    LedgerReloadAction, LedgerReloadEvent, LedgerReloadState, LedgerRevisionChange,
-    LedgerRevisionObserver,
+    LedgerRevisionChange, LedgerRevisionObserver, UsageReloadAction, UsageReloadEvent,
+    UsageReloadState,
 };
 use crate::fmt::{humanize_count, usd_microus};
 use crate::pages::usage_trend::{TrendData, TrendGeometryCell, TrendMetric};
@@ -354,10 +354,15 @@ pub struct UsagePage {
     /// (whole-window aggregates, trend bucket rows, the window they were
     /// queried over — the chart grid must match the SQL's labels).
     state: LoadState<(UsageWindow, Vec<TrendRow>, ResolvedRange)>,
-    /// Live-activity feed: a Persisted event schedules a debounced reload.
+    /// Live-activity feed: the first Persisted event uses a short debounce;
+    /// changes during a load retry 15 seconds after that load completes.
     feed: gpui::Entity<crate::activity::ActivityFeed>,
     active: bool,
-    persisted_reload: LedgerReloadState,
+    usage_reload: UsageReloadState,
+    /// The currently running aggregate load. Dropping it aborts the HTTP task.
+    usage_load_task: Option<gpui::Task<()>>,
+    /// The pending persisted/trailing timer. Dropping it cancels the timer.
+    usage_timer_task: Option<gpui::Task<()>>,
     revision_observer: LedgerRevisionObserver,
     /// Whether the overview's single elapsed-label repaint timer is in flight.
     elapsed_armed: bool,
@@ -414,9 +419,12 @@ impl UsagePage {
             return;
         }
         self.active = active;
-        let _ = self
-            .persisted_reload
-            .reduce(false, LedgerReloadEvent::TabInvalidation);
+        if !active {
+            self.cancel_usage_timer();
+            self.usage_load_task = None;
+            self.usage_reload
+                .reduce(false, UsageReloadEvent::Deactivate);
+        }
         if active {
             self.arm_elapsed(cx);
         } else {
@@ -425,31 +433,56 @@ impl UsagePage {
         cx.notify();
     }
 
-    /// Hand one reload decision to the reducer and do the HTTP work it asks
-    /// for: `ReloadNow` reads immediately, `Schedule` arms the trailing
-    /// debounce shared by a burst of persisted batches.
-    fn apply_reload(&mut self, event: LedgerReloadEvent, cx: &mut Context<Self>) {
-        match self.persisted_reload.reduce(self.active, event) {
-            LedgerReloadAction::None => {}
-            LedgerReloadAction::ReloadNow => self.reload(cx),
-            LedgerReloadAction::Schedule(token) => {
-                cx.spawn(async move |this, cx| {
-                    cx.background_executor()
-                        .timer(crate::activity::PERSISTED_RELOAD_DEBOUNCE)
-                        .await;
-                    this.update(cx, |page, cx| {
-                        if matches!(
-                            page.persisted_reload
-                                .reduce(page.active, LedgerReloadEvent::TimerComplete(token)),
-                            LedgerReloadAction::ReloadNow
-                        ) {
-                            page.reload(cx);
-                        }
-                    })
-                    .ok();
-                })
-                .detach();
+    /// Hand one Usage reload event to the coordinator and perform the requested
+    /// HTTP work. Persisted, manual, and resync events use a short debounce; a
+    /// dirty load retries 15 seconds after that load finishes.
+    fn apply_reload(&mut self, event: UsageReloadEvent, cx: &mut Context<Self>) {
+        match self.usage_reload.reduce(self.active, event) {
+            UsageReloadAction::None => {}
+            UsageReloadAction::ReloadNow => self.reload(cx),
+            UsageReloadAction::Schedule { token, delay } => {
+                self.schedule_usage_timer(token, delay, cx);
             }
+        }
+    }
+
+    fn schedule_usage_timer(
+        &mut self,
+        token: u64,
+        delay: std::time::Duration,
+        cx: &mut Context<Self>,
+    ) {
+        self.usage_timer_task = Some(cx.spawn(async move |this, cx| {
+            cx.background_executor().timer(delay).await;
+            this.update(cx, |page, cx| {
+                let current = page.usage_reload.timer_matches(token);
+                if matches!(
+                    page.usage_reload
+                        .reduce(page.active, UsageReloadEvent::TimerComplete(token)),
+                    UsageReloadAction::ReloadNow
+                ) {
+                    page.usage_timer_task = None;
+                    page.reload(cx);
+                } else if current {
+                    page.usage_timer_task = None;
+                }
+            })
+            .ok();
+        }));
+    }
+
+    fn cancel_usage_timer(&mut self) {
+        self.usage_timer_task = None;
+        self.usage_reload.invalidate_timer();
+    }
+
+    fn finish_usage_load(&mut self, cx: &mut Context<Self>) {
+        self.usage_load_task = None;
+        if let UsageReloadAction::Schedule { token, delay } = self
+            .usage_reload
+            .reduce(self.active, UsageReloadEvent::LoadFinished)
+        {
+            self.schedule_usage_timer(token, delay, cx);
         }
     }
 
@@ -553,7 +586,7 @@ impl UsagePage {
                 let range = UsageRange::Custom(start.date(), end.date());
                 if page.range != range {
                     page.range = range;
-                    page.apply_reload(LedgerReloadEvent::FilterInvalidation, cx);
+                    page.apply_reload(UsageReloadEvent::Manual, cx);
                 }
             },
         )
@@ -561,7 +594,13 @@ impl UsagePage {
         let mut this = Self {
             state: LoadState::Loading,
             active: false,
-            persisted_reload: LedgerReloadState::default(),
+            usage_reload: UsageReloadState::default(),
+            usage_load_task: None,
+            usage_timer_task: None,
+            revision_observer: LedgerRevisionObserver::new(
+                feed.read(cx).resync(),
+                feed.read(cx).persisted(),
+            ),
             elapsed_armed: false,
             generation: 0,
             data_version: 0,
@@ -575,10 +614,6 @@ impl UsagePage {
             keys: Vec::new(),
             users: Vec::new(),
             seen_bootstrap: feed.read(cx).bootstrap_rev(),
-            revision_observer: LedgerRevisionObserver::new(
-                feed.read(cx).resync(),
-                feed.read(cx).persisted(),
-            ),
             seen_live_revision: feed.read(cx).live_revision(),
             client_list_open: false,
             trend_hover: None,
@@ -587,8 +622,9 @@ impl UsagePage {
             trend_cache: TrendCache::new(None),
             feed,
         };
-        // Persisted batches schedule a short trailing authoritative reload only
-        // while this page is active. Other events still repaint the live block.
+        // The first Persisted event uses a short debounce; changes during a load
+        // retry 15 seconds after that load completes. Other events still repaint
+        // the live block.
         cx.observe(&this.feed.clone(), |page, feed, cx| {
             // Seed the dropdown from the pushed document. The Status container
             // owns the initial aggregate load; bootstrap only refreshes labels.
@@ -613,18 +649,14 @@ impl UsagePage {
                         page.reload_keys(cx);
                         page.reload_users(cx);
                     }
-                    page.apply_reload(LedgerReloadEvent::Resync, cx);
+                    page.apply_reload(UsageReloadEvent::Resync, cx);
                 }
-                LedgerRevisionChange::Persisted(revision) => {
-                    page.apply_reload(LedgerReloadEvent::Persisted { revision }, cx);
+                LedgerRevisionChange::Persisted(_) => {
+                    page.apply_reload(UsageReloadEvent::Persisted, cx);
                 }
                 LedgerRevisionChange::None => {}
             }
-            let live_revision = feed.read(cx).live_revision();
-            if live_revision != page.seen_live_revision {
-                page.seen_live_revision = live_revision;
-                page.arm_elapsed(cx);
-            }
+            page.seen_live_revision = feed.read(cx).live_revision();
             page.arm_elapsed(cx);
             cx.notify();
         })
@@ -683,9 +715,15 @@ impl UsagePage {
 
     /// (Re)load the active window of usage over the HTTP admin API. The
     /// range resolves at call time, so a preset's `now` stays live across
-    /// feed-driven reloads.
+    /// feed-driven reloads. This is the direct immediate entry point for
+    /// startup and trend changes; filter/range/manual events go through the
+    /// short debounce in [`Self::apply_reload`].
     pub(super) fn reload(&mut self, cx: &mut Context<Self>) {
-        self.persisted_reload.cancel();
+        self.cancel_usage_timer();
+        self.usage_load_task = None;
+        let _ = self
+            .usage_reload
+            .reduce(self.active, UsageReloadEvent::LoadStarted);
         crate::pages::begin_load(&mut self.state);
         self.generation += 1;
         let generation = self.generation;
@@ -694,7 +732,7 @@ impl UsagePage {
         let filter = self.client_filter.clone();
         let load = cx
             .global::<GatewayRuntime>()
-            .admin_call(move |admin| async move {
+            .admin_call_cancellable(move |admin| async move {
                 let window = admin
                     .usage_window(resolved.since, resolved.until, filter.scope())
                     .await?;
@@ -709,13 +747,15 @@ impl UsagePage {
                     .await?;
                 Ok((window, trend, resolved))
             });
-        cx.spawn(async move |this, cx| {
+        let task = cx.spawn(async move |this, cx| {
             let result = load.await;
             this.update(cx, |page, cx| {
                 if page.generation != generation {
-                    return; // a newer reload is in flight; this snapshot is stale
+                    // The old task is normally already aborted. If its result was
+                    // queued, it must not finish or mutate the new coordinator.
+                    return;
                 }
-                page.state = match result {
+                match result {
                     Ok(rows) => {
                         page.kpi_animation.update(
                             (rows.0.requests != 0).then(|| KpiValues::from_window(&rows.0)),
@@ -723,21 +763,22 @@ impl UsagePage {
                             page.active,
                             cx.reduce_motion(),
                         );
-                        LoadState::Loaded(rows)
+                        page.state = LoadState::Loaded(rows);
                     }
                     Err(error) => {
                         page.kpi_animation
                             .update(None, std::time::Instant::now(), false, false);
-                        LoadState::Failed(error)
+                        page.state = LoadState::Failed(error);
                     }
                 };
                 page.arm_kpi_timer(cx);
                 page.data_version += 1;
+                page.finish_usage_load(cx);
                 cx.notify();
             })
             .ok();
-        })
-        .detach();
+        });
+        self.usage_load_task = Some(task);
     }
 
     /// The 客户端 filter dropdown: the trigger shows the current selection;
@@ -850,7 +891,7 @@ impl UsagePage {
                 this.client_list_open = false;
                 if this.client_filter != option {
                     this.client_filter = option.clone();
-                    this.apply_reload(LedgerReloadEvent::FilterInvalidation, cx);
+                    this.apply_reload(UsageReloadEvent::Manual, cx);
                     this.arm_elapsed(cx);
                     cx.notify();
                 } else {
@@ -880,7 +921,7 @@ impl UsagePage {
                             this.range_picker.update(cx, |picker, cx| {
                                 picker.set_date(PickerDate::Range(None, None), window, cx)
                             });
-                            this.apply_reload(LedgerReloadEvent::FilterInvalidation, cx);
+                            this.apply_reload(UsageReloadEvent::Manual, cx);
                         }
                     }));
                     if range == self.range {
@@ -907,7 +948,7 @@ impl UsagePage {
                 cx.listener(|this, _, _, cx| {
                     this.reload_keys(cx);
                     this.reload_users(cx);
-                    this.apply_reload(LedgerReloadEvent::ManualReload, cx);
+                    this.apply_reload(UsageReloadEvent::Manual, cx);
                 }),
             )
             .into_any_element(),
