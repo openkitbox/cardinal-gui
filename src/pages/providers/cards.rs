@@ -33,7 +33,7 @@ use super::chip::selectable_chip;
 use super::groups::{group_chips, group_tags};
 use super::kiro_import;
 use super::order::DropSide;
-use super::quota::quota_row;
+use super::quota::{codex_reset_row, quota_row};
 use super::{
     AccountLoginForm, CredentialMode, FormSource, KeyCardData, KeyEditor, KeyForm, KiroImportForm,
     LoginProgress, ProvidersPage,
@@ -998,6 +998,72 @@ impl ProvidersPage {
                 if let Some(balance) = &quota.balance {
                     this = this.child(balance_row(balance, quota.probed_at, cx));
                 }
+                if key.auth_kind == "openai_oauth" {
+                    let summary = quota
+                        .codex_resets
+                        .as_ref()
+                        .filter(|summary| summary.available_count > 0);
+                    let retry_available = self.codex_reset_retry_available(provider_id, key_id);
+                    let details_retry_available = self.codex_reset_details_retry_available(key_id);
+                    let callback_label = key.label.clone();
+                    if super::quota::codex_reset_row_visible(
+                        summary,
+                        retry_available || details_retry_available,
+                    ) {
+                        this = this.child(codex_reset_row(
+                            summary,
+                            || {
+                                super::quota::codex_reset_action_available(
+                                    summary,
+                                    retry_available || details_retry_available,
+                                )
+                                .then(|| {
+                                    Button::new(("codex-reset-use", key_id as u64))
+                                        .label(if retry_available || details_retry_available {
+                                            "重试"
+                                        } else {
+                                            "使用"
+                                        })
+                                        .outline()
+                                        .compact()
+                                        .disabled(self.codex_reset_busy(key_id))
+                                        .on_click(cx.listener(move |this, _, window, cx| {
+                                            if this.codex_reset_retry_available(provider_id, key_id)
+                                            {
+                                                // A failed consume keeps its request id and
+                                                // credit id; retry that same consume operation.
+                                                this.retry_codex_reset(provider_id, key_id, cx);
+                                            } else if this
+                                                .codex_reset_details_retry_available(key_id)
+                                            {
+                                                // Details failed before confirmation; retry the
+                                                // read so the user never consumes a stale credit.
+                                                this.confirm_codex_reset(
+                                                    provider_id,
+                                                    key_id,
+                                                    callback_label.clone(),
+                                                    window,
+                                                    cx,
+                                                );
+                                            } else {
+                                                // The snapshot count is authoritative even when
+                                                // its credit details are stale or empty; fetch
+                                                // fresh details before selecting a credit.
+                                                this.confirm_codex_reset(
+                                                    provider_id,
+                                                    key_id,
+                                                    callback_label.clone(),
+                                                    window,
+                                                    cx,
+                                                );
+                                            }
+                                        }))
+                                })
+                            },
+                            cx,
+                        ));
+                    }
+                }
                 for detail in &quota.details {
                     this = this.child(
                         gpui::div()
@@ -1008,6 +1074,22 @@ impl ProvidersPage {
                 }
                 this
             })
+            .when_some(
+                self.codex_reset_status(key_id)
+                    .map(|(status, danger)| (status.to_string(), danger)),
+                |this, (status, danger)| {
+                    this.child(
+                        gpui::div()
+                            .text_size(px(11.))
+                            .text_color(if danger {
+                                cx.theme().danger
+                            } else {
+                                cx.theme().muted_foreground
+                            })
+                            .child(status),
+                    )
+                },
+            )
             // Model rows: one line per whitelisted model (see `model_rows`),
             // pinned to the card's bottom. Cards in a grid row share the
             // tallest card's height while the quota meters above vary in row

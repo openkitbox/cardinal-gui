@@ -33,6 +33,8 @@ use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
+use uuid::Uuid;
+
 use gpui::{
     AppContext as _, Context, Entity, Focusable as _, InteractiveElement, IntoElement,
     ParentElement, Render, Styled, Window, prelude::FluentBuilder as _,
@@ -44,9 +46,9 @@ use gpui_kit::component::{Disableable, Icon, Sizable, WindowExt};
 
 use gateway::admin_ops::Bootstrap;
 use gateway::http_client::{
-    CursorLoginRequest, CursorLoginStart, CursorLoginStatus, GatewayHttpClient, KeyUpdate,
-    OpenaiLoginRequest, OpenaiLoginStart, OpenaiLoginStatus, OpencodeLoginRequest,
-    OpencodeLoginStart, OpencodeLoginStatus,
+    ClientError, CursorLoginRequest, CursorLoginStart, CursorLoginStatus, GatewayHttpClient,
+    KeyUpdate, OpenaiLoginRequest, OpenaiLoginStart, OpenaiLoginStatus, OpenaiResetOutcome,
+    OpencodeLoginRequest, OpencodeLoginStart, OpencodeLoginStatus,
 };
 
 use gateway::probe::ProbeModel;
@@ -61,7 +63,7 @@ use catalog::{
 };
 use group_editor::{GroupCreate, GroupManager};
 use groups::{GroupFilter, KeyFacts, Visibility};
-use quota::KeyQuotaView;
+use quota::{KeyQuotaView, earliest_codex_reset_details};
 
 use crate::pages::{
     LoadState, action_error_card, empty_card, error_card, loading_card, page_frame, refresh_button,
@@ -79,6 +81,32 @@ struct KeyCardData {
     /// editor opens ([`ProvidersPage::open_key_editor`]).
     key: ProviderKeyView,
     quota: Option<KeyQuotaView>,
+}
+
+/// State of the irreversible Codex reset-credit action.
+///
+/// A failed consume retains its request and credit ids for idempotent retry
+/// bookkeeping. The retry reuses the request id but lets the gateway resolve the
+/// credit from the upstream idempotency record.
+#[derive(Clone, Debug)]
+enum CodexResetAction {
+    Pending {
+        key_id: i64,
+    },
+    DetailsFailed {
+        key_id: i64,
+    },
+    Failed {
+        key_id: i64,
+        provider_id: i64,
+        request_id: Option<String>,
+        credit_id: Option<String>,
+        message: String,
+    },
+    Result {
+        key_id: i64,
+        message: String,
+    },
 }
 
 /// Loaded page data: every key across all providers in global position order,
@@ -712,6 +740,7 @@ pub struct ProvidersPage {
     /// card toggles one entry. View state only — the address is already on the
     /// card, masked, and nothing is fetched to reveal it.
     revealed_accounts: HashSet<i64>,
+    codex_resets: HashMap<i64, CodexResetAction>,
     active: bool,
 }
 
@@ -748,6 +777,7 @@ impl ProvidersPage {
             drag: None,
             order_write_in_flight: false,
             revealed_accounts: HashSet::new(),
+            codex_resets: HashMap::new(),
             active: false,
         };
         // The page renders from the PUSHED bootstrap document — providers,
@@ -922,6 +952,306 @@ impl ProvidersPage {
             .ok();
         })
         .detach();
+    }
+
+    /// Fetch current reset details before opening confirmation. The snapshot is
+    /// never used to describe a credit that may already have been consumed.
+    pub(super) fn confirm_codex_reset(
+        &mut self,
+        provider_id: i64,
+        key_id: i64,
+        label: String,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if self.codex_reset_busy(key_id) {
+            return;
+        }
+        let page = cx.entity();
+        self.codex_resets
+            .insert(key_id, CodexResetAction::Pending { key_id });
+        cx.notify();
+        let window_handle = window.window_handle();
+        let call = cx
+            .global::<GatewayRuntime>()
+            .admin_call(move |admin| async move {
+                admin.openai_reset_details(provider_id, key_id).await
+            });
+        cx.spawn(async move |_, cx| {
+            let result = call.await;
+            let _ = window_handle.update(cx, |_, window, cx| {
+                page.update(cx, |page, cx| match result {
+                    Ok(details) => {
+                        let Some(credit) = earliest_codex_reset_details(&details) else {
+                            page.codex_resets.insert(
+                                key_id,
+                                CodexResetAction::Result {
+                                    key_id,
+                                    message: "当前没有可用重置卡".to_string(),
+                                },
+                            );
+                            page.refresh_quotas(cx);
+                            cx.notify();
+                            return;
+                        };
+                        let scope = credit
+                            .reset_type
+                            .as_deref()
+                            .unwrap_or("全部限额窗口")
+                            .to_string();
+                        let expiry = credit
+                            .expires_at
+                            .map(|date| {
+                                date.with_timezone(&crate::ui_tz::display_tz())
+                                    .format("%Y-%m-%d %H:%M")
+                                    .to_string()
+                            })
+                            .unwrap_or_else(|| "过期时间未知".to_string());
+                        let credit_id = credit.id.clone();
+                        let label = if label.trim().is_empty() {
+                            "此账号".to_string()
+                        } else {
+                            label.clone()
+                        };
+                        // Details loading is complete. Clear the loading marker before
+                        // opening the dialog so its OK callback can start the consume
+                        // request, while canceling leaves the action idle.
+                        page.codex_resets.remove(&key_id);
+                        let page = cx.entity();
+                        window.open_alert_dialog(cx, move |dialog, _, _| {
+                            let page = page.clone();
+                            let callback_credit_id = credit_id.clone();
+                            dialog
+                                .confirm()
+                                .title("使用 Codex 重置卡？")
+                                .description(format!(
+                                    "将为账号「{label}」使用最早到期的一张卡。作用范围：{scope}；过期时间：{expiry}。此操作不可撤销。"
+                                ))
+                                .ok_text("使用重置卡")
+                                .ok_variant(ButtonVariant::Danger)
+                                .on_ok(move |_, _, cx| {
+                                    page.update(cx, |page, cx| {
+                                        page.begin_codex_reset(
+                                            provider_id,
+                                            key_id,
+                                            callback_credit_id.clone(),
+                                            cx,
+                                        )
+                                    });
+                                    true
+                                })
+                        });
+                    }
+                    Err(_) => {
+                        page.codex_resets.insert(
+                            key_id,
+                            CodexResetAction::DetailsFailed {
+                                key_id,
+                            },
+                        );
+                        cx.notify();
+                    }
+                })
+            });
+        })
+        .detach();
+    }
+
+    fn begin_codex_reset(
+        &mut self,
+        provider_id: i64,
+        key_id: i64,
+        credit_id: String,
+        cx: &mut Context<Self>,
+    ) {
+        if self.codex_reset_busy(key_id) {
+            return;
+        }
+        let (request_id, retrying_uncertain) = match self.codex_resets.get(&key_id) {
+            Some(CodexResetAction::Failed {
+                key_id: failed_key,
+                provider_id: failed_provider,
+                request_id: Some(request_id),
+                credit_id: Some(previous_credit_id),
+                ..
+            }) if *failed_key == key_id
+                && *failed_provider == provider_id
+                && *previous_credit_id == credit_id =>
+            {
+                (request_id.clone(), true)
+            }
+            _ => (Uuid::new_v4().to_string(), false),
+        };
+        self.codex_resets
+            .insert(key_id, CodexResetAction::Pending { key_id });
+        cx.notify();
+        let call_credit_id = (!retrying_uncertain).then_some(credit_id.clone());
+        let call = cx.global::<GatewayRuntime>().admin_call({
+            let call_request_id = request_id.clone();
+            move |admin| async move {
+                Ok(admin
+                    .consume_openai_reset(
+                        provider_id,
+                        key_id,
+                        &call_request_id,
+                        call_credit_id.as_deref(),
+                    )
+                    .await)
+            }
+        });
+        cx.spawn(async move |this, cx| {
+            let result = call.await;
+            this.update(cx, |page, cx| {
+                match result {
+                    Ok(Ok(OpenaiResetOutcome::Unknown)) => {
+                        page.codex_resets.insert(
+                            key_id,
+                            CodexResetAction::Failed {
+                                key_id,
+                                provider_id,
+                                request_id: Some(request_id.clone()),
+                                credit_id: Some(credit_id.clone()),
+                                message: "重置卡结果不确定，请稍后重试".to_string(),
+                            },
+                        );
+                        page.refresh_quotas(cx);
+                    }
+                    Ok(Ok(outcome)) => {
+                        page.codex_resets.insert(
+                            key_id,
+                            CodexResetAction::Result {
+                                key_id,
+                                message: Self::reset_outcome_message(&outcome),
+                            },
+                        );
+                        page.refresh_quotas(cx);
+                    }
+                    Ok(Err(ClientError::Http { status, .. })) if status.as_u16() == 400 => {
+                        // The gateway rejected the selected credit before reaching
+                        // upstream. Discard the selection and require fresh details;
+                        // do not expose its response body or refresh the quota card.
+                        page.codex_resets
+                            .insert(key_id, CodexResetAction::DetailsFailed { key_id });
+                    }
+                    Ok(Err(_)) => {
+                        page.codex_resets.insert(
+                            key_id,
+                            CodexResetAction::Failed {
+                                key_id,
+                                provider_id,
+                                request_id: Some(request_id.clone()),
+                                credit_id: Some(credit_id.clone()),
+                                message: "重置卡结果不确定，请稍后重试".to_string(),
+                            },
+                        );
+                        page.refresh_quotas(cx);
+                    }
+                    Err(_) => {
+                        page.codex_resets.insert(
+                            key_id,
+                            CodexResetAction::Failed {
+                                key_id,
+                                provider_id,
+                                request_id: Some(request_id),
+                                credit_id: Some(credit_id),
+                                message: "重置卡结果不确定，请稍后重试".to_string(),
+                            },
+                        );
+                        page.refresh_quotas(cx);
+                    }
+                }
+                cx.notify();
+            })
+            .ok();
+        })
+        .detach();
+    }
+
+    pub(super) fn retry_codex_reset(
+        &mut self,
+        provider_id: i64,
+        key_id: i64,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(CodexResetAction::Failed {
+            key_id: failed_key,
+            provider_id: failed_provider,
+            credit_id: Some(credit_id),
+            ..
+        }) = self.codex_resets.get(&key_id)
+        else {
+            return;
+        };
+        if *failed_key != key_id || *failed_provider != provider_id {
+            return;
+        }
+        self.begin_codex_reset(provider_id, key_id, credit_id.clone(), cx);
+    }
+
+    pub(super) fn codex_reset_retry_available(&self, provider_id: i64, key_id: i64) -> bool {
+        matches!(
+            self.codex_resets.get(&key_id),
+            Some(CodexResetAction::Failed {
+                key_id: failed_key,
+                provider_id: failed_provider,
+                request_id: Some(_),
+                credit_id: Some(_),
+                ..
+            }) if *failed_key == key_id && *failed_provider == provider_id
+        )
+    }
+
+    pub(super) fn codex_reset_details_retry_available(&self, key_id: i64) -> bool {
+        matches!(
+            self.codex_resets.get(&key_id),
+            Some(CodexResetAction::DetailsFailed { key_id: failed_key })
+                if *failed_key == key_id
+        )
+    }
+
+    pub(super) fn codex_reset_status(&self, key_id: i64) -> Option<(&str, bool)> {
+        match self.codex_resets.get(&key_id) {
+            Some(CodexResetAction::Pending { key_id: status_key }) if *status_key == key_id => {
+                Some(("重置卡操作处理中", false))
+            }
+            Some(CodexResetAction::DetailsFailed { key_id: status_key })
+                if *status_key == key_id =>
+            {
+                Some(("重置卡详情暂时无法读取，请刷新后重试", true))
+            }
+            Some(CodexResetAction::Failed {
+                key_id: status_key,
+                message,
+                ..
+            }) if *status_key == key_id => Some((message, true)),
+            Some(CodexResetAction::Result {
+                key_id: status_key,
+                message,
+            }) if *status_key == key_id => Some((message, false)),
+            _ => None,
+        }
+    }
+
+    fn reset_outcome_message(outcome: &OpenaiResetOutcome) -> String {
+        match outcome {
+            OpenaiResetOutcome::Reset { windows_reset } if windows_reset.is_empty() => {
+                "重置卡已使用，额度正在刷新".to_string()
+            }
+            OpenaiResetOutcome::Reset { windows_reset } => {
+                format!("重置卡已使用：{}", windows_reset.join("、"))
+            }
+            OpenaiResetOutcome::AlreadyRedeemed => "重置卡已处理，额度正在刷新".to_string(),
+            OpenaiResetOutcome::NothingToReset => "当前没有需要重置的额度".to_string(),
+            OpenaiResetOutcome::NoCredit => "没有可用重置卡".to_string(),
+            OpenaiResetOutcome::Unknown => "重置卡返回了未知结果".to_string(),
+        }
+    }
+
+    pub(super) fn codex_reset_busy(&self, key_id: i64) -> bool {
+        matches!(
+            self.codex_resets.get(&key_id),
+            Some(CodexResetAction::Pending { .. })
+        )
     }
 
     /// Run one write against the HTTP admin API: on success clear the error

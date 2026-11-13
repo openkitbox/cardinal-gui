@@ -16,10 +16,12 @@ use std::rc::Rc;
 
 use chrono::{DateTime, Datelike, Duration, Timelike, Utc};
 use gpui::prelude::FluentBuilder;
-use gpui::{App, Div, ParentElement, Styled, px, relative};
+use gpui::{App, Div, IntoElement, ParentElement, Styled, px, relative};
 use gpui_kit::component::ActiveTheme;
+use gpui_kit::component::button::Button;
 
-use gateway::quota::{KeyQuota, QuotaWindow};
+use gateway::http_client::{OpenaiResetCredit, OpenaiResetDetails};
+use gateway::quota::{CodexResetSummary, KeyQuota, QuotaWindow};
 use gateway::store::{BalanceHistoryPoint, QuotaHistoryPoint};
 
 use super::balance::BalanceView;
@@ -103,6 +105,8 @@ impl QuotaWindowView {
 pub(super) struct KeyQuotaView {
     pub(super) windows: Vec<QuotaWindowView>,
     pub(super) balance: Option<BalanceView>,
+    /// OpenAI Codex reset credits from the gateway's typed quota view.
+    pub(super) codex_resets: Option<CodexResetSummaryView>,
     /// The vendor's name for the account's plan ("Pro"), when it names one.
     /// Rendered beside the account on the credential row, not here.
     pub(super) plan: Option<String>,
@@ -111,6 +115,9 @@ pub(super) struct KeyQuotaView {
     /// When this reading was probed (snapshot time; a live refresh stamps now).
     pub(super) probed_at: chrono::DateTime<chrono::Utc>,
 }
+
+pub(crate) type CodexResetSummaryView = CodexResetSummary;
+type CodexResetView = gateway::quota::CodexResetDisplay;
 
 impl KeyQuotaView {
     /// Build the view from a reading plus the gateway's recorded samples for
@@ -123,6 +130,13 @@ impl KeyQuotaView {
         history: &[QuotaHistoryPoint],
         balance_history: &[BalanceHistoryPoint],
     ) -> Self {
+        let KeyQuota {
+            windows,
+            balance,
+            codex_resets,
+            plan,
+            details,
+        } = quota;
         let mut by_window: std::collections::HashMap<&str, Vec<(chrono::DateTime<Utc>, f64)>> =
             std::collections::HashMap::new();
         for point in history {
@@ -132,8 +146,7 @@ impl KeyQuotaView {
                 .push((point.probed_at, point.used_pct));
         }
         Self {
-            windows: quota
-                .windows
+            windows: windows
                 .into_iter()
                 .map(|window| {
                     let history = by_window
@@ -144,12 +157,12 @@ impl KeyQuotaView {
                 })
                 .collect(),
             // A non-finite amount (vendor garbage) is no reading at all.
-            balance: quota
-                .balance
+            balance: balance
                 .filter(|balance| balance.amount.is_finite())
                 .map(|balance| BalanceView::new(balance, balance_history, probed_at)),
-            plan: quota.plan,
-            details: quota.details,
+            codex_resets,
+            plan,
+            details,
             probed_at,
         }
     }
@@ -158,20 +171,26 @@ impl KeyQuotaView {
     /// history and the balance segment (the live endpoint returns no series;
     /// a window or balance that was not present before starts its series now).
     pub(super) fn live(self, quota: KeyQuota, probed_at: chrono::DateTime<chrono::Utc>) -> Self {
+        let KeyQuota {
+            windows,
+            balance,
+            codex_resets,
+            plan,
+            details,
+        } = quota;
         let mut histories: std::collections::HashMap<String, Vec<(DateTime<Utc>, f64)>> = self
             .windows
             .into_iter()
             .map(|window| (window.name, window.history))
             .collect();
-        let reading = quota.balance.filter(|balance| balance.amount.is_finite());
+        let reading = balance.filter(|balance| balance.amount.is_finite());
         let balance = match (self.balance, reading) {
             (Some(previous), Some(balance)) => Some(previous.live(balance, probed_at)),
             (None, Some(balance)) => Some(BalanceView::new(balance, &[], probed_at)),
             (_, None) => None,
         };
         Self {
-            windows: quota
-                .windows
+            windows: windows
                 .into_iter()
                 .map(|window| {
                     let history = histories.remove(&window.name).unwrap_or_default();
@@ -179,11 +198,125 @@ impl KeyQuotaView {
                 })
                 .collect(),
             balance,
-            plan: quota.plan,
-            details: quota.details,
+            codex_resets,
+            plan,
+            details,
             probed_at,
         }
     }
+}
+
+/// Available credits are the only actionable rows. Missing expiry sorts after
+/// dated credits; equal values retain the upstream order for stable cards.
+pub(super) fn available_codex_resets(summary: &CodexResetSummaryView) -> Vec<&CodexResetView> {
+    let mut credits: Vec<&CodexResetView> = summary
+        .credits
+        .iter()
+        .filter(|credit| credit.status == "available")
+        .collect();
+    credits.sort_by(|left, right| codex_expiry_cmp(left.expires_at, right.expires_at));
+    credits
+}
+
+/// Keep the authoritative count visible even when the detail list is stale.
+pub(super) fn codex_reset_row_visible(
+    summary: Option<&CodexResetSummaryView>,
+    retry_available: bool,
+) -> bool {
+    retry_available || summary.is_some_and(|summary| summary.available_count > 0)
+}
+
+/// Whether the row should render an actionable consume/retry button.
+pub(super) fn codex_reset_action_available(
+    summary: Option<&CodexResetSummaryView>,
+    retry_available: bool,
+) -> bool {
+    retry_available || summary.is_some_and(|summary| summary.available_count > 0)
+}
+
+/// Choose the same available credit ordering used by the stored quota card.
+/// The reset endpoint returns the id needed to consume it, while the stored
+/// snapshot deliberately does not; keeping the ordering here avoids selecting
+/// a different card in the confirmation flow.
+pub(super) fn earliest_codex_reset_details(
+    details: &OpenaiResetDetails,
+) -> Option<&OpenaiResetCredit> {
+    details
+        .credits
+        .iter()
+        .filter(|credit| credit.status == "available")
+        .min_by_key(|credit| codex_expiry_key(credit.expires_at))
+}
+
+fn codex_expiry_key(
+    expiry: Option<chrono::DateTime<chrono::Utc>>,
+) -> (bool, Option<chrono::DateTime<chrono::Utc>>) {
+    (expiry.is_none(), expiry)
+}
+
+fn codex_expiry_cmp(
+    left: Option<chrono::DateTime<chrono::Utc>>,
+    right: Option<chrono::DateTime<chrono::Utc>>,
+) -> std::cmp::Ordering {
+    codex_expiry_key(left).cmp(&codex_expiry_key(right))
+}
+
+/// Render the Codex reset-credit section. The caller owns the action callback;
+/// this helper only displays gateway state and never performs I/O.
+pub(super) fn codex_reset_row(
+    summary: Option<&CodexResetSummaryView>,
+    reset: impl FnOnce() -> Option<Button>,
+    cx: &App,
+) -> Div {
+    let available = summary.map(available_codex_resets).unwrap_or_default();
+    let mut details: Vec<gpui::AnyElement> = Vec::new();
+    for credit in &available {
+        let expiry = credit
+            .expires_at
+            .map(|date| {
+                date.with_timezone(&crate::ui_tz::display_tz())
+                    .format("%Y-%m-%d %H:%M")
+                    .to_string()
+            })
+            .unwrap_or_else(|| "过期时间未知".to_string());
+        let scope = credit.reset_type.as_deref().unwrap_or("全部限额窗口");
+        let granted = credit
+            .granted_at
+            .map(|date| {
+                date.with_timezone(&crate::ui_tz::display_tz())
+                    .format("%Y-%m-%d %H:%M")
+                    .to_string()
+            })
+            .unwrap_or_else(|| "发放时间未知".to_string());
+        details.push(
+            gpui::div()
+                .text_size(px(11.))
+                .text_color(cx.theme().muted_foreground)
+                .child(format!("{scope} · 发放 {granted} · 过期 {expiry}"))
+                .into_any_element(),
+        );
+    }
+    gpui::div()
+        .flex()
+        .flex_col()
+        .gap_1()
+        .child(
+            gpui::div()
+                .flex()
+                .items_center()
+                .gap_2()
+                .child(match summary {
+                    Some(summary) => gpui::div()
+                        .text_color(cx.theme().success)
+                        .child(format!("可用重置 {} 次", summary.available_count)),
+                    None => gpui::div()
+                        .text_color(cx.theme().warning)
+                        .child("重置卡操作未完成"),
+                })
+                .child(gpui::div().flex_1())
+                .when_some(reset(), |this, button| this.child(button)),
+        )
+        .children(details)
 }
 
 /// Quota windows, one full-width meter per row: name + reset countdown above
