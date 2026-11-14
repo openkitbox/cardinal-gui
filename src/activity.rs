@@ -16,8 +16,9 @@ use gpui::{Context, Hsla};
 
 use gateway::activity::{ActivityEvent, EndMetrics, EndStatus, PersistedRequest, StartEvent};
 use gateway::admin_ops::Bootstrap;
+use gateway::http_client::backoff_delay;
 
-use crate::runtime::GatewayRuntime;
+use crate::runtime::{ActivitySubscription, GatewayRuntime};
 
 /// A live row that saw no event for this long lost its End: sweep it. (The
 /// clock is the last event, not the start — long streams stay alive as long
@@ -30,6 +31,61 @@ const POLL: Duration = Duration::from_secs(15);
 pub(crate) const PERSISTED_RELOAD_DEBOUNCE: Duration = Duration::from_millis(100);
 /// Trailing delay after a Usage load completes before retrying a dirty load.
 pub(crate) const USAGE_TRAILING_RELOAD_DELAY: Duration = Duration::from_secs(15);
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum ActivityDrainAction {
+    Acquire,
+    Wait(Duration),
+    Stop,
+}
+
+pub(crate) struct ActivityDrainState {
+    action: ActivityDrainAction,
+    failures: u32,
+    connected_once: bool,
+}
+
+impl ActivityDrainState {
+    pub(crate) fn new() -> Self {
+        Self {
+            action: ActivityDrainAction::Acquire,
+            failures: 0,
+            connected_once: false,
+        }
+    }
+
+    pub(crate) fn action(&mut self) -> ActivityDrainAction {
+        let action = self.action;
+        if matches!(action, ActivityDrainAction::Wait(_)) {
+            self.action = ActivityDrainAction::Stop;
+        }
+        action
+    }
+
+    pub(crate) fn receiver_closed(&mut self) {
+        let delay = backoff_delay(self.failures);
+        self.failures = self.failures.saturating_add(1);
+        self.action = ActivityDrainAction::Wait(delay);
+    }
+
+    pub(crate) fn runtime_unavailable(&mut self) {
+        self.action = ActivityDrainAction::Stop;
+    }
+
+    pub(crate) fn delay_elapsed(&mut self) {
+        self.action = ActivityDrainAction::Acquire;
+    }
+
+    pub(crate) fn connection_frame_received(&mut self) -> bool {
+        let reconnected = self.connected_once;
+        self.connected_once = true;
+        reconnected
+    }
+
+    pub(crate) fn stable_event_received(&mut self) {
+        self.failures = 0;
+    }
+}
 
 /// State token for a debounced persisted reload. Replacing or invalidating the
 /// token makes an already sleeping timer a no-op when it wakes.
@@ -626,16 +682,66 @@ impl ActivityFeed {
         }
     }
 
-    /// Drain the gateway's activity subscription until the feed (or the
-    /// channel) dies. No subscription (a broken client build) leaves the feed
-    /// silent — the pages still work, just without the live block.
+    /// Drain the gateway's activity subscription and recreate it after a
+    /// receiver closes. The runtime reservation prevents a second consumer.
     fn start_drain(&mut self, cx: &mut Context<Self>) {
-        let take = cx.global::<GatewayRuntime>().take_activity();
+        let runtime = cx.global::<GatewayRuntime>().clone();
         cx.spawn(async move |this, cx| {
-            let Some(mut rx) = take.await else { return };
-            while let Some(event) = rx.recv().await {
-                if this.update(cx, |feed, cx| feed.apply(event, cx)).is_err() {
-                    return;
+            let mut state = ActivityDrainState::new();
+            loop {
+                match state.action() {
+                    ActivityDrainAction::Acquire => {
+                        let mut reservation = match runtime.take_activity() {
+                            ActivitySubscription::Acquired(reservation) => reservation,
+                            ActivitySubscription::Busy => {
+                                tracing::warn!(
+                                    "activity subscription already owned; stopping feed"
+                                );
+                                state.runtime_unavailable();
+                                continue;
+                            }
+                            ActivitySubscription::Unavailable => {
+                                tracing::warn!("activity subscription unavailable; stopping feed");
+                                state.runtime_unavailable();
+                                continue;
+                            }
+                        };
+                        loop {
+                            let event = reservation.receiver_mut().recv().await;
+                            let Some(event) = event else {
+                                break;
+                            };
+                            let is_bootstrap = matches!(&event, ActivityEvent::Bootstrap(_));
+                            let is_connection_frame =
+                                is_bootstrap || matches!(&event, ActivityEvent::Resync);
+                            let is_stable_event = !is_connection_frame;
+                            if this
+                                .update(cx, |feed, cx| {
+                                    let reconnected = if is_connection_frame {
+                                        state.connection_frame_received()
+                                    } else {
+                                        false
+                                    };
+                                    if is_stable_event {
+                                        state.stable_event_received();
+                                    }
+                                    feed.apply(event, cx);
+                                    if reconnected && is_bootstrap {
+                                        feed.notify_persisted(cx);
+                                    }
+                                })
+                                .is_err()
+                            {
+                                return;
+                            }
+                        }
+                        state.receiver_closed();
+                    }
+                    ActivityDrainAction::Wait(delay) => {
+                        cx.background_executor().timer(delay).await;
+                        state.delay_elapsed();
+                    }
+                    ActivityDrainAction::Stop => return,
                 }
             }
         })

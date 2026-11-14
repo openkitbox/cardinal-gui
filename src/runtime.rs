@@ -21,12 +21,49 @@
 //! reqwest from the main thread.
 
 use std::future::Future;
+use std::sync::Arc;
+use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
+use gateway::activity::ActivityReceiver;
 use gateway::http_client::{GatewayHttpClient, UNREACHABLE_MESSAGE};
 use tokio::sync::watch;
+
+pub(crate) enum ActivitySubscription {
+    Acquired(ActivityReservation),
+    Busy,
+    Unavailable,
+}
+
+pub(crate) struct ActivityReservation {
+    receiver: ActivityReceiver,
+    active: Arc<Mutex<bool>>,
+}
+
+impl ActivityReservation {
+    fn new(receiver: ActivityReceiver, active: Arc<Mutex<bool>>) -> Self {
+        Self { receiver, active }
+    }
+
+    pub(crate) fn receiver_mut(&mut self) -> &mut ActivityReceiver {
+        &mut self.receiver
+    }
+}
+
+impl Drop for ActivityReservation {
+    fn drop(&mut self) {
+        match self.active.lock() {
+            Ok(mut active) => *active = false,
+            Err(error) => {
+                tracing::warn!(
+                    ?error,
+                    "activity subscription state lock poisoned while releasing"
+                );
+            }
+        }
+    }
+}
 
 struct AbortOnDrop(tokio::task::AbortHandle);
 
@@ -65,6 +102,7 @@ enum Link {
 
 /// Process-wide handle to the gateway runtime, installed as a GPUI global
 /// before the window opens.
+#[derive(Clone)]
 pub(crate) struct GatewayRuntime {
     /// Tokio handle for dispatching admin operations onto the admin thread.
     /// `None` only when the runtime itself failed to build.
@@ -82,12 +120,10 @@ pub(crate) struct GatewayRuntime {
     /// The probe trigger (kept to re-run the probe on
     /// [`GatewayRuntime::reconnect`]).
     link_tx: Option<watch::Sender<Link>>,
-    /// The live-activity subscription (single-consumer): the GUI's feed takes
-    /// it once via [`GatewayRuntime::take_activity`]. The SSE pump starts with
-    /// the runtime and retries on its own schedule — a gateway that comes up
-    /// later (after the status-bar retry, or independently) starts feeding
-    /// events without any rewiring.
-    activity: Mutex<Option<gateway::activity::ActivityReceiver>>,
+    /// The live-activity subscription state. The feed is the sole consumer;
+    /// it releases the reservation when the receiver ends before acquiring a
+    /// fresh subscription.
+    activity_active: Arc<Mutex<bool>>,
     /// Set when an admin call fails at connect (gateway died mid-session),
     /// cleared on the next success or probe. The status bar reads it so a
     /// dead gateway turns red even though the one-shot probe resolved
@@ -111,7 +147,7 @@ fn failed(message: String) -> GatewayRuntime {
         chat_url: String::new(),
         link,
         link_tx: None,
-        activity: Mutex::new(None),
+        activity_active: Arc::new(Mutex::new(false)),
         link_down: Arc::new(AtomicBool::new(false)),
         failure: Some(message),
     }
@@ -179,12 +215,6 @@ pub(crate) fn spawn(config: gateway::config::Config) -> GatewayRuntime {
         Err(_) => return failed("timed out building the gateway client".to_string()),
     };
 
-    // The activity SSE pump starts immediately and reconnects on its own
-    // schedule: the feed comes alive whenever the gateway does, regardless of
-    // when (or whether) the status-bar retry runs. `subscribe_activity` spawns
-    // on the admin runtime's handle explicitly, so it is safe from this thread.
-    let activity = Mutex::new(Some(client.subscribe_activity(&handle)));
-
     // Startup probe: driven on the admin runtime, observed by pages.
     let (link_tx, link) = watch::channel(Link::Pending);
     probe(&handle, client.clone(), link_tx.clone());
@@ -195,7 +225,7 @@ pub(crate) fn spawn(config: gateway::config::Config) -> GatewayRuntime {
         chat_url,
         link,
         link_tx: Some(link_tx),
-        activity,
+        activity_active: Arc::new(Mutex::new(false)),
         link_down: Arc::new(AtomicBool::new(false)),
         failure: None,
     }
@@ -218,14 +248,28 @@ impl GatewayRuntime {
         }
     }
 
-    /// Take the live-activity subscription (single-consumer; the first taker —
-    /// the GUI's activity feed — owns it, later calls get `None`). The SSE pump
-    /// reconnects and reseeds on its own, so this resolves immediately.
-    pub(crate) fn take_activity(
-        &self,
-    ) -> impl Future<Output = Option<gateway::activity::ActivityReceiver>> + Send + 'static {
-        let activity = self.activity.lock().ok().and_then(|mut slot| slot.take());
-        async move { activity }
+    /// Result of attempting to become the activity feed's sole consumer.
+    pub(crate) fn take_activity(&self) -> ActivitySubscription {
+        let mut active = match self.activity_active.lock() {
+            Ok(active) => active,
+            Err(error) => {
+                tracing::warn!(?error, "activity subscription state lock poisoned");
+                return ActivitySubscription::Unavailable;
+            }
+        };
+        if *active {
+            return ActivitySubscription::Busy;
+        }
+        let (Some(handle), Some(client)) = (self.handle.as_ref(), self.client.as_ref()) else {
+            tracing::warn!("activity subscription runtime unavailable");
+            return ActivitySubscription::Unavailable;
+        };
+        let receiver = client.subscribe_activity(handle);
+        *active = true;
+        ActivitySubscription::Acquired(ActivityReservation::new(
+            receiver,
+            Arc::clone(&self.activity_active),
+        ))
     }
 
     /// Re-run the startup probe (the status-bar retry for the Unreachable

@@ -88,8 +88,8 @@ impl App {
         });
 
         // The shared activity feed: one entity, one gateway SSE subscription,
-        // every page renders it. The subscription is taken once — this is that
-        // once.
+        // every page renders it. The feed acquires and recreates its subscription
+        // as needed when the receiver closes.
         let feed = cx.new(ActivityFeed::new);
 
         let status_page = cx.new(|cx| StatusPage::new(state.clone(), feed.clone(), window, cx));
