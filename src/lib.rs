@@ -88,6 +88,12 @@ fn apply_light_theme(cx: &mut gpui::App) {
         c.list_active = gpui::rgb(SELECTED).into();
         c.list_active_border = gpui::rgb(PRIMARY).into();
 
+        // Prefer MiSans VF when installed. The registered family name is
+        // "MiSans VF" (the file is MiSansVF.ttf) — GPUI matches by family name.
+        // On systems without it, GPUI's own fallback font stack takes over.
+        // theme.font_family = "阿里妈妈方圆体 VF".into();
+        // theme.font_family = "MiSans VF".into();
+
         // Match the app's 13px base / 12px mono type scale.
         theme.font_size = px(13.);
         theme.mono_font_size = px(12.);

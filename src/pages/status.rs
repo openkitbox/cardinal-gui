@@ -211,7 +211,8 @@ impl Render for StatusPage {
                                     state.update(cx, |state, cx| state.set_status_tab(next, cx));
                                 }
                             })
-                            .children(StatusTab::ALL.map(|tab| Tab::new().label(tab.label()))),
+                            .children(StatusTab::ALL.map(|tab| Tab::new().label(tab.label())))
+                            .font_weight(gpui::FontWeight::SEMIBOLD),
                     )
                     .child(
                         gpui::div()

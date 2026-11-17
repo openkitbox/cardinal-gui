@@ -1182,7 +1182,6 @@ fn kpi_value(value: String, cx: &gpui::App) -> gpui::AnyElement {
     gpui::div()
         .text_size(px(22.))
         .font_weight(gpui::FontWeight::SEMIBOLD)
-        .font_family("Avenir Next")
         .text_color(cx.theme().foreground)
         .child(value)
         .into_any_element()
