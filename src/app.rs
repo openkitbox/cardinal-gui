@@ -70,6 +70,11 @@ impl AppState {
 
 /// The root view: tab-bar content area with a bottom status bar.
 pub struct App {
+    /// Shared tab state, kept here only for the offscreen screenshot tool so
+    /// it can select a scene without simulating UI clicks. `StatusPage` owns
+    /// the state handle production code actually needs.
+    #[cfg(feature = "screenshot-test")]
+    state: Entity<AppState>,
     status_page: Entity<StatusPage>,
     feed: Entity<ActivityFeed>,
     focus_handle: FocusHandle,
@@ -101,12 +106,34 @@ impl App {
         Self::watch_relay_spawn(cx);
 
         Self {
+            #[cfg(feature = "screenshot-test")]
+            state,
             status_page,
             feed,
             focus_handle,
             relay: None,
             last_relay: None,
         }
+    }
+
+    /// Handles to the pieces the offscreen screenshot tool drives directly
+    /// (active tab and page forms). Production code never calls this.
+    #[cfg(feature = "screenshot-test")]
+    #[doc(hidden)]
+    pub(crate) fn screenshot_handles(&self) -> (Entity<AppState>, Entity<StatusPage>) {
+        (self.state.clone(), self.status_page.clone())
+    }
+
+    /// `admin_call` refuses to send anything until the startup probe has set
+    /// the gateway link to Connected. The screenshot tool waits on this before
+    /// driving any page action, otherwise admin reads silently evaporate.
+    #[cfg(feature = "screenshot-test")]
+    #[doc(hidden)]
+    pub(crate) fn gateway_connected_for_screenshot(&self) -> bool {
+        matches!(
+            self.relay,
+            Some(Ok(crate::runtime::RelayMode::Connected(_)))
+        )
     }
 
     /// The status-bar 重试 (shown while the gateway is unreachable): re-run the

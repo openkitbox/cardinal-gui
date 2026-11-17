@@ -17,9 +17,20 @@ pub mod load;
 mod pages;
 mod runtime;
 mod sales_mode;
+#[cfg(feature = "screenshot-test")]
+mod screenshots;
 mod ui_tz;
 
 use app::App;
+
+/// Render the GUI's key screens offscreen from a fixed mock fixture and write
+/// PNGs for pre-commit visual review. See `docs/screenshots.md`. Hidden from
+/// docs: this is a developer tool, not part of the application's public API.
+#[cfg(feature = "screenshot-test")]
+#[doc(hidden)]
+pub fn run_screenshots() -> Result<(), String> {
+    screenshots::run()
+}
 
 use crate::assets::GuiAssets;
 use gpui::{AppContext as _, WindowBounds, px, size};

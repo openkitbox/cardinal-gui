@@ -195,6 +195,21 @@ impl UsersPage {
         }
     }
 
+    /// Screenshot-only readiness probe; absent from production builds.
+    #[cfg(feature = "screenshot-test")]
+    pub(crate) fn is_loaded_for_screenshot(&self) -> bool {
+        matches!(self.state, LoadState::Loaded(_))
+    }
+
+    #[cfg(feature = "screenshot-test")]
+    pub(crate) fn screenshot_state(&self) -> String {
+        match &self.state {
+            LoadState::Loading => "Loading".to_owned(),
+            LoadState::Loaded(users) => format!("Loaded({})", users.len()),
+            LoadState::Failed(error) => format!("Failed({error})"),
+        }
+    }
+
     pub(crate) fn set_active(&mut self, active: bool) {
         self.active = active;
     }

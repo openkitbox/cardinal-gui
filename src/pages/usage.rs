@@ -414,6 +414,12 @@ pub struct UsagePage {
 }
 
 impl UsagePage {
+    /// Screenshot-only readiness probe; absent from production builds.
+    #[cfg(feature = "screenshot-test")]
+    pub(crate) fn is_loaded_for_screenshot(&self) -> bool {
+        matches!(self.state, LoadState::Loaded(_))
+    }
+
     pub(crate) fn set_active(&mut self, active: bool, cx: &mut Context<Self>) {
         if self.active == active {
             return;

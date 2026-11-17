@@ -788,6 +788,60 @@ fn consume_resync_revision(active: bool, seen: &mut u64, current: u64) -> bool {
     active && changed
 }
 
+/// Screenshot-only entry points. The headless tool is a sibling module and
+/// cannot call the private handlers; keeping the wrappers feature-gated means
+/// production builds carry no widened visibility for these methods.
+#[cfg(feature = "screenshot-test")]
+impl ProvidersPage {
+    pub(crate) fn open_key_form_for_screenshot(
+        &mut self,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.open_key_form(window, cx);
+    }
+
+    pub(crate) fn open_key_editor_for_screenshot(
+        &mut self,
+        provider_id: i64,
+        key_id: i64,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.open_key_editor(provider_id, key_id, window, cx);
+    }
+
+    /// Readiness observed by the screenshot tool: the bootstrap has been
+    /// applied and a form action has actually taken effect.
+    pub(crate) fn is_loaded_for_screenshot(&self) -> bool {
+        matches!(self.state, LoadState::Loaded(_))
+    }
+
+    pub(crate) fn has_key_form_for_screenshot(&self) -> bool {
+        self.key_form.is_some()
+    }
+
+    /// True once the reveal response has landed in the open editor.
+    pub(crate) fn editor_key_revealed_for_screenshot(&self) -> bool {
+        self.key_editor
+            .as_ref()
+            .is_some_and(|editor| editor.api_key.is_some())
+    }
+
+    #[cfg(feature = "screenshot-test")]
+    pub(crate) fn screenshot_editor_state(&self) -> String {
+        match &self.key_editor {
+            None => "no editor".to_owned(),
+            Some(editor) => format!(
+                "editor(key={}, revealed={}, error={:?})",
+                editor.key_id,
+                editor.api_key.is_some(),
+                editor.error
+            ),
+        }
+    }
+}
+
 impl ProvidersPage {
     pub(crate) fn set_active(&mut self, active: bool) {
         if self.active == active {

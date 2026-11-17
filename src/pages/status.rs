@@ -34,6 +34,55 @@ pub struct StatusPage {
 }
 
 impl StatusPage {
+    /// Handle to the providers page, used by the offscreen screenshot tool to
+    /// open the add/edit account forms before capture.
+    #[cfg(feature = "screenshot-test")]
+    #[doc(hidden)]
+    pub(crate) fn providers_entity(&self) -> Entity<ProvidersPage> {
+        self.providers.clone()
+    }
+
+    /// Screenshot-only readiness check for the active scene's page. The
+    /// headless tool gates the form action on the owning page's load state so
+    /// it never clicks into a still-loading page.
+    #[cfg(feature = "screenshot-test")]
+    #[doc(hidden)]
+    pub(crate) fn page_loaded_for_screenshot(&self, tab: StatusTab, cx: &gpui::App) -> bool {
+        match tab {
+            StatusTab::Providers => self.providers.read(cx).is_loaded_for_screenshot(),
+            StatusTab::Routes => self.routes.read(cx).is_loaded_for_screenshot(),
+            StatusTab::Usage => self.usage.read(cx).is_loaded_for_screenshot(),
+            StatusTab::Users => self.users.read(cx).is_loaded_for_screenshot(),
+            StatusTab::Requests | StatusTab::Keys | StatusTab::Settings => true,
+        }
+    }
+
+    #[cfg(feature = "screenshot-test")]
+    #[doc(hidden)]
+    pub(crate) fn screenshot_debug(&self, cx: &gpui::App) -> String {
+        format!(
+            "active_tab={:?} providers={} editor={} routes={} usage={} users={}",
+            self.active_tab,
+            self.providers.read(cx).is_loaded_for_screenshot(),
+            self.providers.read(cx).screenshot_editor_state(),
+            self.routes.read(cx).screenshot_state(),
+            self.usage.read(cx).is_loaded_for_screenshot(),
+            self.users.read(cx).screenshot_state(),
+        )
+    }
+
+    /// Drive tab activation and its reload directly. The normal path relies
+    /// on the `AppState` observer, whose delivery relative to a headless
+    /// dispatcher's frame pump is not deterministic; the tool calls this so a
+    /// scene's reload is issued on demand and can be waited on explicitly.
+    #[cfg(feature = "screenshot-test")]
+    #[doc(hidden)]
+    pub(crate) fn activate_tab_for_screenshot(&mut self, tab: StatusTab, cx: &mut Context<Self>) {
+        self.active_tab = Some(tab);
+        self.set_child_active(tab, cx);
+        self.refresh_child(tab, cx);
+    }
+
     pub(crate) fn new(
         state: Entity<AppState>,
         feed: Entity<crate::activity::ActivityFeed>,

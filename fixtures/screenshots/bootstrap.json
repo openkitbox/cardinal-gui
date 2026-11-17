@@ -1,0 +1,261 @@
+{
+  "providers": [
+    {
+      "id": 1,
+      "name": "openai",
+      "protocol": "openai_chat",
+      "base_url": "https://api.openai.com/v1",
+      "auth_scheme": "bearer",
+      "enabled": true,
+      "dns": "overseas"
+    },
+    {
+      "id": 2,
+      "name": "anthropic",
+      "protocol": "anthropic_messages",
+      "base_url": "https://api.anthropic.com/v1",
+      "auth_scheme": "x_api_key",
+      "enabled": true,
+      "dns": "overseas"
+    }
+  ],
+  "keys": [
+    {
+      "id": 10,
+      "provider_id": 1,
+      "label": "主用",
+      "enabled": true,
+      "position": 0,
+      "max_concurrency": 8,
+      "inflight": 2,
+      "rest_on_429": true,
+      "models": [
+        {
+          "id": "gpt-4o-mini",
+          "rate_multiplier": null,
+          "context": 128000,
+          "max_output": 16384,
+          "input_modalities": ["image"],
+          "effort_levels": ["low", "medium", "high"],
+          "default_effort": "medium"
+        },
+        {
+          "id": "gpt-4o",
+          "rate_multiplier": null,
+          "context": 128000,
+          "max_output": 16384,
+          "input_modalities": ["image"],
+          "effort_levels": ["low", "medium", "high"],
+          "default_effort": "medium"
+        }
+      ],
+      "allowed_models": null,
+      "auth_kind": "static",
+      "account": null,
+      "email": null,
+      "plan_type": null,
+      "organization": null,
+      "archived_at": null,
+      "proxy_configured": true
+    },
+    {
+      "id": 11,
+      "provider_id": 1,
+      "label": "备用",
+      "enabled": true,
+      "position": 1,
+      "max_concurrency": null,
+      "inflight": 0,
+      "rest_on_429": false,
+      "models": null,
+      "allowed_models": ["gpt-4o-mini"],
+      "auth_kind": "static",
+      "account": null,
+      "email": null,
+      "plan_type": null,
+      "organization": null,
+      "archived_at": null,
+      "proxy_configured": false
+    },
+    {
+      "id": 12,
+      "provider_id": 2,
+      "label": "Claude Pro",
+      "enabled": true,
+      "position": 0,
+      "max_concurrency": 4,
+      "inflight": 1,
+      "rest_on_429": true,
+      "models": [
+        {
+          "id": "claude-sonnet-4-5",
+          "rate_multiplier": null,
+          "context": 200000,
+          "max_output": 32000,
+          "input_modalities": ["image"],
+          "effort_levels": ["low", "medium", "high"],
+          "default_effort": "medium"
+        }
+      ],
+      "allowed_models": null,
+      "auth_kind": "static",
+      "account": null,
+      "email": null,
+      "plan_type": null,
+      "organization": null,
+      "archived_at": null,
+      "proxy_configured": false
+    },
+    {
+      "id": 13,
+      "provider_id": 2,
+      "label": "旧账号（已停用）",
+      "enabled": false,
+      "position": 1,
+      "max_concurrency": null,
+      "inflight": null,
+      "rest_on_429": true,
+      "models": null,
+      "allowed_models": null,
+      "auth_kind": "static",
+      "account": null,
+      "email": null,
+      "plan_type": null,
+      "organization": null,
+      "archived_at": "2026-10-01T00:00:00Z",
+      "proxy_configured": false
+    }
+  ],
+  "routes": [
+    {
+      "alias": "gpt-4o-mini",
+      "entries": [
+        { "key_id": 10, "model": "gpt-4o-mini" },
+        { "key_id": 11, "model": "gpt-4o-mini" }
+      ],
+      "context_window": 128000,
+      "strategy": "smart",
+      "note": "主用与备用按额度排名",
+      "efforts": ["low", "medium", "high"]
+    },
+    {
+      "alias": "claude-sonnet-4-5",
+      "entries": [
+        { "key_id": 12, "model": "claude-sonnet-4-5" }
+      ],
+      "context_window": 200000,
+      "strategy": "ordered"
+    }
+  ],
+  "rests": [
+    {
+      "key_id": 11,
+      "provider_id": 1,
+      "model": "gpt-4o",
+      "rest_until": "2026-11-17T01:00:00Z",
+      "reason": "upstream 429",
+      "provider_name": "openai",
+      "key_label": "备用"
+    }
+  ],
+  "quota_snapshots": [
+    {
+      "key_id": 10,
+      "quota": {
+        "windows": [
+          {
+            "name": "5h",
+            "used_pct": 34.5,
+            "resets_at": "2026-11-17T04:00:00Z",
+            "period_minutes": 300,
+            "total": null,
+            "used": null
+          },
+          {
+            "name": "本周",
+            "used_pct": 62.0,
+            "resets_at": "2026-11-23T00:00:00Z",
+            "period_minutes": 10080,
+            "total": null,
+            "used": null
+          }
+        ],
+        "balance": null,
+        "plan": "Pro",
+        "details": ["今日用量 $1.24", "本月用量 $18.60"],
+        "codex_resets": null
+      },
+      "fetched_at": "2026-11-17T00:05:00Z"
+    },
+    {
+      "key_id": 12,
+      "quota": {
+        "windows": [
+          {
+            "name": "5h",
+            "used_pct": 12.0,
+            "resets_at": "2026-11-17T03:00:00Z",
+            "period_minutes": 300,
+            "total": null,
+            "used": null
+          }
+        ],
+        "balance": { "amount": 12.34, "symbol": "$" },
+        "plan": "Team",
+        "details": [],
+        "codex_resets": null
+      },
+      "fetched_at": "2026-11-17T00:04:30Z"
+    }
+  ],
+  "quota_history": [
+    { "key_id": 10, "window_name": "5h", "used_pct": 10.0, "probed_at": "2026-11-16T20:00:00Z" },
+    { "key_id": 10, "window_name": "5h", "used_pct": 22.5, "probed_at": "2026-11-16T22:00:00Z" },
+    { "key_id": 10, "window_name": "5h", "used_pct": 34.5, "probed_at": "2026-11-17T00:00:00Z" }
+  ],
+  "balance_history": [
+    { "key_id": 12, "amount": 20.00, "opens_segment": true, "topup": 20.00, "probed_at": "2026-11-16T00:00:00Z" },
+    { "key_id": 12, "amount": 15.10, "opens_segment": false, "topup": null, "probed_at": "2026-11-16T12:00:00Z" },
+    { "key_id": 12, "amount": 12.34, "opens_segment": false, "topup": null, "probed_at": "2026-11-17T00:00:00Z" }
+  ],
+  "gateway_keys": [
+    {
+      "id": 100,
+      "key": "mock-placeholder-not-a-real-key-0001",
+      "label": "开发用",
+      "enabled": true,
+      "user_id": 1,
+      "login": "owner",
+      "created_at": "2026-11-01T00:00:00Z",
+      "created_by": "owner",
+      "last_used_at": "2026-11-17T00:03:00Z",
+      "disabled_at": null,
+      "expires_at": "2026-12-01T00:00:00Z",
+      "quota_microus": 100000000,
+      "spent_microus": 12345678
+    },
+    {
+      "id": 101,
+      "key": "mock-placeholder-not-a-real-key-0002",
+      "label": "测试用",
+      "enabled": false,
+      "user_id": 2,
+      "login": "alice",
+      "created_at": "2026-11-05T00:00:00Z",
+      "created_by": "owner",
+      "last_used_at": null,
+      "disabled_at": "2026-11-10T00:00:00Z",
+      "expires_at": null,
+      "quota_microus": null,
+      "spent_microus": 0
+    }
+  ],
+  "model_success": [
+    { "key_id": 10, "served_model": "gpt-4o-mini", "last_ok": "2026-11-17T00:03:00Z" },
+    { "key_id": 12, "served_model": "claude-sonnet-4-5", "last_ok": "2026-11-16T23:58:00Z" }
+  ],
+  "key_groups": [
+    { "id": 1, "name": "主力", "key_ids": [10, 12] },
+    { "id": 2, "name": "备用", "key_ids": [11] }
+  ]
+}

@@ -1,0 +1,125 @@
+{
+  "users": [
+    {
+      "id": 1,
+      "login": "owner",
+      "display_name": "管理员",
+      "enabled": true,
+      "group_id": 1,
+      "group_name": "internal",
+      "rate_bp": null,
+      "group_rate_bp": 0,
+      "balance_microus": 500000000,
+      "max_concurrent": 16,
+      "rpm": null,
+      "created_at": "2026-11-01T00:00:00Z"
+    },
+    {
+      "id": 2,
+      "login": "alice",
+      "display_name": "Alice",
+      "enabled": true,
+      "group_id": 2,
+      "group_name": "team",
+      "rate_bp": 9500,
+      "group_rate_bp": 10000,
+      "balance_microus": 25000000,
+      "max_concurrent": 4,
+      "rpm": 60,
+      "created_at": "2026-11-05T00:00:00Z"
+    },
+    {
+      "id": 3,
+      "login": "bob",
+      "display_name": "Bob",
+      "enabled": false,
+      "group_id": 2,
+      "group_name": "team",
+      "rate_bp": null,
+      "group_rate_bp": 10000,
+      "balance_microus": 0,
+      "max_concurrent": 2,
+      "rpm": null,
+      "created_at": "2026-11-08T00:00:00Z"
+    }
+  ],
+  "groups": [
+    { "id": 1, "name": "internal", "rate_bp": 0, "route_aliases": null, "user_count": 1 },
+    { "id": 2, "name": "team", "rate_bp": 10000, "route_aliases": ["gpt-4o-mini", "claude-sonnet-4-5"], "user_count": 2 }
+  ],
+  "quotas": [
+    {
+      "key_id": 10,
+      "quota": {
+        "windows": [
+          {
+            "name": "5h",
+            "used_pct": 34.5,
+            "resets_at": "2026-11-17T04:00:00Z",
+            "period_minutes": 300,
+            "total": null,
+            "used": null
+          },
+          {
+            "name": "本周",
+            "used_pct": 62.0,
+            "resets_at": "2026-11-23T00:00:00Z",
+            "period_minutes": 10080,
+            "total": null,
+            "used": null
+          }
+        ],
+        "balance": null,
+        "plan": "Pro",
+        "details": ["今日用量 $1.24", "本月用量 $18.60"],
+        "codex_resets": null
+      }
+    },
+    {
+      "key_id": 12,
+      "quota": {
+        "windows": [
+          {
+            "name": "5h",
+            "used_pct": 12.0,
+            "resets_at": "2026-11-17T03:00:00Z",
+            "period_minutes": 300,
+            "total": null,
+            "used": null
+          }
+        ],
+        "balance": { "amount": 12.34, "symbol": "$" },
+        "plan": "Team",
+        "details": [],
+        "codex_resets": null
+      }
+    }
+  ],
+  "usage_window": {
+    "input_tokens": 12500000,
+    "output_tokens": 2340000,
+    "cached_input_tokens": 4100000,
+    "requests": 1842,
+    "failed": 23,
+    "cost_usd": 4.5678,
+    "charged_microus": 5312000,
+    "unpriced": 5,
+    "timed_output": 2300000,
+    "timed_ms": 184000000,
+    "decode_ms": 92000000
+  },
+  "usage_trend": [
+    { "bucket": "2026-11-11", "category": "gpt-4o-mini", "input_tokens": 2100000, "output_tokens": 380000, "cached_input_tokens": 700000, "requests": 310, "failed": 4, "cost_usd": 0.71, "charged_microus": 810000, "timed_output": 375000, "timed_ms": 30000000, "decode_ms": 15000000 },
+    { "bucket": "2026-11-11", "category": "claude-sonnet-4-5", "input_tokens": 900000, "output_tokens": 140000, "cached_input_tokens": 200000, "requests": 120, "failed": 1, "cost_usd": 0.52, "charged_microus": 600000, "timed_output": 138000, "timed_ms": 12000000, "decode_ms": 6000000 },
+    { "bucket": "2026-11-12", "category": "gpt-4o-mini", "input_tokens": 2600000, "output_tokens": 460000, "cached_input_tokens": 850000, "requests": 380, "failed": 6, "cost_usd": 0.88, "charged_microus": 1020000, "timed_output": 455000, "timed_ms": 37000000, "decode_ms": 18500000 },
+    { "bucket": "2026-11-12", "category": "claude-sonnet-4-5", "input_tokens": 1100000, "output_tokens": 180000, "cached_input_tokens": 300000, "requests": 150, "failed": 2, "cost_usd": 0.64, "charged_microus": 740000, "timed_output": 178000, "timed_ms": 15000000, "decode_ms": 7500000 },
+    { "bucket": "2026-11-13", "category": "gpt-4o-mini", "input_tokens": 2400000, "output_tokens": 420000, "cached_input_tokens": 790000, "requests": 350, "failed": 5, "cost_usd": 0.81, "charged_microus": 940000, "timed_output": 415000, "timed_ms": 35000000, "decode_ms": 17500000 },
+    { "bucket": "2026-11-13", "category": "claude-sonnet-4-5", "input_tokens": 1000000, "output_tokens": 160000, "cached_input_tokens": 250000, "requests": 140, "failed": 1, "cost_usd": 0.58, "charged_microus": 680000, "timed_output": 158000, "timed_ms": 14000000, "decode_ms": 7000000 },
+    { "bucket": "2026-11-14", "category": "gpt-4o-mini", "input_tokens": 1900000, "output_tokens": 340000, "cached_input_tokens": 620000, "requests": 280, "failed": 3, "cost_usd": 0.64, "charged_microus": 750000, "timed_output": 335000, "timed_ms": 28000000, "decode_ms": 14000000 },
+    { "bucket": "2026-11-14", "category": "claude-sonnet-4-5", "input_tokens": 850000, "output_tokens": 130000, "cached_input_tokens": 180000, "requests": 110, "failed": 1, "cost_usd": 0.49, "charged_microus": 570000, "timed_output": 128000, "timed_ms": 11000000, "decode_ms": 5500000 },
+    { "bucket": "2026-11-15", "category": "gpt-4o-mini", "input_tokens": 1500000, "output_tokens": 270000, "cached_input_tokens": 500000, "requests": 220, "failed": 2, "cost_usd": 0.51, "charged_microus": 590000, "timed_output": 265000, "timed_ms": 22000000, "decode_ms": 11000000 },
+    { "bucket": "2026-11-15", "category": "claude-sonnet-4-5", "input_tokens": 700000, "output_tokens": 100000, "cached_input_tokens": 140000, "requests": 90, "failed": 0, "cost_usd": 0.40, "charged_microus": 470000, "timed_output": 99000, "timed_ms": 9000000, "decode_ms": 4500000 },
+    { "bucket": "2026-11-16", "category": "gpt-4o-mini", "input_tokens": 1100000, "output_tokens": 200000, "cached_input_tokens": 380000, "requests": 170, "failed": 2, "cost_usd": 0.38, "charged_microus": 440000, "timed_output": 195000, "timed_ms": 17000000, "decode_ms": 8500000 },
+    { "bucket": "2026-11-16", "category": "claude-sonnet-4-5", "input_tokens": 600000, "output_tokens": 90000, "cached_input_tokens": 120000, "requests": 80, "failed": 0, "cost_usd": 0.35, "charged_microus": 400000, "timed_output": 89000, "timed_ms": 8000000, "decode_ms": 4000000 }
+  ]
+}
