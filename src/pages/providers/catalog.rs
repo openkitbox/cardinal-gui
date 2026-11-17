@@ -12,8 +12,6 @@ pub(super) enum ProviderIcon {
     /// SVG logo embedded in the binary (width/height patched to 96px at import
     /// so resvg rasterizes crisply), rendered full-color via `img()`.
     Svg(&'static [u8]),
-    /// A letter tile for catalog vendors without a bundled logo.
-    Letter(&'static str),
 }
 
 /// One entry of the hardcoded provider catalog. `name` is the value stored in
@@ -201,17 +199,7 @@ pub(super) const PROVIDER_SPECS: &[ProviderSpec] = &[
         protocol: "openai_chat",
         auth_scheme: "bearer",
         dns: Dns::Domestic,
-        icon: ProviderIcon::Letter("W"),
-        login: Some(AccountLogin::WorkbuddyBrowser),
-    },
-    ProviderSpec {
-        name: "workbuddy-intl",
-        display: "WorkBuddy 国际",
-        base_url: "https://www.workbuddy.ai",
-        protocol: "openai_chat",
-        auth_scheme: "bearer",
-        dns: Dns::Overseas,
-        icon: ProviderIcon::Letter("W"),
+        icon: ProviderIcon::Svg(provider_logos::WORKBUDDY),
         login: Some(AccountLogin::WorkbuddyBrowser),
     },
     ProviderSpec {
@@ -299,6 +287,7 @@ pub(super) fn spec_for(provider_name: &str) -> Option<&'static ProviderSpec> {
 pub(super) fn imported_logo(provider_name: &str) -> Option<&'static [u8]> {
     match provider_name.split('-').next().unwrap_or(provider_name) {
         "kiro" => Some(provider_logos::KIRO),
+        "workbuddy" => Some(provider_logos::WORKBUDDY),
         _ => None,
     }
 }
@@ -329,10 +318,18 @@ impl Region {
 
 /// (name, base_url, DNS region) for one vendor's region × Coding Plan combination;
 /// indexed `[coding_plan][region]`.
-type VariantTable = [[(&'static str, &'static str, Dns); 2]; 2];
+type CodingPlanTable = [[(&'static str, &'static str, Dns); 2]; 2];
+
+/// (name, base_url, DNS region) for one vendor's regional endpoints.
+type RegionTable = [(&'static str, &'static str, Dns); 2];
+
+pub(super) enum VariantTable {
+    CodingPlan(&'static CodingPlanTable),
+    Region(&'static RegionTable),
+}
 
 /// kimi：月之暗面平台（host 根，能力路径由网关拼接）与 Kimi Code（base 即版本根）。
-const KIMI_VARIANTS: VariantTable = [
+const KIMI_VARIANTS: CodingPlanTable = [
     [
         ("kimi", "https://api.moonshot.cn", Dns::Domestic),
         ("kimi-intl", "https://api.moonshot.ai", Dns::Overseas),
@@ -348,7 +345,7 @@ const KIMI_VARIANTS: VariantTable = [
 ];
 
 /// glm：标准版与 Coding Plan（`/api/coding/paas/v4`），国内/国际各一套。
-const GLM_VARIANTS: VariantTable = [
+const GLM_VARIANTS: CodingPlanTable = [
     [
         ("glm", "https://open.bigmodel.cn/api/paas/v4", Dns::Domestic),
         ("glm-intl", "https://api.z.ai/api/paas/v4", Dns::Overseas),
@@ -367,12 +364,21 @@ const GLM_VARIANTS: VariantTable = [
     ],
 ];
 
+/// WorkBuddy's domestic and international endpoints have no Coding Plan
+/// dimension, so the authoritative region rows are stored only once.
+const WORKBUDDY_REGIONS: RegionTable = [
+    ("workbuddy", "https://copilot.tencent.com", Dns::Domestic),
+    ("workbuddy-intl", "https://www.workbuddy.ai", Dns::Overseas),
+];
+const WORKBUDDY_VARIANTS: VariantTable = VariantTable::Region(&WORKBUDDY_REGIONS);
+
 /// The region × Coding Plan variant table of a catalog spec, when the vendor
-/// has one (only kimi/glm do).
+/// has one.
 pub(super) fn variants_of(spec: &ProviderSpec) -> Option<&'static VariantTable> {
     match spec.name {
-        "kimi" => Some(&KIMI_VARIANTS),
-        "glm" => Some(&GLM_VARIANTS),
+        "kimi" => Some(&VariantTable::CodingPlan(&KIMI_VARIANTS)),
+        "glm" => Some(&VariantTable::CodingPlan(&GLM_VARIANTS)),
+        "workbuddy" => Some(&WORKBUDDY_VARIANTS),
         _ => None,
     }
 }
@@ -386,15 +392,27 @@ pub(super) fn variants_of(spec: &ProviderSpec) -> Option<&'static VariantTable> 
 pub(super) fn variant_of_row(name: &str, base_url: &str) -> Option<(Region, bool)> {
     let vendor = name.split('-').next().unwrap_or(name);
     let table = match vendor {
-        "kimi" => &KIMI_VARIANTS,
-        "glm" => &GLM_VARIANTS,
+        "kimi" => &VariantTable::CodingPlan(&KIMI_VARIANTS),
+        "glm" => &VariantTable::CodingPlan(&GLM_VARIANTS),
+        "workbuddy" => &WORKBUDDY_VARIANTS,
         _ => return None,
     };
     let base = base_url.trim_end_matches('/');
-    for (coding_index, row) in table.iter().enumerate() {
-        for (region_index, (variant_name, variant_url, _)) in row.iter().enumerate() {
-            if *variant_name == name && *variant_url == base {
-                return Some((Region::ALL[region_index], coding_index == 1));
+    match table {
+        VariantTable::CodingPlan(table) => {
+            for (coding_index, row) in table.iter().enumerate() {
+                for (region_index, (variant_name, variant_url, _)) in row.iter().enumerate() {
+                    if *variant_name == name && *variant_url == base {
+                        return Some((Region::ALL[region_index], coding_index == 1));
+                    }
+                }
+            }
+        }
+        VariantTable::Region(table) => {
+            for (region_index, (variant_name, variant_url, _)) in table.iter().enumerate() {
+                if *variant_name == name && *variant_url == base {
+                    return Some((Region::ALL[region_index], false));
+                }
             }
         }
     }
@@ -410,7 +428,8 @@ pub(super) fn resolve(
     coding_plan: bool,
 ) -> (&'static str, &'static str, Dns) {
     match variants_of(spec) {
-        Some(table) => table[coding_plan as usize][region as usize],
+        Some(VariantTable::CodingPlan(table)) => table[coding_plan as usize][region as usize],
+        Some(VariantTable::Region(table)) => table[region as usize],
         None => (spec.name, spec.base_url, spec.dns),
     }
 }

@@ -238,8 +238,7 @@ impl ProvidersPage {
                     )
                 },
             )
-            // 入口变体：仅 kimi/glm 有区域 × Coding Plan 之分；两个小按钮单选区域，
-            // 一个 chip 切换 Coding Plan（风格对齐上面的 provider 选择按钮）。
+            // 入口变体：区域 chips，以及 kimi/glm 的 Coding Plan chip。
             .when(
                 catalog_spec.is_some_and(|spec| variants_of(spec).is_some()),
                 |this| {
@@ -283,7 +282,10 @@ impl ProvidersPage {
                                             .child(region.label()),
                                     )
                             }))
-                            .child({
+                            .when(
+                                catalog_spec.is_some_and(|spec| spec.name != "workbuddy"),
+                                |this| {
+                                    this.child({
                                 let selected = form.coding_plan;
                                 gpui::div()
                                     .id("key-form-coding-plan")
@@ -315,7 +317,9 @@ impl ProvidersPage {
                                             .text_color(cx.theme().foreground)
                                             .child("Coding Plan"),
                                     )
-                            }),
+                                    })
+                                },
+                            ),
                     )
                 },
             )
@@ -1870,7 +1874,6 @@ fn model_rows(key: &ProviderKeyView, cx: &App) -> Div {
 fn provider_icon(spec: &'static ProviderSpec, height: f32, cx: &App) -> Div {
     match &spec.icon {
         ProviderIcon::Svg(bytes) => logo(bytes, height, cx),
-        ProviderIcon::Letter(letter) => letter_tile(letter, height, cx),
     }
 }
 
@@ -1896,7 +1899,15 @@ fn provider_icon_for(
     }
     match imported_logo(&provider.name) {
         Some(bytes) => logo(bytes, height, cx),
-        None => letter_tile(&provider.name[..1].to_uppercase(), height, cx),
+        None => {
+            let initial = provider
+                .name
+                .chars()
+                .next()
+                .map(|character| character.to_uppercase().collect::<String>())
+                .unwrap_or_else(|| "?".to_owned());
+            letter_tile(&initial, height, cx)
+        }
     }
 }
 

@@ -75,6 +75,8 @@ pub(crate) mod provider_logos {
     pub(crate) const COMMANDCODE: &[u8] = include_bytes!("../assets/providers/commandcode.svg");
     /// Cursor (the cube mark, lobe-icons).
     pub(crate) const CURSOR: &[u8] = include_bytes!("../assets/providers/cursor.svg");
+    /// WorkBuddy (vendor brand mark).
+    pub(crate) const WORKBUDDY: &[u8] = include_bytes!("../assets/providers/workbuddy.svg");
     /// Kiro (the purple mark, from magpie's lobe-icon set). Kiro is imported
     /// rather than created from the picker, so it has no catalog entry — the
     /// cards resolve this logo by provider name.
