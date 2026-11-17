@@ -367,6 +367,14 @@ impl ProvidersPage {
                     cx,
                 ))
             })
+            // Proxy credentials are input only; the gateway never returns the
+            // URL, so the form only ever holds what the operator typed now.
+            .child(editor_field(
+                "代理",
+                Input::new(&form.proxy_url).disabled(form.saving),
+                None,
+                cx,
+            ))
             // 普通供应商才显示模型探测；Kiro 导入必须保持纯本地解析，登录账号无 key 可探测。
             .when(has_pasted_key, |this| {
                 this.child(
@@ -992,9 +1000,10 @@ impl ProvidersPage {
             // only): 区域 (国内/国际) + Coding Plan — the variant decides the
             // anthropic capability, so the card says which entry it sits on.
             // Display-only; wraps when long; no row when there is no tag.
-            .when_some(tag_row(key_id, provider, groups, cx), |this, row| {
-                this.child(row)
-            })
+            .when_some(
+                tag_row(key_id, provider, groups, key.proxy_configured, cx),
+                |this, row| this.child(row),
+            )
             // Quota: one meter per probed window, and/or a balance line. A key
             // without a reading (unknown vendor, probe never succeeded) renders
             // neither — the section collapses and the card shrinks.
@@ -1284,6 +1293,55 @@ impl ProvidersPage {
                 "并发上限",
                 Input::new(&editor.max_concurrency).disabled(editor.saving),
                 Some(96.),
+                cx,
+            ))
+            // The stored proxy is a secret: only its configured state comes
+            // from the bootstrap view. Typing a URL replaces it; clearing is
+            // an explicit action and leaves the input disabled.
+            .child(
+                gpui::div()
+                    .flex()
+                    .items_center()
+                    .flex_wrap()
+                    .gap_2()
+                    .child(field_label("代理", cx))
+                    .child(
+                        gpui::div()
+                            .text_size(px(12.))
+                            .text_color(cx.theme().muted_foreground)
+                            .child(if key.proxy_configured {
+                                "已配置（URL 与密码不回显）"
+                            } else {
+                                "未配置"
+                            }),
+                    )
+                    .child(
+                        Button::new("key-editor-proxy-clear")
+                            .label(if editor.proxy_clear {
+                                "已选择清除"
+                            } else {
+                                "清除代理"
+                            })
+                            .outline()
+                            .compact()
+                            .disabled(!key.proxy_configured || editor.saving)
+                            .on_click(cx.listener(|this, _, window, cx| {
+                                if let Some(editor) = this.key_editor.as_mut() {
+                                    editor.proxy_clear = !editor.proxy_clear;
+                                    if editor.proxy_clear {
+                                        editor.proxy_url.update(cx, |input, cx| {
+                                            input.set_value("", window, cx)
+                                        });
+                                    }
+                                }
+                                cx.notify();
+                            })),
+                    ),
+            )
+            .child(editor_field(
+                "新代理",
+                Input::new(&editor.proxy_url).disabled(editor.saving || editor.proxy_clear),
+                None,
                 cx,
             ))
             // 分组归属：点击切换，可多选；保存时只在有变化时提交。
@@ -2104,11 +2162,22 @@ pub(super) fn inline_error(message: &str, cx: &App) -> Div {
         .child(message.to_string())
 }
 
-/// A card's tag row: group tags followed by the variant markers. Non-catalog
-/// rows (a manually-added provider) carry no markers. `None` when empty.
-fn tag_row(key_id: i64, provider: &ProviderRow, groups: &[KeyGroupView], cx: &App) -> Option<Div> {
+/// A card's tag row: group tags, the variant markers and the proxy marker.
+/// Non-catalog rows (a manually-added provider) carry no variant markers.
+/// `None` when empty. Every marker sizes to its own text; the concurrency tag
+/// stays alone on the header row.
+fn tag_row(
+    key_id: i64,
+    provider: &ProviderRow,
+    groups: &[KeyGroupView],
+    proxy_configured: bool,
+    cx: &App,
+) -> Option<Div> {
     let mut tags = group_tags(key_id, groups, cx);
     tags.extend(variant_markers(provider, cx));
+    if proxy_configured {
+        tags.push(variant_marker("代理", cx));
+    }
     if tags.is_empty() {
         return None;
     }

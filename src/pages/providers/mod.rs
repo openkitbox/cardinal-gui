@@ -331,6 +331,9 @@ struct KeyForm {
     credential_mode: CredentialMode,
     /// Optional per-key concurrency cap (empty = 不限).
     max_concurrency: Entity<InputState>,
+    /// Optional per-key HTTPS/SOCKS5 egress proxy. Empty = no proxy; the
+    /// gateway validates the URL before storing it and never echoes it back.
+    proxy_url: Entity<InputState>,
     /// Models the last 获取模型 probe returned (None until probed).
     probed_models: Option<Vec<ProbeModel>>,
     /// Narrows the rendered chips to model ids containing this text. A pure
@@ -436,6 +439,14 @@ struct ImportOutcome {
     /// Set when the provider row was created by this run, every account
     /// failed, and removing the now-empty row failed too.
     cleanup_error: Option<String>,
+}
+
+/// Per-account settings shared by one Kiro import run. Grouped so the import
+/// task factory does not grow one more positional argument per key field.
+struct ImportOptions {
+    group_ids: Option<Arc<[i64]>>,
+    max_concurrency: Option<Option<i32>>,
+    proxy_url: Option<Arc<str>>,
 }
 
 /// Accounts imported in parallel within one run (each is one gateway POST
@@ -614,6 +625,11 @@ struct KeyEditor {
     label: Entity<InputState>,
     /// Concurrency cap; empty = 不限 (PATCH clears the column).
     max_concurrency: Entity<InputState>,
+    /// Replacement proxy URL. Always blank on open: the stored URL contains
+    /// credentials and is never echoed back. Empty = leave it untouched.
+    proxy_url: Entity<InputState>,
+    /// The operator explicitly asked to clear the stored proxy on save.
+    proxy_clear: bool,
     /// Model whitelist selection (prefilled from the key; empty = 全部模型).
     selected_models: Vec<String>,
     /// Group memberships being edited (prefilled from the loaded groups).
@@ -1549,6 +1565,9 @@ impl ProvidersPage {
         });
         let max_concurrency =
             cx.new(|cx| InputState::new(window, cx).placeholder("并发上限（空 = 不限）"));
+        let proxy_url = cx.new(|cx| {
+            InputState::new(window, cx).placeholder("代理（https:// 或 socks5://，可选）")
+        });
         let focus = label.read(cx).focus_handle(cx);
         window.focus(&focus, cx);
         let source = FormSource::Catalog(0);
@@ -1567,6 +1586,7 @@ impl ProvidersPage {
             login: source.login_form(self.form_generation),
             credential_mode: CredentialMode::AccountLogin,
             max_concurrency,
+            proxy_url,
             probed_models: None,
             model_filter: Self::model_filter_input(window, cx),
             selected_models: Vec::new(),
@@ -1742,6 +1762,16 @@ impl ProvidersPage {
             cx.notify();
             return;
         }
+        let proxy_url = match Self::parse_proxy(&form.proxy_url.read(cx).value()) {
+            Ok(proxy_url) => proxy_url,
+            Err(message) => {
+                if let Some(form) = &mut self.key_form {
+                    form.error = Some(message.to_string());
+                }
+                cx.notify();
+                return;
+            }
+        };
         let target = match form.target(cx) {
             Ok(target) => target,
             Err(message) => {
@@ -1771,7 +1801,11 @@ impl ProvidersPage {
             .global::<GatewayRuntime>()
             .admin_call(move |admin| async move {
                 let input = target.input();
-                let models = admin.validate_key(&input, &api_key).await?;
+                // The typed proxy goes into the validation probe itself: the
+                // first model listing must already use the account's egress.
+                let models = admin
+                    .validate_key(&input, &api_key, proxy_url.as_deref())
+                    .await?;
                 // Custom provider ↔ key is one-to-one (name = label): creating
                 // fails on a taken name instead of attaching to someone else's row.
                 let (provider_id, provider_created) = if custom {
@@ -1786,6 +1820,7 @@ impl ProvidersPage {
                         &api_key,
                         max_concurrency,
                         allowed_models,
+                        proxy_url.as_deref(),
                     )
                     .await
                 {
@@ -1938,6 +1973,16 @@ impl ProvidersPage {
                 return;
             }
         };
+        let proxy_url = match Self::parse_proxy(&form.proxy_url.read(cx).value()) {
+            Ok(proxy_url) => proxy_url.map(Arc::from),
+            Err(message) => {
+                if let Some(form) = &mut self.key_form {
+                    form.error = Some(message.to_string());
+                }
+                cx.notify();
+                return;
+            }
+        };
         // A group deleted since the page loaded would fail every item with
         // the same 400; refuse the batch up front instead.
         if !import.selected_groups.is_empty() {
@@ -1989,8 +2034,11 @@ impl ProvidersPage {
                     &provider_name,
                     &endpoint,
                     jobs,
-                    group_ids,
-                    max_concurrency,
+                    ImportOptions {
+                        group_ids,
+                        max_concurrency,
+                        proxy_url,
+                    },
                     progress_tx,
                 )
                 .await
@@ -2128,6 +2176,16 @@ impl ProvidersPage {
                 return;
             }
         };
+        let proxy_url = match Self::parse_proxy(&form.proxy_url.read(cx).value()) {
+            Ok(proxy_url) => proxy_url,
+            Err(message) => {
+                if let Some(form) = &mut self.key_form {
+                    form.error = Some(message.to_string());
+                }
+                cx.notify();
+                return;
+            }
+        };
         let generation = self.form_generation;
         if let Some(form) = &mut self.key_form {
             form.saving = true;
@@ -2149,6 +2207,7 @@ impl ProvidersPage {
                     key_id: None,
                     group_ids: Vec::new(),
                     max_concurrency,
+                    proxy_url: proxy_url.clone(),
                 };
                 match kind {
                     AccountLogin::OpencodeDevice => admin
@@ -2177,6 +2236,7 @@ impl ProvidersPage {
                             key_id: None,
                             group_ids: request.group_ids,
                             max_concurrency: request.max_concurrency,
+                            proxy_url: request.proxy_url,
                         };
                         admin
                             .start_openai_login(&request)
@@ -2475,6 +2535,16 @@ impl ProvidersPage {
                 return;
             }
         };
+        let proxy_url = match Self::parse_proxy(&form.proxy_url.read(cx).value()) {
+            Ok(proxy_url) => proxy_url,
+            Err(message) => {
+                if let Some(form) = &mut self.key_form {
+                    form.error = Some(message.to_string());
+                }
+                cx.notify();
+                return;
+            }
+        };
         let Some(form) = &mut self.key_form else {
             return;
         };
@@ -2491,9 +2561,11 @@ impl ProvidersPage {
         let guard_target = target.clone();
         let call = cx
             .global::<GatewayRuntime>()
-            .admin_call(
-                move |admin| async move { admin.validate_key(&target.input(), &api_key).await },
-            );
+            .admin_call(move |admin| async move {
+                admin
+                    .validate_key(&target.input(), &api_key, proxy_url.as_deref())
+                    .await
+            });
         cx.spawn(async move |this, cx| {
             let result = call.await;
             this.update(cx, |page, cx| {
@@ -2647,6 +2719,15 @@ impl ProvidersPage {
             return;
         }
         let key_id = editor.key_id;
+        // A typed replacement proxy is used for the endpoint probe too, so an
+        // edited endpoint sees the same egress the save would configure.
+        let proxy_url = match Self::parse_proxy(&editor.proxy_url.read(cx).value()) {
+            Ok(proxy_url) => proxy_url,
+            Err(message) => {
+                self.fail_editor(message, cx);
+                return;
+            }
+        };
         // A custom row with an edited endpoint probes the new endpoint with the
         // revealed key (nothing is persisted until save); otherwise the saved
         // key is re-probed, which also refreshes its stored snapshot.
@@ -2690,7 +2771,9 @@ impl ProvidersPage {
                             enabled: true,
                             dns: target.dns,
                         };
-                        admin.validate_key(&input, &api_key).await
+                        admin
+                            .validate_key(&input, &api_key, proxy_url.as_deref())
+                            .await
                     }
                     None => admin.list_key_models(key_id).await,
                 }
@@ -2736,6 +2819,35 @@ impl ProvidersPage {
         }
     }
 
+    /// Read a typed proxy URL at the form boundary. Empty input means "no
+    /// proxy" for a new account, never a request to clear an existing one.
+    /// The gateway remains the authoritative validator; this only rejects
+    /// unsupported schemes early, before a key is created, and never puts the
+    /// typed value (which may carry credentials) into an error message.
+    fn parse_proxy(raw: &str) -> Result<Option<String>, &'static str> {
+        let raw = raw.trim();
+        if raw.is_empty() {
+            return Ok(None);
+        }
+        if !(raw.starts_with("https://") || raw.starts_with("socks5://")) {
+            return Err("代理仅支持 https:// 或 socks5://");
+        }
+        Ok(Some(raw.to_string()))
+    }
+
+    /// The editor's three-state proxy value: absent = leave untouched,
+    /// `Some(None)` = clear, `Some(Some(url))` = replace. An explicit clear
+    /// disables the replacement input in the UI, so the two cannot conflict.
+    fn editor_proxy(
+        editor: &KeyEditor,
+        cx: &gpui::App,
+    ) -> Result<Option<Option<String>>, &'static str> {
+        if editor.proxy_clear {
+            return Ok(Some(None));
+        }
+        Ok(Self::parse_proxy(&editor.proxy_url.read(cx).value())?.map(Some))
+    }
+
     /// Open the inline edit form for one existing key, prefilled from the
     /// credential-free view, and fetch the plaintext credential once (the only
     /// credential read: the list shapes deliberately carry none).
@@ -2771,6 +2883,12 @@ impl ProvidersPage {
                 input.set_value(limit.to_string(), window, cx)
             });
         }
+        // The stored URL is a secret: the view only tells us whether one is
+        // configured, so the replacement field always starts blank.
+        let proxy_url = cx.new(|cx| {
+            InputState::new(window, cx)
+                .placeholder("新代理（https:// 或 socks5://；留空 = 不改动）")
+        });
         let focus = label.read(cx).focus_handle(cx);
         window.focus(&focus, cx);
         let initial_groups = match &self.state {
@@ -2807,6 +2925,8 @@ impl ProvidersPage {
             key_id,
             label,
             max_concurrency,
+            proxy_url,
+            proxy_clear: false,
             selected_models,
             selected_groups: initial_groups.clone(),
             initial_groups,
@@ -2940,6 +3060,13 @@ impl ProvidersPage {
             cx.notify();
             return;
         }
+        let proxy_url = match Self::editor_proxy(editor, cx) {
+            Ok(proxy_url) => proxy_url,
+            Err(message) => {
+                self.fail_editor(message, cx);
+                return;
+            }
+        };
         // The chips editor is always authoritative on save: an empty selection
         // clears the whitelist (inner None = unrestricted), a non-empty one sets it.
         let selected = editor.selected_models.clone();
@@ -3016,6 +3143,10 @@ impl ProvidersPage {
             .admin_call(move |admin| async move {
                 // Provider PATCH goes before the key PATCH: a rejected endpoint or
                 // a taken name leaves the key untouched.
+                // A replacement proxy is used for the endpoint probe as well;
+                // an unchanged/cleared proxy probes directly (the stored URL is
+                // a secret and is never echoed back to the GUI).
+                let probe_proxy = proxy_url.as_ref().and_then(Option::as_deref);
                 if let Some(write) = &provider_write {
                     let input = ProviderInput {
                         name: &label,
@@ -3026,7 +3157,9 @@ impl ProvidersPage {
                         dns: write.dns,
                     };
                     let models = match &write.validate_with {
-                        Some(api_key) => Some(admin.validate_key(&input, api_key).await?),
+                        Some(api_key) => {
+                            Some(admin.validate_key(&input, api_key, probe_proxy).await?)
+                        }
                         None => None,
                     };
                     admin.update_provider(provider_id, &input).await?;
@@ -3045,6 +3178,7 @@ impl ProvidersPage {
                         &KeyUpdate {
                             label: Some(&label),
                             max_concurrency,
+                            proxy_url,
                             allowed_models,
                             group_ids: group_ids.as_deref(),
                             ..Default::default()
@@ -3201,10 +3335,14 @@ async fn import_kiro_accounts(
     provider_name: &str,
     endpoint: &str,
     jobs: Vec<(String, kiro_import::ImportItem)>,
-    group_ids: Option<Arc<[i64]>>,
-    max_concurrency: Option<Option<i32>>,
+    options: ImportOptions,
     progress: tokio::sync::mpsc::UnboundedSender<()>,
 ) -> Result<ImportOutcome, gateway::http_client::ClientError> {
+    let ImportOptions {
+        group_ids,
+        max_concurrency,
+        proxy_url,
+    } = options;
     let (provider_id, provider_created) = admin
         .find_or_create_kiro_provider(provider_name, endpoint)
         .await?;
@@ -3218,6 +3356,7 @@ async fn import_kiro_accounts(
         let admin = admin.clone();
         let limit = Arc::clone(&limit);
         let group_ids = group_ids.clone();
+        let proxy_url = proxy_url.clone();
         let progress = progress.clone();
         let task_label = label.clone();
         let handle = tasks.spawn(async move {
@@ -3232,13 +3371,14 @@ async fn import_kiro_accounts(
                     &item.credentials,
                     group_ids.as_deref(),
                     max_concurrency,
+                    proxy_url.as_deref(),
                 )
-                .await;
+                .await
+                .err()
+                .map(|error| import_failure_message(&error.to_string()));
             // A closed receiver only means nobody watches the counter.
             let _ = progress.send(());
             result
-                .err()
-                .map(|error| import_failure_message(&error.to_string()))
         });
         labels.insert(handle.id(), label);
     }
