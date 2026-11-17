@@ -48,7 +48,8 @@ use gateway::admin_ops::Bootstrap;
 use gateway::http_client::{
     ClientError, CursorLoginRequest, CursorLoginStart, CursorLoginStatus, GatewayHttpClient,
     KeyUpdate, OpenaiLoginRequest, OpenaiLoginStart, OpenaiLoginStatus, OpenaiResetOutcome,
-    OpencodeLoginRequest, OpencodeLoginStart, OpencodeLoginStatus,
+    OpencodeLoginRequest, OpencodeLoginStart, OpencodeLoginStatus, WorkbuddyLoginRequest,
+    WorkbuddyLoginStart, WorkbuddyLoginStatus,
 };
 
 use gateway::probe::ProbeModel;
@@ -543,6 +544,18 @@ impl From<CursorLoginStart> for LoginStart {
     }
 }
 
+impl From<WorkbuddyLoginStart> for LoginStart {
+    fn from(start: WorkbuddyLoginStart) -> Self {
+        Self {
+            session: start.session,
+            user_code: None,
+            verification_url: start.login_url,
+            expires_in: start.expires_in,
+            interval: 1,
+        }
+    }
+}
+
 /// How often the block re-reads a Cursor login: the gateway polls Cursor
 /// every 500 ms, so a one-second read sees a landing within a second.
 const CURSOR_LOGIN_POLL_SECS: u64 = 1;
@@ -576,6 +589,15 @@ impl From<OpenaiLoginStatus> for LoginState {
 
 impl From<CursorLoginStatus> for LoginState {
     fn from(status: CursorLoginStatus) -> Self {
+        Self {
+            state: status.state,
+            message: status.message,
+        }
+    }
+}
+
+impl From<WorkbuddyLoginStatus> for LoginState {
+    fn from(status: WorkbuddyLoginStatus) -> Self {
         Self {
             state: status.state,
             message: status.message,
@@ -2140,6 +2162,13 @@ impl ProvidersPage {
                             .await
                             .map(LoginStart::from)
                     }
+                    AccountLogin::WorkbuddyBrowser => {
+                        let request: WorkbuddyLoginRequest = request;
+                        admin
+                            .start_workbuddy_login(provider_id, &request)
+                            .await
+                            .map(LoginStart::from)
+                    }
                     // OpenAI's route takes the provider in the body.
                     AccountLogin::OpenaiDevice => {
                         let request = OpenaiLoginRequest {
@@ -2237,6 +2266,10 @@ impl ProvidersPage {
                         .map(LoginState::from),
                     AccountLogin::CursorBrowser => admin
                         .cursor_login_status(&call_session)
+                        .await
+                        .map(LoginState::from),
+                    AccountLogin::WorkbuddyBrowser => admin
+                        .workbuddy_login_status(&call_session)
                         .await
                         .map(LoginState::from),
                     AccountLogin::OpenaiDevice => admin
@@ -2390,6 +2423,7 @@ impl ProvidersPage {
                 match kind {
                     AccountLogin::OpencodeDevice => admin.cancel_opencode_login(&session).await,
                     AccountLogin::CursorBrowser => admin.cancel_cursor_login(&session).await,
+                    AccountLogin::WorkbuddyBrowser => admin.cancel_workbuddy_login(&session).await,
                     AccountLogin::OpenaiDevice => admin.cancel_openai_login(&session).await,
                 }
             });

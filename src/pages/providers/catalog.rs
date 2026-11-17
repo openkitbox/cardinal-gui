@@ -12,6 +12,8 @@ pub(super) enum ProviderIcon {
     /// SVG logo embedded in the binary (width/height patched to 96px at import
     /// so resvg rasterizes crisply), rendered full-color via `img()`.
     Svg(&'static [u8]),
+    /// A letter tile for catalog vendors without a bundled logo.
+    Letter(&'static str),
 }
 
 /// One entry of the hardcoded provider catalog. `name` is the value stored in
@@ -42,6 +44,8 @@ pub(super) enum AccountLogin {
     /// Cursor's browser login: one URL carrying the challenge, no code; the
     /// gateway polls Cursor every 500 ms.
     CursorBrowser,
+    /// WorkBuddy's browser login: one URL carrying the challenge, no code.
+    WorkbuddyBrowser,
     /// ChatGPT Codex device flow: a user code typed at OpenAI's device page;
     /// the gateway polls the issuer on its interval.
     OpenaiDevice,
@@ -189,6 +193,26 @@ pub(super) const PROVIDER_SPECS: &[ProviderSpec] = &[
         dns: Dns::Overseas,
         icon: ProviderIcon::Svg(provider_logos::CURSOR),
         login: Some(AccountLogin::CursorBrowser),
+    },
+    ProviderSpec {
+        name: "workbuddy",
+        display: "WorkBuddy",
+        base_url: "https://copilot.tencent.com",
+        protocol: "openai_chat",
+        auth_scheme: "bearer",
+        dns: Dns::Domestic,
+        icon: ProviderIcon::Letter("W"),
+        login: Some(AccountLogin::WorkbuddyBrowser),
+    },
+    ProviderSpec {
+        name: "workbuddy-intl",
+        display: "WorkBuddy 国际",
+        base_url: "https://www.workbuddy.ai",
+        protocol: "openai_chat",
+        auth_scheme: "bearer",
+        dns: Dns::Overseas,
+        icon: ProviderIcon::Letter("W"),
+        login: Some(AccountLogin::WorkbuddyBrowser),
     },
     ProviderSpec {
         name: "kiro",

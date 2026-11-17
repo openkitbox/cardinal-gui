@@ -519,6 +519,10 @@ impl ProvidersPage {
                 "浏览器里登录 Cursor 账号；有 API key 也可以在上方切换为填写 key",
                 "已自动打开浏览器，登录 Cursor 后回到这里即可（若没打开请点上面的链接）",
             ),
+            AccountLogin::WorkbuddyBrowser => (
+                "浏览器里登录 WorkBuddy 账号",
+                "已自动打开浏览器，登录 WorkBuddy 后回到这里即可（若没打开请点上面的链接）",
+            ),
         };
         let mut fields = gpui::div().flex().flex_col().gap_2().child(
             gpui::div()
@@ -1864,8 +1868,10 @@ fn model_rows(key: &ProviderKeyView, cx: &App) -> Div {
 /// full-color (gpui's `svg()` element renders monochrome alpha-masks, so
 /// brand logos go through `img()` instead).
 fn provider_icon(spec: &'static ProviderSpec, height: f32, cx: &App) -> Div {
-    let ProviderIcon::Svg(bytes) = &spec.icon;
-    logo(bytes, height, cx)
+    match &spec.icon {
+        ProviderIcon::Svg(bytes) => logo(bytes, height, cx),
+        ProviderIcon::Letter(letter) => letter_tile(letter, height, cx),
+    }
 }
 
 /// A brand SVG rendered at `height` (see [`provider_icon`] for why `img()`).
@@ -2134,6 +2140,14 @@ fn account_row(
             key.account.as_deref(),
             revealed,
             "Cursor 账号",
+            plan,
+            cx,
+        )),
+        "workbuddy_oauth" => Some(oauth_account_row(
+            key,
+            key.account.as_deref(),
+            revealed,
+            "WorkBuddy 账号",
             plan,
             cx,
         )),
