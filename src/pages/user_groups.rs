@@ -95,6 +95,14 @@ impl UserGroupsView {
         }
     }
 
+    /// The route aliases loaded with the groups for this page refresh.
+    pub(crate) fn aliases(&self) -> Option<&[String]> {
+        match &self.state {
+            LoadState::Loaded(snapshot) => Some(&snapshot.aliases),
+            _ => None,
+        }
+    }
+
     fn group(&self, id: i64) -> Option<&GroupRow> {
         self.groups()?.iter().find(|group| group.id == id)
     }
@@ -443,7 +451,7 @@ impl UserGroupsView {
             .flex()
             .items_start()
             .gap_2()
-            .child(field_label("可用路由", cx))
+            .child(field_label("默认可见路由", cx))
             .child(gpui::div().flex_1().child(picker))
     }
 }

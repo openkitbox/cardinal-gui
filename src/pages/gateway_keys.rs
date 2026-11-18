@@ -39,6 +39,22 @@ use crate::runtime::GatewayRuntime;
 struct KeySnapshot {
     keys: Vec<GatewayKeyRow>,
     users: Vec<UserRow>,
+    aliases: Vec<String>,
+}
+
+#[derive(Clone, PartialEq, Eq)]
+enum RouteAccess {
+    Inherited,
+    Whitelist(Vec<String>),
+}
+
+impl RouteAccess {
+    fn as_update(&self) -> Option<&[String]> {
+        match self {
+            Self::Inherited => None,
+            Self::Whitelist(aliases) => Some(aliases),
+        }
+    }
 }
 
 /// The create/edit form. One editor at a time; opening it resets every field
@@ -59,6 +75,8 @@ struct KeyEditor {
     label: Entity<InputState>,
     expiry: Entity<DatePickerState>,
     quota: Entity<InputState>,
+    original_route_access: RouteAccess,
+    route_access: RouteAccess,
     enabled: bool,
     saving: bool,
     error: Option<String>,
@@ -182,6 +200,8 @@ impl GatewayKeysPage {
             label,
             expiry: Self::date_picker(window, cx),
             quota,
+            original_route_access: RouteAccess::Inherited,
+            route_access: RouteAccess::Inherited,
             enabled: true,
             saving: false,
             error: None,
@@ -241,6 +261,14 @@ impl GatewayKeysPage {
             label,
             expiry,
             quota,
+            original_route_access: key
+                .route_aliases
+                .clone()
+                .map_or(RouteAccess::Inherited, RouteAccess::Whitelist),
+            route_access: key
+                .route_aliases
+                .clone()
+                .map_or(RouteAccess::Inherited, RouteAccess::Whitelist),
             enabled: key.enabled,
             saving: false,
             error: None,
@@ -325,6 +353,9 @@ impl GatewayKeysPage {
         }
         let parsed_quota = quota.as_deref().and_then(gateway::billing::parse_usd);
         let quota_changed = parsed_quota != editor.original_quota;
+        let route_access = (editing.is_none()
+            || editor.route_access != editor.original_route_access)
+            .then_some(editor.route_access.clone());
         let enabled_changed = enabled != editor.original_enabled;
         editor.saving = true;
         editor.error = None;
@@ -341,7 +372,13 @@ impl GatewayKeysPage {
             .admin_call(move |admin| async move {
                 match editing {
                     None => admin
-                        .create_gateway_key(owner, &label, expires_at, quota.as_deref())
+                        .create_gateway_key(
+                            owner,
+                            &label,
+                            expires_at,
+                            quota.as_deref(),
+                            route_access.as_ref().and_then(RouteAccess::as_update),
+                        )
                         .await
                         .map(|_| ()),
                     Some(id) => {
@@ -350,6 +387,7 @@ impl GatewayKeysPage {
                             enabled: enabled_changed.then_some(enabled),
                             expires_at: expiry_changed.then_some(expires_at),
                             quota_usd: quota_changed.then_some(quota.as_deref()),
+                            route_aliases: route_access.as_ref().map(RouteAccess::as_update),
                         };
                         admin.patch_gateway_key(id, &update).await
                     }
@@ -430,6 +468,116 @@ impl GatewayKeysPage {
             }
         }
         cx.notify();
+    }
+
+    fn pick_route_access(&mut self, inherited: bool, cx: &mut Context<Self>) {
+        if let Some(editor) = &mut self.editor {
+            if inherited {
+                editor.route_access = RouteAccess::Inherited;
+            } else if matches!(editor.route_access, RouteAccess::Inherited) {
+                editor.route_access = RouteAccess::Whitelist(Vec::new());
+            }
+        }
+        cx.notify();
+    }
+
+    fn toggle_route(&mut self, alias: String, checked: bool, cx: &mut Context<Self>) {
+        if let Some(editor) = &mut self.editor
+            && let RouteAccess::Whitelist(aliases) = &mut editor.route_access
+        {
+            aliases.retain(|item| item != &alias);
+            if checked {
+                aliases.push(alias);
+            }
+        }
+        cx.notify();
+    }
+
+    fn route_access_row(&self, cx: &mut Context<Self>) -> Option<Div> {
+        let editor = self.editor.as_ref()?;
+        let aliases = match &self.state {
+            LoadState::Loaded(snapshot) => snapshot.aliases.as_slice(),
+            _ => &[],
+        };
+        let inherited = matches!(editor.route_access, RouteAccess::Inherited);
+        let checked_aliases = match &editor.route_access {
+            RouteAccess::Inherited => &[][..],
+            RouteAccess::Whitelist(items) => items.as_slice(),
+        };
+        let mut picker = gpui::div().flex().flex_wrap().items_center().gap_2();
+        for alias in aliases {
+            let alias_owned = alias.clone();
+            picker = picker.child(
+                Checkbox::new(ElementId::from(gpui::SharedString::from(format!(
+                    "key-route-{alias_owned}"
+                ))))
+                .label(alias.clone())
+                .checked(checked_aliases.contains(alias))
+                .disabled(inherited)
+                .on_click(cx.listener(move |this, checked: &bool, _, cx| {
+                    this.toggle_route(alias_owned.clone(), *checked, cx);
+                })),
+            );
+        }
+        let stale = checked_aliases
+            .iter()
+            .filter(|alias| !aliases.contains(alias));
+        for alias in stale {
+            let alias_owned = alias.clone();
+            picker = picker.child(
+                Checkbox::new(ElementId::from(gpui::SharedString::from(format!(
+                    "key-route-stale-{alias_owned}"
+                ))))
+                .label(format!("{alias}（已删除）"))
+                .checked(true)
+                .on_click(cx.listener(move |this, checked: &bool, _, cx| {
+                    this.toggle_route(alias_owned.clone(), *checked, cx);
+                })),
+            );
+        }
+        Some(
+            gpui::div()
+                .flex()
+                .items_start()
+                .gap_2()
+                .child(field_label("可见路由", cx))
+                .child(
+                    gpui::div()
+                        .flex()
+                        .flex_col()
+                        .gap_2()
+                        .child(
+                            gpui::div()
+                                .flex()
+                                .gap_2()
+                                .child(
+                                    Button::new("key-route-inherited")
+                                        .label("继承用户权限")
+                                        .compact()
+                                        .on_click(cx.listener(|this, _, _, cx| {
+                                            this.pick_route_access(true, cx);
+                                        })),
+                                )
+                                .child(
+                                    Button::new("key-route-custom")
+                                        .label("自定义白名单")
+                                        .compact()
+                                        .on_click(cx.listener(|this, _, _, cx| {
+                                            this.pick_route_access(false, cx);
+                                        })),
+                                ),
+                        )
+                        .child(picker)
+                        .when(!inherited && checked_aliases.is_empty(), |row| {
+                            row.child(
+                                gpui::div()
+                                    .text_size(px(12.))
+                                    .text_color(cx.theme().danger)
+                                    .child("该 Key 将不能调用任何路由"),
+                            )
+                        }),
+                ),
+        )
     }
 
     /// Whether `picker`'s option list is open, and the user it has selected.
@@ -575,6 +723,7 @@ impl GatewayKeysPage {
         }
         form = form
             .child(editor_row("Label", Input::new(&label), None, cx))
+            .when_some(self.route_access_row(cx), |form, row| form.child(row))
             .child(
                 gpui::div()
                     .flex()
@@ -828,7 +977,17 @@ impl GatewayKeysPage {
                 // the picker options describe the same snapshot as the rows.
                 let keys = admin.gateway_keys(None).await?;
                 let users = admin.users().await?;
-                Ok(KeySnapshot { keys, users })
+                let aliases = admin
+                    .routes()
+                    .await?
+                    .into_iter()
+                    .map(|route| route.alias)
+                    .collect();
+                Ok(KeySnapshot {
+                    keys,
+                    users,
+                    aliases,
+                })
             });
         cx.spawn(async move |this, cx| {
             let result = call.await;

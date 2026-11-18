@@ -77,6 +77,25 @@ enum RateMode {
     Override,
 }
 
+#[derive(Clone, PartialEq, Eq)]
+enum RouteAccess {
+    Inherited,
+    Whitelist(Vec<String>),
+}
+
+impl RouteAccess {
+    fn as_create(&self) -> Option<&[String]> {
+        match self {
+            Self::Inherited => None,
+            Self::Whitelist(aliases) => Some(aliases),
+        }
+    }
+
+    fn as_update(&self) -> Option<&[String]> {
+        self.as_create()
+    }
+}
+
 /// The page's two group dropdowns.
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum GroupPicker {
@@ -123,6 +142,9 @@ struct UserEditor {
     rate_mode: RateMode,
     rate: Entity<InputState>,
     max_concurrent: Entity<InputState>,
+    original_route_access: RouteAccess,
+    route_access: RouteAccess,
+    route_list_open: bool,
     enabled: bool,
     saving: bool,
     error: Option<String>,
@@ -139,6 +161,7 @@ struct UserSubmit {
     /// `Some(None)` clears, `Some(Some(bp))` sets.
     rate_bp: Option<Option<i64>>,
     max_concurrent: Option<i32>,
+    route_access: Option<RouteAccess>,
 }
 
 /// User management page (the 用户 tab).
@@ -345,6 +368,9 @@ impl UsersPage {
             rate_mode: RateMode::Inherit,
             rate: Self::rate_input(window, cx, String::new()),
             max_concurrent,
+            original_route_access: RouteAccess::Inherited,
+            route_access: RouteAccess::Inherited,
+            route_list_open: false,
             enabled: true,
             saving: false,
             error: None,
@@ -395,6 +421,9 @@ impl UsersPage {
             group_list_open: false,
             rate,
             max_concurrent,
+            original_route_access: route_access_from_row(user.route_aliases.clone()),
+            route_access: route_access_from_row(user.route_aliases.clone()),
+            route_list_open: false,
             saving: false,
             error: None,
         });
@@ -431,6 +460,12 @@ impl UsersPage {
             }
         };
         let display_name = editor.display_name.read(cx).value().trim().to_string();
+        let route_access =
+            if editor.editing.is_none() || editor.route_access != editor.original_route_access {
+                Some(editor.route_access.clone())
+            } else {
+                None
+            };
         let Some(original) = &editor.original else {
             return Ok(UserSubmit {
                 editing: None,
@@ -440,6 +475,7 @@ impl UsersPage {
                 group_id: Some(group_id),
                 rate_bp: Some(rate_bp),
                 max_concurrent,
+                route_access,
             });
         };
         Ok(UserSubmit {
@@ -450,6 +486,7 @@ impl UsersPage {
             group_id: (group_id != original.group_id).then_some(group_id),
             rate_bp: (rate_bp != original.rate_bp).then_some(rate_bp),
             max_concurrent: max_concurrent.filter(|cap| *cap != original.max_concurrent),
+            route_access,
         })
     }
 
@@ -492,6 +529,7 @@ impl UsersPage {
                     group_id,
                     rate_bp,
                     max_concurrent,
+                    route_access,
                 } = submit;
                 match (editing, group_id) {
                     (None, Some(group_id)) => {
@@ -501,6 +539,7 @@ impl UsersPage {
                             group_id,
                             rate_bp: rate_bp.flatten(),
                             max_concurrent,
+                            route_aliases: route_access.as_ref().and_then(RouteAccess::as_create),
                         };
                         admin.create_user(&user).await.map(|_| ())
                     }
@@ -512,6 +551,7 @@ impl UsersPage {
                             group_id,
                             rate_bp,
                             max_concurrent,
+                            route_aliases: route_access.as_ref().map(RouteAccess::as_update),
                         };
                         admin.patch_user(id, &patch).await.map(|_| ())
                     }
@@ -586,6 +626,113 @@ impl UsersPage {
                 (editor.group_list_open, editor.group)
             }),
         }
+    }
+
+    fn pick_route_access(&mut self, inherited: bool, cx: &mut Context<Self>) {
+        if let Some(editor) = &mut self.editor {
+            if inherited {
+                editor.route_access = RouteAccess::Inherited;
+                editor.route_list_open = false;
+            } else if matches!(editor.route_access, RouteAccess::Inherited) {
+                editor.route_access = RouteAccess::Whitelist(Vec::new());
+                editor.route_list_open = true;
+            } else {
+                editor.route_list_open = true;
+            }
+        }
+        cx.notify();
+    }
+
+    fn toggle_route(&mut self, alias: String, checked: bool, cx: &mut Context<Self>) {
+        if let Some(editor) = &mut self.editor
+            && let RouteAccess::Whitelist(aliases) = &mut editor.route_access
+        {
+            aliases.retain(|item| item != &alias);
+            if checked {
+                aliases.push(alias);
+            }
+        }
+        cx.notify();
+    }
+
+    fn route_access_row(&self, cx: &Context<Self>) -> Option<Div> {
+        let editor = self.editor.as_ref()?;
+        let aliases = self.groups.read(cx).aliases().unwrap_or(&[]);
+        let access = editor.route_access.clone();
+        let inherited = matches!(access, RouteAccess::Inherited);
+        let checked_aliases = match &access {
+            RouteAccess::Inherited => &[][..],
+            RouteAccess::Whitelist(aliases) => aliases.as_slice(),
+        };
+        let mut picker = gpui::div().flex().flex_wrap().items_center().gap_2();
+        for alias in aliases {
+            let alias_owned = alias.clone();
+            picker = picker.child(
+                Checkbox::new(ElementId::from(gpui::SharedString::from(format!(
+                    "user-route-{alias_owned}"
+                ))))
+                .label(alias.clone())
+                .checked(checked_aliases.contains(alias))
+                .disabled(inherited)
+                .on_click(cx.listener(move |this, checked: &bool, _, cx| {
+                    this.toggle_route(alias_owned.clone(), *checked, cx);
+                })),
+            );
+        }
+        let stale = checked_aliases
+            .iter()
+            .filter(|alias| !aliases.contains(alias));
+        for alias in stale {
+            let alias_owned = alias.clone();
+            picker = picker.child(
+                Checkbox::new(ElementId::from(gpui::SharedString::from(format!(
+                    "user-route-stale-{alias_owned}"
+                ))))
+                .label(format!("{alias}（已删除）"))
+                .checked(true)
+                .on_click(cx.listener(move |this, checked: &bool, _, cx| {
+                    this.toggle_route(alias_owned.clone(), *checked, cx);
+                })),
+            );
+        }
+        Some(
+            gpui::div()
+                .flex()
+                .items_start()
+                .gap_2()
+                .child(field_label("可见路由", cx))
+                .child(
+                    gpui::div()
+                        .flex()
+                        .flex_col()
+                        .gap_2()
+                        .child(
+                            gpui::div()
+                                .flex()
+                                .gap_2()
+                                .child(
+                                    Button::new("user-route-inherited")
+                                        .label("继承用户组")
+                                        .compact()
+                                        .on_click(cx.listener(|this, _, _, cx| {
+                                            this.pick_route_access(true, cx);
+                                        })),
+                                )
+                                .child(
+                                    Button::new("user-route-custom")
+                                        .label("自定义白名单")
+                                        .compact()
+                                        .on_click(cx.listener(|this, _, _, cx| {
+                                            this.pick_route_access(false, cx);
+                                        })),
+                                ),
+                        )
+                        .child(picker)
+                        .when(!inherited && checked_aliases.is_empty(), |row| {
+                            row.child(inline_error("该用户将不能调用任何路由".to_string(), cx))
+                        }),
+                ),
+        )
     }
 
     /// A group dropdown: a trigger button plus a floating option list.
@@ -739,6 +886,7 @@ impl UsersPage {
                     .child(self.group_dropdown(GroupPicker::Editor, groups, cx)),
             )
             .child(Self::rate_row(editor, groups, cx))
+            .when_some(self.route_access_row(cx), |form, row| form.child(row))
             .child(editor_row(
                 "并发上限",
                 Input::new(&editor.max_concurrent),
@@ -1133,6 +1281,10 @@ fn group_name_label(name: &str) -> String {
     } else {
         name.to_string()
     }
+}
+
+fn route_access_from_row(aliases: Option<Vec<String>>) -> RouteAccess {
+    aliases.map_or(RouteAccess::Inherited, RouteAccess::Whitelist)
 }
 
 /// The form's 继承组倍率 / 自定义倍率 switch.
