@@ -334,6 +334,8 @@ struct StageAccount {
     /// archived, its provider is disabled, or its whitelist omits the entry's
     /// model. The row renders dimmed with a muted filled dot and the reason.
     stopped: Option<Stopped>,
+    /// Operator pause: the entry is kept in the route but dispatch skips it.
+    paused: bool,
     /// Latest successful request time for this account on this model — shown in
     /// the serving-caption slot once the entry goes idle.
     last_success: Option<chrono::DateTime<chrono::Utc>>,
@@ -700,6 +702,7 @@ impl RoutesPage {
                             live: state.serving.is_some(),
                             cool_until,
                             stopped: state.stopped,
+                            paused: entry.paused,
                             last_success: state.last_success,
                         }
                     })
@@ -1096,6 +1099,7 @@ impl RoutesPage {
         let busy = self.manage_write_in_flight;
         let cooling = account.cool_until.is_some();
         let disabled = account.stopped.is_some();
+        let paused = account.paused;
         let mut dot_color = if account.live {
             theme.foreground
         } else if cooling {
@@ -1128,9 +1132,9 @@ impl RoutesPage {
             })
             .rounded(px(10.))
             .overflow_hidden()
-            // A fully rested or stopped entry is skipped by dispatch — dim it
-            // so the stage reads as "present but out of rotation".
-            .opacity(if (cooling || disabled) && !account.live {
+            // A rested, stopped or paused entry is skipped by dispatch — dim
+            // it so the stage reads as "present but out of rotation".
+            .opacity(if (cooling || disabled || paused) && !account.live {
                 0.55
             } else {
                 1.0
@@ -1228,7 +1232,9 @@ impl RoutesPage {
                     .rounded_full()
                     .border_1()
                     .border_color(dot_color)
-                    .when(account.live || cooling || disabled, |dot| dot.bg(dot_color)),
+                    .when(account.live || cooling || disabled || paused, |dot| {
+                        dot.bg(dot_color)
+                    }),
             )
             .child(
                 gpui::div()
@@ -1282,6 +1288,15 @@ impl RoutesPage {
                         .child(stopped.label()),
                 )
             })
+            .when(paused, |row| {
+                row.child(
+                    gpui::div()
+                        .flex_shrink_0()
+                        .text_size(px(11.))
+                        .text_color(theme.warning)
+                        .child("已暂停"),
+                )
+            })
             // Nothing extra here: an entry is one account on one model, so the
             // row carries no tally — its own marker says why it cannot
             // dispatch, and the cooling marker says when it can again.
@@ -1321,6 +1336,20 @@ impl RoutesPage {
             });
         if manage {
             let alias = route.alias.clone();
+            let toggle_alias = route.alias.clone();
+            let row = row.child(
+                Button::new(ElementId::from(gpui::SharedString::from(format!(
+                    "entry-pause-{}-{index}",
+                    route.alias
+                ))))
+                .label(if paused { "恢复" } else { "暂停" })
+                .ghost()
+                .compact()
+                .disabled(busy)
+                .on_click(cx.listener(move |this, _, _, cx| {
+                    this.toggle_entry_pause(toggle_alias.clone(), index, cx)
+                })),
+            );
             row.child(
                 Button::new(ElementId::from(gpui::SharedString::from(format!(
                     "entry-del-{}-{index}",

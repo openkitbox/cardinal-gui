@@ -264,6 +264,9 @@ struct ItemDraft {
     /// the account's own cap still applies).
     cap: Entity<InputState>,
     weight: Entity<InputState>,
+    /// Operator pause: the entry stays in the route but is never dispatched.
+    /// Carried through the editor so a save never silently resumes it.
+    paused: bool,
     /// Ordered availability rules (top = highest priority).
     rules: Vec<RuleDraft>,
 }
@@ -328,6 +331,8 @@ struct SelectionDraft {
     label: String,
     cap: String,
     weight: String,
+    /// Pause state of the stored entry, snapshot at save time.
+    paused: bool,
     rules: Vec<RuleSelection>,
 }
 
@@ -420,6 +425,7 @@ fn route_entries(drafts: &[SelectionDraft]) -> Result<Vec<RouteEntry>, String> {
             weight,
             label,
             max_concurrency,
+            paused: draft.paused,
             rules,
             active_window: None,
         });
@@ -470,6 +476,7 @@ fn item_draft(
         label,
         cap,
         weight,
+        paused: false,
         rules: Vec::new(),
     }
 }
@@ -707,6 +714,7 @@ impl RoutesPage {
                                 input.set_value(cap.to_string(), window, cx)
                             });
                         }
+                        draft.paused = entry.paused;
                         for rule in entry.rules() {
                             let mut draft_rule = rule_draft(window, cx);
                             draft_rule.allow = rule.effect == gateway::store::RuleEffect::Allow;
@@ -929,6 +937,7 @@ impl RoutesPage {
                 label: item.label.read(cx).value().trim().to_string(),
                 cap: item.cap.read(cx).value().trim().to_string(),
                 weight: item.weight.read(cx).value().trim().to_string(),
+                paused: item.paused,
                 rules: item
                     .rules
                     .iter()
@@ -1094,6 +1103,42 @@ impl RoutesPage {
         };
         let Some(target) = target else { return };
         entries.swap(index, target);
+        let context_window = route.context_window;
+        let strategy = route.strategy;
+        let note = route.note.clone();
+        self.manage_write(cx, move |admin| async move {
+            admin
+                .put_route(
+                    &alias,
+                    &entries,
+                    context_window,
+                    strategy,
+                    note.as_deref(),
+                    None,
+                )
+                .await
+        });
+    }
+
+    /// Toggle one entry's pause flag (manage-mode 暂停/恢复): re-PUT the whole
+    /// route from the freshest snapshot so no other entry state is lost.
+    fn toggle_entry_pause(&mut self, alias: String, index: usize, cx: &mut Context<Self>) {
+        if self.manage_write_in_flight {
+            return;
+        }
+        let LoadState::Loaded(data) = &self.state else {
+            return;
+        };
+        let Some(route) = data.routes.iter().find(|route| route.alias == alias) else {
+            return;
+        };
+        let mut entries = route.entries.clone();
+        // The index comes from a rendered frame; a debounced reload may have
+        // shrunk the route since — same defense as move_entry.
+        let Some(entry) = entries.get_mut(index) else {
+            return;
+        };
+        entry.paused = !entry.paused;
         let context_window = route.context_window;
         let strategy = route.strategy;
         let note = route.note.clone();
@@ -1467,6 +1512,25 @@ impl RoutesPage {
               .children(account_state.map(|stopped| {
                 gpui::div().flex_shrink_0().text_size(px(11.)).text_color(cx.theme().warning).child(stopped.label())
               }))
+              .when(item.paused, |row| {
+                row.child(
+                  gpui::div().flex_shrink_0().text_size(px(11.)).text_color(cx.theme().warning).child("已暂停"),
+                )
+              })
+              .child(
+                Button::new(("route-item-pause", index as u64))
+                  .label(if item.paused { "恢复" } else { "暂停" })
+                  .ghost()
+                  .compact()
+                  .on_click(cx.listener(move |this, _, _, cx| {
+                    if let Some(editor) = &mut this.editor
+                      && let Some(item) = editor.items.get_mut(index)
+                    {
+                      item.paused = !item.paused;
+                    }
+                    cx.notify();
+                  })),
+              )
               .child(gpui::div().flex_1())
               .child(Button::new(("route-item-remove", index as u64)).icon(Icon::new(IconName::Close).small()).ghost().compact().on_click(
                 cx.listener(move |this, _, _, cx| {

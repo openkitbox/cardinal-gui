@@ -1284,6 +1284,7 @@ fn skip_reason_label(reason: Option<&SkipReason>) -> String {
         Some(SkipReason::SecretSkipped) => "secret_skipped".to_string(),
         Some(SkipReason::ConcurrencyFull) => "concurrency_full".to_string(),
         Some(SkipReason::QueueTimeout) => "queue_timeout".to_string(),
+        Some(SkipReason::Paused) => "paused".to_string(),
         None => "ready".to_string(),
     }
 }
