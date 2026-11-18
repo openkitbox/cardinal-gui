@@ -778,6 +778,9 @@ pub struct ProvidersPage {
     /// card toggles one entry. View state only — the address is already on the
     /// card, masked, and nothing is fetched to reveal it.
     revealed_accounts: HashSet<i64>,
+    /// Keys whose single-account quota probe is in flight. A second click on
+    /// the same card is ignored until it lands; the header shows a live hint.
+    refreshing_keys: HashSet<i64>,
     codex_resets: HashMap<i64, CodexResetAction>,
     active: bool,
 }
@@ -786,6 +789,34 @@ fn consume_resync_revision(active: bool, seen: &mut u64, current: u64) -> bool {
     let changed = current != *seen;
     *seen = current;
     active && changed
+}
+
+/// Claim one single-account refresh: reject a second click while the first is
+/// in flight, and a key that no longer has a card. Pure state transition — the
+/// caller owns the request and `cx.notify()`.
+fn begin_key_refresh(refreshing: &mut HashSet<i64>, key_exists: bool, key_id: i64) -> bool {
+    key_exists && refreshing.insert(key_id)
+}
+
+/// Merge one freshly probed reading into its one card. `now` is taken once at
+/// the call boundary so every window of this reading shares a stamp; an
+/// existing view keeps its recorded history via [`KeyQuotaView::live`]. Pure
+/// over the card slice: `false` means the key left the list before the probe
+/// landed and nothing changed.
+fn merge_key_quota(
+    cards: &mut [KeyCardData],
+    key_id: i64,
+    quota: KeyQuota,
+    now: chrono::DateTime<chrono::Utc>,
+) -> bool {
+    let Some(card) = cards.iter_mut().find(|card| card.key.id == key_id) else {
+        return false;
+    };
+    card.quota = Some(match card.quota.take() {
+        Some(previous) => previous.live(quota, now),
+        None => KeyQuotaView::new(quota, now, &[], &[]),
+    });
+    true
 }
 
 /// Screenshot-only entry points. The headless tool is a sibling module and
@@ -869,6 +900,7 @@ impl ProvidersPage {
             drag: None,
             order_write_in_flight: false,
             revealed_accounts: HashSet::new(),
+            refreshing_keys: HashSet::new(),
             codex_resets: HashMap::new(),
             active: false,
         };
@@ -1026,17 +1058,60 @@ impl ProvidersPage {
                 let (Ok(quotas), LoadState::Loaded(data)) = (result, &mut page.state) else {
                     return;
                 };
-                let mut quotas: HashMap<i64, KeyQuota> = quotas
+                let quotas: HashMap<i64, KeyQuota> = quotas
                     .into_iter()
                     .map(|row| (row.key_id, row.quota))
                     .collect();
                 let now = chrono::Utc::now();
-                for card in &mut data.keys {
-                    if let Some(quota) = quotas.remove(&card.key.id) {
-                        card.quota = Some(match card.quota.take() {
-                            Some(previous) => previous.live(quota, now),
-                            None => KeyQuotaView::new(quota, now, &[], &[]),
-                        });
+                for (key_id, quota) in quotas {
+                    merge_key_quota(&mut data.keys, key_id, quota, now);
+                }
+                cx.notify();
+            })
+            .ok();
+        })
+        .detach();
+    }
+
+    /// Re-probe ONE account from its card menu. The gateway's single-key
+    /// endpoint avoids the all-keys fan-out, and archived cards use the same
+    /// path. A click for a key already in flight (or no longer loaded) is a
+    /// no-op. The result merges into that card alone; a missing reading or a
+    /// request failure is reported at page level and never clears the old one.
+    fn refresh_key_quota(&mut self, key_id: i64, cx: &mut Context<Self>) {
+        let key_exists = match &self.state {
+            LoadState::Loaded(data) => data.keys.iter().any(|card| card.key.id == key_id),
+            _ => false,
+        };
+        if !begin_key_refresh(&mut self.refreshing_keys, key_exists, key_id) {
+            return;
+        }
+        cx.notify();
+        let call = cx
+            .global::<GatewayRuntime>()
+            .admin_call(move |admin| async move { admin.key_quota(key_id).await });
+        cx.spawn(async move |this, cx| {
+            let result = call.await;
+            this.update(cx, |page, cx| {
+                page.refreshing_keys.remove(&key_id);
+                match result {
+                    Ok(Some(row)) => {
+                        if let LoadState::Loaded(data) = &mut page.state
+                            && merge_key_quota(
+                                &mut data.keys,
+                                key_id,
+                                row.quota,
+                                chrono::Utc::now(),
+                            )
+                        {
+                            page.action_error = None;
+                        }
+                    }
+                    Ok(None) => {
+                        page.action_error = Some(format!("账号 {key_id} 没有可用的配额读数"));
+                    }
+                    Err(error) => {
+                        page.action_error = Some(format!("账号 {key_id} 刷新失败：{error}"));
                     }
                 }
                 cx.notify();
@@ -3560,5 +3635,188 @@ fn toggle_selection<T: PartialEq + Clone>(selected: &mut Vec<T>, item: &T) {
         selected.remove(index);
     } else {
         selected.push(item.clone());
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use gateway::quota::QuotaWindow;
+
+    use super::*;
+
+    fn reading(name: &str, used_pct: f64, plan: &str) -> KeyQuota {
+        KeyQuota {
+            windows: vec![QuotaWindow {
+                name: name.to_owned(),
+                used_pct,
+                resets_at: None,
+                period_minutes: None,
+                total: None,
+                used: None,
+            }],
+            balance: None,
+            plan: Some(plan.to_owned()),
+            details: Vec::new(),
+            codex_resets: None,
+        }
+    }
+
+    fn card(id: i64, quota: Option<KeyQuota>) -> KeyCardData {
+        KeyCardData {
+            provider: ProviderRow {
+                id: 1,
+                name: "test".to_owned(),
+                protocol: "openai_compatible".to_owned(),
+                base_url: "http://localhost".to_owned(),
+                auth_scheme: "bearer".to_owned(),
+                enabled: true,
+                dns: Dns::default(),
+            },
+            key: ProviderKeyView {
+                id,
+                provider_id: 1,
+                label: format!("key-{id}"),
+                enabled: true,
+                position: 0,
+                max_concurrency: None,
+                inflight: None,
+                rest_on_429: false,
+                models: None,
+                allowed_models: None,
+                auth_kind: "static".to_owned(),
+                account: None,
+                email: None,
+                plan_type: None,
+                organization: None,
+                archived_at: None,
+                proxy_configured: false,
+            },
+            quota: quota.map(|quota| KeyQuotaView::new(quota, chrono::Utc::now(), &[], &[])),
+        }
+    }
+
+    fn snapshots(
+        cards: &[KeyCardData],
+    ) -> Vec<Option<(String, chrono::DateTime<chrono::Utc>, usize)>> {
+        cards
+            .iter()
+            .map(|card| {
+                card.quota.as_ref().map(|quota| {
+                    (
+                        quota.plan.clone().unwrap_or_default(),
+                        quota.probed_at,
+                        quota.windows.len(),
+                    )
+                })
+            })
+            .collect()
+    }
+
+    #[test]
+    fn merging_one_reading_touches_only_its_card() {
+        let now = chrono::Utc::now();
+        let mut cards = vec![
+            card(1, Some(reading("5h", 10., "old-1"))),
+            card(2, Some(reading("5h", 20., "old-2"))),
+            card(3, None),
+        ];
+        let before = snapshots(&cards);
+
+        assert!(merge_key_quota(
+            &mut cards,
+            2,
+            reading("本周", 75., "new-2"),
+            now
+        ));
+
+        let after = snapshots(&cards);
+        assert_eq!(
+            after[0], before[0],
+            "the card before the target must keep its reading"
+        );
+        assert_eq!(
+            after[2], before[2],
+            "the card after the target must keep its reading"
+        );
+        assert_eq!(
+            cards[1].quota.as_ref().map(|quota| quota.probed_at),
+            Some(now)
+        );
+        assert_eq!(
+            after[1].as_ref().map(|snapshot| snapshot.0.as_str()),
+            Some("new-2")
+        );
+    }
+
+    #[test]
+    fn merging_one_reading_creates_a_reading_when_absent() {
+        let now = chrono::Utc::now();
+        let mut cards = vec![card(1, None), card(2, Some(reading("5h", 20., "old-2")))];
+
+        assert!(merge_key_quota(
+            &mut cards,
+            1,
+            reading("5h", 5., "new-1"),
+            now
+        ));
+
+        assert_eq!(
+            cards[0].quota.as_ref().map(|quota| quota.probed_at),
+            Some(now)
+        );
+        assert_eq!(
+            cards[0]
+                .quota
+                .as_ref()
+                .and_then(|quota| quota.plan.as_deref()),
+            Some("new-1")
+        );
+        assert_eq!(
+            cards[0].quota.as_ref().map(|quota| quota.windows.len()),
+            Some(1)
+        );
+        assert_eq!(
+            cards[1]
+                .quota
+                .as_ref()
+                .and_then(|quota| quota.plan.as_deref()),
+            Some("old-2"),
+            "another card must not be overwritten"
+        );
+    }
+
+    #[test]
+    fn merging_an_unknown_key_changes_nothing() {
+        let mut cards = vec![card(1, Some(reading("5h", 10., "old-1")))];
+        let before = snapshots(&cards);
+
+        assert!(!merge_key_quota(
+            &mut cards,
+            99,
+            reading("5h", 90., "stranger"),
+            chrono::Utc::now(),
+        ));
+        assert_eq!(snapshots(&cards), before);
+    }
+
+    #[test]
+    fn a_second_click_while_refreshing_is_rejected() {
+        let mut refreshing = HashSet::new();
+
+        assert!(begin_key_refresh(&mut refreshing, true, 7));
+        assert_eq!(refreshing, HashSet::from([7]));
+        assert!(!begin_key_refresh(&mut refreshing, true, 7));
+        assert_eq!(
+            refreshing,
+            HashSet::from([7]),
+            "a duplicate click must not change the set"
+        );
+        assert!(!begin_key_refresh(&mut refreshing, false, 8));
+        assert!(
+            !refreshing.contains(&8),
+            "a missing key must not be claimed"
+        );
+        assert!(begin_key_refresh(&mut refreshing, true, 8));
+        assert_eq!(refreshing, HashSet::from([7, 8]));
     }
 }

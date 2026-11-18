@@ -972,9 +972,22 @@ impl ProvidersPage {
                     .when(archived, |this| this.child(archived_badge(cx)))
                     // The quota reading's probe age lives on the title row
                     // (配额 header row removed — the card is one row shorter).
-                    .when_some(card_data.quota.as_ref(), |this, quota| {
-                        this.child(probe_age_label(quota.probed_at, cx))
+                    // A single-key probe in flight replaces it with a live hint.
+                    .when(self.refreshing_keys.contains(&key_id), |this| {
+                        this.child(
+                            gpui::div()
+                                .text_size(px(11.))
+                                .text_color(cx.theme().muted_foreground)
+                                .child("刷新中…"),
+                        )
                     })
+                    .when_some(
+                        card_data
+                            .quota
+                            .as_ref()
+                            .filter(|_| !self.refreshing_keys.contains(&key_id)),
+                        |this, quota| this.child(probe_age_label(quota.probed_at, cx)),
+                    )
                     .child(key_menu_button(provider, key, cx.weak_entity())),
             )
             // Credential row: an account key has no key to preview, so the card
@@ -1691,7 +1704,7 @@ fn toggle_target<E>(read: Result<Option<bool>, E>) -> Option<bool> {
     read.ok().flatten().map(|current| !current)
 }
 
-/// The account menu: 启用/停用、429 不冷却 (Kiro accounts only)、编辑、
+/// The account menu: 启用/停用、429 不冷却 (Kiro accounts only)、刷新、编辑、
 /// 归档/移出归档、删除. The state the items show
 /// is captured at render time; every click resolves the key again through the
 /// page, because the cached menu entity can outlive the snapshot it was built
@@ -1787,6 +1800,22 @@ fn key_menu(mut menu: PopupMenu, shown: MenuKey, weak: WeakEntity<ProvidersPage>
         );
     }
     menu.separator()
+        .item(
+            // Re-probe this card alone, including an archived one: the
+            // single-key endpoint does not filter by enabled/archived.
+            PopupMenuItem::new("刷新")
+                .icon(Icon::new(IconName::RefreshCw).small())
+                .on_click({
+                    let weak = weak.clone();
+                    move |_, _window, cx| {
+                        if let Err(error) =
+                            weak.update(cx, |this, cx| this.refresh_key_quota(key_id, cx))
+                        {
+                            eprintln!("card menu refresh failed: {error}");
+                        }
+                    }
+                }),
+        )
         .item(
             PopupMenuItem::new("编辑")
                 .icon(Icon::new(IconName::Pencil).small())
