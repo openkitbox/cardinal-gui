@@ -1,6 +1,8 @@
 # Cardinal GUI
 
-A native macOS management and monitoring dashboard for the [Cardinal](../cardinal) LLM gateway.
+A native macOS management and monitoring dashboard for the [Cardinal](https://github.com/openkitbox/cardinal) LLM gateway.
+
+Cardinal GUI is the companion client for the server repository. The Cardinal gateway provides the HTTP API, protocol translation, routing, metering, and provider integration; this repository provides the native macOS interface for managing and monitoring it.
 
 ## Features
 
