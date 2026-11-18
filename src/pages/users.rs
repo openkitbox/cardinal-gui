@@ -256,14 +256,47 @@ impl UsersPage {
                     }))
             }
         };
-        vec![
+        let mut actions = Vec::new();
+        if self.segment == Segment::Users {
+            let groups = self.groups.read(cx).groups().unwrap_or(&[]);
+            actions.push(
+                gpui::div()
+                    .flex()
+                    .items_center()
+                    .gap_2()
+                    .child(
+                        gpui::div()
+                            .w(px(110.))
+                            .h(px(28.))
+                            .child(Input::new(&self.search).small()),
+                    )
+                    .child(self.group_dropdown(GroupPicker::Filter, groups, cx))
+                    .child(segmented(
+                        "users-status",
+                        &[
+                            (StatusFilter::All, "全部"),
+                            (StatusFilter::Enabled, "启用"),
+                            (StatusFilter::Disabled, "停用"),
+                        ],
+                        self.status_filter,
+                        cx,
+                        |page, filter, cx| {
+                            page.status_filter = filter;
+                            cx.notify();
+                        },
+                    ))
+                    .into_any_element(),
+            );
+        }
+        actions.push(
             create
                 .icon(Icon::new(IconName::Plus).small())
                 .outline()
                 .compact()
                 .into_any_element(),
-            refresh.into_any_element(),
-        ]
+        );
+        actions.push(refresh.into_any_element());
+        actions
     }
 
     /// Silent by default: tab switches, group writes and balance changes pass
@@ -1188,18 +1221,7 @@ impl UsersPage {
     }
 
     fn users_body(&self, groups: &[GroupRow], cx: &Context<Self>) -> Div {
-        let mut content = gpui::div().flex().flex_col().gap_4().child(
-            gpui::div()
-                .flex()
-                .items_center()
-                .gap_2()
-                .child(
-                    gpui::div()
-                        .w(px(220.))
-                        .child(Input::new(&self.search).small()),
-                )
-                .child(self.group_dropdown(GroupPicker::Filter, groups, cx)),
-        );
+        let mut content = gpui::div().flex().flex_col().gap_4();
         if let Some(editor) = self.editor_card(groups, cx) {
             content = content.child(editor);
         }
@@ -1235,29 +1257,13 @@ impl UsersPage {
 
 impl Render for UsersPage {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        let mut header = gpui::div().flex().items_center().gap_3().child(segmented(
+        let header = gpui::div().flex().items_center().gap_3().child(segmented(
             "users-segment",
             &[(Segment::Users, "用户"), (Segment::Groups, "用户组")],
             self.segment,
             cx,
             Self::pick_segment,
         ));
-        if self.segment == Segment::Users {
-            header = header.child(segmented(
-                "users-status",
-                &[
-                    (StatusFilter::All, "全部"),
-                    (StatusFilter::Enabled, "启用"),
-                    (StatusFilter::Disabled, "停用"),
-                ],
-                self.status_filter,
-                cx,
-                |page, filter, cx| {
-                    page.status_filter = filter;
-                    cx.notify();
-                },
-            ));
-        }
         let mut content = gpui::div().flex().flex_col().gap_4().child(header);
         content = match self.segment {
             Segment::Users => {

@@ -150,18 +150,33 @@ impl GatewayKeysPage {
             }),
         );
         match &self.state {
-            LoadState::Loaded(_) => vec![
-                Button::new("key-create")
-                    .icon(Icon::new(IconName::Plus).small())
-                    .label("新增 Key")
-                    .outline()
-                    .compact()
-                    .on_click(cx.listener(|this, _, window, cx| {
-                        this.open_create(window, cx);
-                    }))
-                    .into_any_element(),
-                refresh.into_any_element(),
-            ],
+            LoadState::Loaded(_) => {
+                let filter = self.user_dropdown(UserPicker::Filter, cx);
+                let filters = gpui::div()
+                    .flex()
+                    .items_center()
+                    .gap_2()
+                    .child(
+                        gpui::div()
+                            .w(px(130.))
+                            .h(px(28.))
+                            .child(Input::new(&self.search).small()),
+                    )
+                    .child(filter);
+                vec![
+                    filters.into_any_element(),
+                    Button::new("key-create")
+                        .icon(Icon::new(IconName::Plus).small())
+                        .label("新增 Key")
+                        .outline()
+                        .compact()
+                        .on_click(cx.listener(|this, _, window, cx| {
+                            this.open_create(window, cx);
+                        }))
+                        .into_any_element(),
+                    refresh.into_any_element(),
+                ]
+            }
             _ => vec![refresh.into_any_element()],
         }
     }
@@ -1016,20 +1031,6 @@ impl GatewayKeysPage {
 impl Render for GatewayKeysPage {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let mut content = gpui::div().flex().flex_col().gap_4();
-
-        let filter = self.user_dropdown(UserPicker::Filter, cx);
-        content = content.child(
-            gpui::div()
-                .flex()
-                .items_center()
-                .gap_2()
-                .child(
-                    gpui::div()
-                        .w(px(260.))
-                        .child(Input::new(&self.search).small()),
-                )
-                .child(filter),
-        );
 
         if let Some(editor) = self.editor_card(cx) {
             content = content.child(editor);
