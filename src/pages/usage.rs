@@ -9,8 +9,8 @@
 use chrono::{DateTime, Duration, LocalResult, NaiveDate, TimeZone as _, Utc};
 use gpui::prelude::FluentBuilder as _;
 use gpui::{
-    AppContext as _, Context, Div, ElementId, InteractiveElement, IntoElement, ParentElement,
-    Render, StatefulInteractiveElement, Styled, Window, px, relative,
+    AnyWindowHandle, AppContext as _, Context, Div, ElementId, InteractiveElement, IntoElement,
+    ParentElement, Render, StatefulInteractiveElement, Styled, Window, px, relative,
 };
 use gpui_kit::component::ActiveTheme;
 use gpui_kit::component::Sizable;
@@ -30,7 +30,8 @@ use crate::activity::{
 use crate::fmt::{humanize_count, usd_microus};
 use crate::pages::usage_trend::{TrendData, TrendGeometryCell, TrendMetric};
 use crate::pages::{
-    LoadState, card, empty_card, error_card, loading_card, page_frame, refresh_button,
+    LoadState, card, empty_card, error_card, loading_card, notify_error, notify_success,
+    page_frame, refresh_button,
 };
 use crate::runtime::GatewayRuntime;
 
@@ -443,11 +444,23 @@ impl UsagePage {
     /// HTTP work. Persisted, manual, and resync events use a short debounce; a
     /// dirty load retries 15 seconds after that load finishes.
     fn apply_reload(&mut self, event: UsageReloadEvent, cx: &mut Context<Self>) {
+        self.apply_reload_with_notice(event, None, cx);
+    }
+
+    /// Same reload decision as [`Self::apply_reload`], but carries the window
+    /// of an explicit refresh through the debounce so that load reports one
+    /// toast. Filter/range changes and feed events stay silent.
+    fn apply_reload_with_notice(
+        &mut self,
+        event: UsageReloadEvent,
+        handle: Option<AnyWindowHandle>,
+        cx: &mut Context<Self>,
+    ) {
         match self.usage_reload.reduce(self.active, event) {
             UsageReloadAction::None => {}
-            UsageReloadAction::ReloadNow => self.reload(cx),
+            UsageReloadAction::ReloadNow => self.reload_with_notice(cx, handle),
             UsageReloadAction::Schedule { token, delay } => {
-                self.schedule_usage_timer(token, delay, cx);
+                self.schedule_usage_timer(token, delay, handle, cx);
             }
         }
     }
@@ -456,6 +469,7 @@ impl UsagePage {
         &mut self,
         token: u64,
         delay: std::time::Duration,
+        handle: Option<AnyWindowHandle>,
         cx: &mut Context<Self>,
     ) {
         self.usage_timer_task = Some(cx.spawn(async move |this, cx| {
@@ -468,7 +482,7 @@ impl UsagePage {
                     UsageReloadAction::ReloadNow
                 ) {
                     page.usage_timer_task = None;
-                    page.reload(cx);
+                    page.reload_with_notice(cx, handle);
                 } else if current {
                     page.usage_timer_task = None;
                 }
@@ -488,7 +502,7 @@ impl UsagePage {
             .usage_reload
             .reduce(self.active, UsageReloadEvent::LoadFinished)
         {
-            self.schedule_usage_timer(token, delay, cx);
+            self.schedule_usage_timer(token, delay, None, cx);
         }
     }
 
@@ -725,6 +739,12 @@ impl UsagePage {
     /// startup and trend changes; filter/range/manual events go through the
     /// short debounce in [`Self::apply_reload`].
     pub(super) fn reload(&mut self, cx: &mut Context<Self>) {
+        self.reload_with_notice(cx, None);
+    }
+
+    /// Same load as [`Self::reload`], but toasts the result of an explicit
+    /// refresh. Internal reloads pass `None` and stay silent.
+    fn reload_with_notice(&mut self, cx: &mut Context<Self>, handle: Option<AnyWindowHandle>) {
         self.cancel_usage_timer();
         self.usage_load_task = None;
         let _ = self
@@ -770,10 +790,16 @@ impl UsagePage {
                             cx.reduce_motion(),
                         );
                         page.state = LoadState::Loaded(rows);
+                        if let Some(handle) = handle {
+                            notify_success(handle, cx, "刷新成功");
+                        }
                     }
                     Err(error) => {
                         page.kpi_animation
                             .update(None, std::time::Instant::now(), false, false);
+                        if let Some(handle) = handle {
+                            notify_error(handle, cx, format!("刷新失败：{error}"));
+                        }
                         page.state = LoadState::Failed(error);
                     }
                 };
@@ -951,10 +977,14 @@ impl UsagePage {
         actions.push(
             refresh_button(
                 "usage-refresh",
-                cx.listener(|this, _, _, cx| {
+                cx.listener(|this, _, window, cx| {
                     this.reload_keys(cx);
                     this.reload_users(cx);
-                    this.apply_reload(UsageReloadEvent::Manual, cx);
+                    this.apply_reload_with_notice(
+                        UsageReloadEvent::Manual,
+                        Some(window.window_handle()),
+                        cx,
+                    );
                 }),
             )
             .into_any_element(),

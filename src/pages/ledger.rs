@@ -13,8 +13,8 @@
 
 use gpui::prelude::FluentBuilder as _;
 use gpui::{
-    AppContext as _, Context, Div, ElementId, Entity, EventEmitter, Focusable as _, IntoElement,
-    ParentElement, Render, Styled, Window, px,
+    AnyWindowHandle, AppContext as _, Context, Div, ElementId, Entity, EventEmitter,
+    Focusable as _, IntoElement, ParentElement, Render, Styled, Window, px,
 };
 use gpui_kit::assets::IconName;
 use gpui_kit::component::button::{Button, ButtonVariant, ButtonVariants as _};
@@ -26,8 +26,8 @@ use gateway::store::{CreditKind, EntryRow, GatewayKeyRow, UserRow};
 
 use crate::fmt::{usd_exact, usd_microus};
 use crate::pages::{
-    LoadState, action_error_card, begin_load, card, display_time, editor_row, error_card,
-    icon_button, inline_error, loading_card,
+    LoadState, begin_load, card, display_time, editor_row, error_card, icon_button, inline_error,
+    loading_card, notify_error, notify_success,
 };
 use crate::runtime::GatewayRuntime;
 
@@ -71,20 +71,9 @@ pub(crate) struct LedgerPanel {
     loading_more: bool,
     credit: Option<CreditForm>,
     reconcile: Option<ReconcileState>,
-    action_error: Option<String>,
 }
 
 impl EventEmitter<BalanceChanged> for LedgerPanel {}
-
-impl crate::pages::ActionPage for LedgerPanel {
-    fn action_error_slot(&mut self) -> &mut Option<String> {
-        &mut self.action_error
-    }
-
-    fn reload(&mut self, cx: &mut Context<Self>) {
-        LedgerPanel::reload(self, cx);
-    }
-}
 
 impl LedgerPanel {
     /// A panel for `user_id`; it starts loading at once.
@@ -95,7 +84,6 @@ impl LedgerPanel {
             loading_more: false,
             credit: None,
             reconcile: None,
-            action_error: None,
         };
         panel.reload(cx);
         panel
@@ -140,7 +128,7 @@ impl LedgerPanel {
     }
 
     /// Fetch the page older than the oldest loaded entry and append it.
-    fn load_older(&mut self, cx: &mut Context<Self>) {
+    fn load_older(&mut self, cx: &mut Context<Self>, handle: Option<AnyWindowHandle>) {
         let LoadState::Loaded(snapshot) = &self.state else {
             return;
         };
@@ -175,7 +163,11 @@ impl LedgerPanel {
                             snapshot.entries.extend(page);
                         }
                     }
-                    Err(error) => panel.action_error = Some(error),
+                    Err(error) => {
+                        if let Some(handle) = handle {
+                            notify_error(handle, cx, format!("加载更早流水失败：{error}"));
+                        }
+                    }
                 }
                 cx.notify();
             })
@@ -278,6 +270,7 @@ impl LedgerPanel {
             usd_exact(after)
         );
         let panel = cx.entity();
+        let handle = Some(window.window_handle());
         window.open_alert_dialog(cx, move |dialog, _, _| {
             let panel = panel.clone();
             let amount_text = amount_text.clone();
@@ -296,7 +289,7 @@ impl LedgerPanel {
                     let amount_text = amount_text.clone();
                     let note = note.clone();
                     panel.update(cx, |panel, cx| {
-                        panel.submit_credit(kind, amount_text, note, cx);
+                        panel.submit_credit(kind, amount_text, note, handle, cx);
                     });
                     true
                 })
@@ -308,6 +301,7 @@ impl LedgerPanel {
         kind: CreditKind,
         amount_text: String,
         note: String,
+        handle: Option<AnyWindowHandle>,
         cx: &mut Context<Self>,
     ) {
         let Some(form) = &mut self.credit else {
@@ -332,11 +326,24 @@ impl LedgerPanel {
             this.update(cx, |panel, cx| match result {
                 Ok(_) => {
                     panel.credit = None;
-                    panel.action_error = None;
                     panel.reload(cx);
+                    if let Some(handle) = handle {
+                        let action = match kind {
+                            CreditKind::Topup => "充值",
+                            CreditKind::Adjust => "余额调整",
+                        };
+                        notify_success(handle, cx, format!("{action}成功"));
+                    }
                     cx.emit(BalanceChanged);
                 }
                 Err(error) => {
+                    if let Some(handle) = handle {
+                        let action = match kind {
+                            CreditKind::Topup => "充值",
+                            CreditKind::Adjust => "余额调整",
+                        };
+                        notify_error(handle, cx, format!("{action}失败：{error}"));
+                    }
                     if let Some(form) = &mut panel.credit {
                         form.saving = false;
                         form.error = Some(error);
@@ -625,9 +632,6 @@ impl LedgerPanel {
 impl Render for LedgerPanel {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let mut content = gpui::div().flex().flex_col().gap_3();
-        if let Some(error) = &self.action_error {
-            content = content.child(action_error_card(error, cx));
-        }
         let snapshot = match &self.state {
             LoadState::Loading => return content.child(loading_card(cx)),
             LoadState::Failed(error) => return content.child(error_card(error, cx)),
@@ -710,7 +714,9 @@ impl Render for LedgerPanel {
                     .ghost()
                     .compact()
                     .disabled(self.loading_more)
-                    .on_click(cx.listener(|this, _, _, cx| this.load_older(cx))),
+                    .on_click(cx.listener(|this, _, window, cx| {
+                        this.load_older(cx, Some(window.window_handle()));
+                    })),
             )
         })
     }

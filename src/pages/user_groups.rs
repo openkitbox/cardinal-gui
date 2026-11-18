@@ -10,8 +10,8 @@
 //! for confirmation first.
 
 use gpui::{
-    AppContext as _, Context, Div, ElementId, Entity, EventEmitter, Focusable as _, IntoElement,
-    ParentElement, Render, Styled, Window, px,
+    AnyWindowHandle, AppContext as _, Context, Div, ElementId, Entity, EventEmitter,
+    Focusable as _, IntoElement, ParentElement, Render, Styled, Window, px,
 };
 use gpui_kit::assets::IconName;
 use gpui_kit::component::button::{Button, ButtonVariant, ButtonVariants as _};
@@ -24,7 +24,7 @@ use gateway::store::GroupRow;
 
 use crate::pages::{
     LoadState, card, editor_row, empty_card, error_card, field_label, icon_button, inline_error,
-    loading_card,
+    loading_card, notify_error, notify_success,
 };
 use crate::runtime::GatewayRuntime;
 
@@ -198,11 +198,12 @@ impl UserGroupsView {
         let Some(submit) = self.validate(cx) else {
             return;
         };
+        let handle = Some(window.window_handle());
         let internal = self.editor.as_ref().is_some_and(|editor| {
             editor.editing.is_some() && editor.original_name == INTERNAL_GROUP
         });
         if !(internal && (submit.rate_changed || submit.routes_changed)) {
-            self.submit(submit, cx);
+            self.submit(submit, handle, cx);
             return;
         }
         let view = cx.entity();
@@ -219,18 +220,28 @@ impl UserGroupsView {
                 .ok_variant(ButtonVariant::Danger)
                 .on_ok(move |_, _, cx| {
                     let submit = submit.clone();
-                    view.update(cx, |view, cx| view.submit(submit, cx));
+                    view.update(cx, |view, cx| view.submit(submit, handle, cx));
                     true
                 })
         });
     }
 
-    fn submit(&mut self, submit: GroupSubmit, cx: &mut Context<Self>) {
+    fn submit(
+        &mut self,
+        submit: GroupSubmit,
+        handle: Option<AnyWindowHandle>,
+        cx: &mut Context<Self>,
+    ) {
         let Some(editor) = &mut self.editor else {
             return;
         };
         editor.saving = true;
         cx.notify();
+        let action = if submit.editing.is_some() {
+            "保存用户组"
+        } else {
+            "创建用户组"
+        };
         let call = cx
             .global::<GatewayRuntime>()
             .admin_call(move |admin| async move {
@@ -270,8 +281,14 @@ impl UserGroupsView {
                         view.editor = None;
                         view.reload(cx);
                         cx.emit(GroupsChanged);
+                        if let Some(handle) = handle {
+                            notify_success(handle, cx, format!("{action}成功"));
+                        }
                     }
                     Err(error) => {
+                        if let Some(handle) = handle {
+                            notify_error(handle, cx, format!("{action}失败：{error}"));
+                        }
                         if let Some(editor) = &mut view.editor {
                             editor.saving = false;
                             editor.error = Some(error);

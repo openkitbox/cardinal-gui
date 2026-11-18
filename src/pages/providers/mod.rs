@@ -10,8 +10,8 @@
 //! snapshot back; a key without a reading renders no meter.
 //!
 //! Writes go through `Admin`'s write methods; every successful write triggers
-//! a reload, and failures surface either in the form card (validation) or in
-//! a page-level error card (row-level operations).
+//! a reload and an in-app success toast, and failures surface either in the
+//! form card (validation) or as an in-app error toast.
 //!
 //! Layout: page state + behavior here; `catalog` = the provider catalog and
 //! variant resolution (pure data/logic), `quota` = quota view models,
@@ -36,8 +36,8 @@ use std::time::{Duration, Instant};
 use uuid::Uuid;
 
 use gpui::{
-    AppContext as _, Context, Entity, Focusable as _, InteractiveElement, IntoElement,
-    ParentElement, Render, Styled, Window, prelude::FluentBuilder as _,
+    AnyWindowHandle, AppContext as _, Context, Entity, Focusable as _, InteractiveElement,
+    IntoElement, ParentElement, Render, Styled, Window, prelude::FluentBuilder as _,
 };
 use gpui_kit::assets::IconName;
 use gpui_kit::component::button::{Button, ButtonVariant};
@@ -67,7 +67,8 @@ use groups::{GroupFilter, KeyFacts, Visibility};
 use quota::{KeyQuotaView, earliest_codex_reset_details};
 
 use crate::pages::{
-    LoadState, action_error_card, empty_card, error_card, loading_card, page_frame, refresh_button,
+    LoadState, empty_card, error_card, loading_card, notify_error, notify_success, page_frame,
+    refresh_button,
 };
 use crate::runtime::GatewayRuntime;
 
@@ -748,8 +749,6 @@ pub struct ProvidersPage {
     form_generation: u64,
     key_form: Option<KeyForm>,
     key_editor: Option<KeyEditor>,
-    /// Failure of a row-level write (toggle/archive/delete); shown above the list.
-    action_error: Option<String>,
     /// Which accounts the 分组 dropdown admits (local view state).
     group_filter: GroupFilter,
     /// The 分组 dropdown list is open.
@@ -888,7 +887,6 @@ impl ProvidersPage {
             form_generation: 0,
             key_form: None,
             key_editor: None,
-            action_error: None,
             group_filter: GroupFilter::All,
             group_list_open: false,
             group_create: None,
@@ -965,8 +963,9 @@ impl ProvidersPage {
     pub(crate) fn actions(&mut self, cx: &mut Context<Self>) -> Vec<gpui::AnyElement> {
         let refresh = refresh_button(
             "providers-refresh",
-            cx.listener(|this, _, _, cx| {
-                this.reload(cx);
+            cx.listener(|this, _, window, cx| {
+                let handle = window.window_handle();
+                this.reload_with_notice(cx, Some(handle));
                 this.refresh_quotas(cx);
             }),
         );
@@ -1012,6 +1011,14 @@ impl ProvidersPage {
     /// in [`Self::refresh_quotas`], fired on manual refresh and after adding
     /// an account.
     pub(super) fn reload(&mut self, cx: &mut Context<Self>) {
+        self.reload_with_notice(cx, None);
+    }
+
+    /// Same load as [`Self::reload`], but toasts the outcome when `handle`
+    /// names the window that asked for the refresh. Internal reloads pass
+    /// `None`, so tab switches, pushed revisions and write follow-ups stay
+    /// silent; a stale result (superseded by a newer reload) toasts nothing.
+    fn reload_with_notice(&mut self, cx: &mut Context<Self>, handle: Option<AnyWindowHandle>) {
         crate::pages::begin_load(&mut self.state);
         self.generation += 1;
         let generation = self.generation;
@@ -1026,9 +1033,17 @@ impl ProvidersPage {
                 }
                 match result {
                     Ok(document) => {
-                        page.state = LoadState::Loaded(ProvidersData::from_bootstrap(&document))
+                        page.state = LoadState::Loaded(ProvidersData::from_bootstrap(&document));
+                        if let Some(handle) = handle {
+                            notify_success(handle, cx, "刷新成功");
+                        }
                     }
-                    Err(error) => page.state = LoadState::Failed(error),
+                    Err(error) => {
+                        if let Some(handle) = handle {
+                            notify_error(handle, cx, format!("刷新失败：{error}"));
+                        }
+                        page.state = LoadState::Failed(error);
+                    }
                 }
                 cx.notify();
             })
@@ -1077,9 +1092,9 @@ impl ProvidersPage {
     /// endpoint avoids the all-keys fan-out, and archived cards use the same
     /// path. A click for a key already in flight (or no longer loaded) is a
     /// no-op. The result merges into that card alone; a missing reading keeps
-    /// the old one and shows nothing, while a request failure is the only
-    /// page-level error.
+    /// the old one and shows nothing, while a request failure is toasted.
     fn refresh_key_quota(&mut self, key_id: i64, cx: &mut Context<Self>) {
+        let handle = cx.active_window();
         let key_exists = match &self.state {
             LoadState::Loaded(data) => data.keys.iter().any(|card| card.key.id == key_id),
             _ => false,
@@ -1097,22 +1112,24 @@ impl ProvidersPage {
                 page.refreshing_keys.remove(&key_id);
                 match result {
                     Ok(Some(row)) => {
-                        if let LoadState::Loaded(data) = &mut page.state
-                            && merge_key_quota(
-                                &mut data.keys,
-                                key_id,
-                                row.quota,
-                                chrono::Utc::now(),
-                            )
-                        {
-                            page.action_error = None;
+                        if let LoadState::Loaded(data) = &mut page.state {
+                            merge_key_quota(&mut data.keys, key_id, row.quota, chrono::Utc::now());
+                        }
+                        if let Some(handle) = handle {
+                            notify_success(handle, cx, format!("账号 {key_id} 额度已刷新"));
                         }
                     }
                     // No reading is not a failure; the card keeps its last
                     // meter, exactly like the full fan-out.
                     Ok(None) => {}
                     Err(error) => {
-                        page.action_error = Some(format!("账号 {key_id} 刷新失败：{error}"));
+                        if let Some(handle) = handle {
+                            notify_error(
+                                handle,
+                                cx,
+                                format!("账号 {key_id} 额度刷新失败：{error}"),
+                            );
+                        }
                     }
                 }
                 cx.notify();
@@ -1422,8 +1439,8 @@ impl ProvidersPage {
         )
     }
 
-    /// Run one write against the HTTP admin API: on success clear the error
-    /// and reload; on failure show the message above the list.
+    /// Run one write against the HTTP admin API: on success reload and toast,
+    /// on failure toast the error. The outcome is not mirrored into page state.
     fn write<F, Fut>(&mut self, cx: &mut Context<Self>, f: F)
     where
         F: FnOnce(GatewayHttpClient) -> Fut + Send + 'static,
@@ -1431,7 +1448,26 @@ impl ProvidersPage {
             + Send
             + 'static,
     {
-        crate::pages::run_write(cx, f);
+        let call = cx.global::<GatewayRuntime>().admin_call(f);
+        let handle = cx.active_window();
+        cx.spawn(async move |this, cx| {
+            let result = call.await;
+            this.update(cx, |page, cx| match result {
+                Ok(()) => {
+                    page.reload(cx);
+                    if let Some(handle) = handle {
+                        notify_success(handle, cx, "操作成功");
+                    }
+                }
+                Err(error) => {
+                    if let Some(handle) = handle {
+                        notify_error(handle, cx, format!("操作失败：{error}"));
+                    }
+                }
+            })
+            .ok();
+        })
+        .detach();
     }
 
     /// Begin dragging one account's card: its grip was grabbed. The card is a
@@ -1480,8 +1516,9 @@ impl ProvidersPage {
         // order the server never stored. The drop is refused and the refusal
         // is stated, so the drag does not just appear to do nothing.
         if self.order_write_in_flight {
-            self.action_error = Some("上一步排序仍在保存，请稍后再拖".to_string());
-            cx.notify();
+            if let Some(handle) = cx.active_window() {
+                notify_error(handle, cx, "上一步排序仍在保存，请稍后再拖");
+            }
             return;
         }
         if drag.dragged != dragged {
@@ -1546,14 +1583,14 @@ impl ProvidersPage {
     }
 
     /// Write a dropped order back as the gateway's global key order. This is
-    /// the one write that cannot go through
-    /// [`crate::pages::run_write`]: the cards already moved, so a failure has
-    /// to restore `previous` (the order loaded before the drop) or the page
-    /// would keep showing an order the server never stored. Failures still
-    /// surface in the page's action-error slot; success clears it and reloads,
-    /// and the bootstrap brings the new `position` values back.
+    /// the one write that cannot use [`Self::write`]: the cards already moved,
+    /// so a failure has to restore `previous` (the order loaded before the
+    /// drop) or the page would keep showing an order the server never stored.
+    /// Both outcomes toast; success also reloads so the bootstrap brings the
+    /// new `position` values back.
     fn submit_key_order(&mut self, cx: &mut Context<Self>, order: Vec<i64>, previous: Vec<i64>) {
         self.order_write_in_flight = true;
+        let handle = cx.active_window();
         let call = cx
             .global::<GatewayRuntime>()
             .admin_call(move |admin| async move { admin.reorder_keys(&order).await });
@@ -1562,18 +1599,20 @@ impl ProvidersPage {
             this.update(cx, |page, cx| match result {
                 Ok(()) => {
                     page.order_write_in_flight = false;
-                    page.action_error = None;
                     page.reload(cx);
+                    if let Some(handle) = handle {
+                        notify_success(handle, cx, "排序已保存");
+                    }
                 }
                 Err(error) => {
                     page.order_write_in_flight = false;
                     page.apply_key_order(&previous);
-                    page.action_error = Some(error);
-                    // Re-read once as well: the rollback restores the order the
-                    // page had at drop time, and a pushed bootstrap may have
-                    // landed since. The reload is the authority; the error
-                    // stays on screen either way.
+                    // The rollback restores the order at drop time; a pushed
+                    // bootstrap may have landed since, so re-read once more.
                     page.reload(cx);
+                    if let Some(handle) = handle {
+                        notify_error(handle, cx, format!("排序保存失败：{error}"));
+                    }
                 }
             })
             .ok();
@@ -1622,9 +1661,9 @@ impl ProvidersPage {
             .map(|card| card.key.label.clone())
     }
 
-    /// Archive or unarchive one key. Same success/failure handling as
-    /// [`Self::write`]; an unarchive additionally probes quotas, because the
-    /// gateway skipped the key while it was archived and its reading is stale.
+    /// Archive or unarchive one key. The outcome toasts like [`Self::write`];
+    /// an unarchive additionally probes quotas, because the gateway skipped
+    /// the key while it was archived and its reading is stale.
     fn set_key_archived(
         &mut self,
         provider_id: i64,
@@ -1632,6 +1671,7 @@ impl ProvidersPage {
         archived: bool,
         cx: &mut Context<Self>,
     ) {
+        let handle = cx.active_window();
         let call = cx
             .global::<GatewayRuntime>()
             .admin_call(move |admin| async move {
@@ -1650,14 +1690,23 @@ impl ProvidersPage {
             let result = call.await;
             this.update(cx, |page, cx| match result {
                 Ok(()) => {
-                    page.action_error = None;
                     page.reload(cx);
                     if !archived {
                         page.refresh_quotas(cx);
                     }
+                    if let Some(handle) = handle {
+                        let message = if archived {
+                            "账号已归档"
+                        } else {
+                            "账号已恢复"
+                        };
+                        notify_success(handle, cx, message);
+                    }
                 }
                 Err(error) => {
-                    page.action_error = Some(error);
+                    if let Some(handle) = handle {
+                        notify_error(handle, cx, format!("归档状态更新失败：{error}"));
+                    }
                     cx.notify();
                 }
             })
@@ -1865,12 +1914,13 @@ impl ProvidersPage {
         // An account-login vendor has no key to validate or persist: the whole
         // write is the gateway's device flow (which the block polls).
         if form.uses_account_login() {
-            self.start_account_login(cx);
+            self.start_account_login(window.window_handle(), cx);
             return;
         }
         if form.saving {
             return; // one save in flight at a time
         }
+        let handle = Some(window.window_handle());
         let custom = matches!(form.source, FormSource::Custom { .. });
         let label = form.label.read(cx).value().trim().to_string();
         let api_key = form.api_key.read(cx).value().trim().to_string();
@@ -1985,17 +2035,20 @@ impl ProvidersPage {
                 match result {
                     Ok(()) => {
                         page.key_form = None;
-                        page.action_error = None;
                         page.reload(cx);
                         // The new account has no snapshot yet — probe right away so its
                         // card gets a reading without waiting for a manual refresh.
                         page.refresh_quotas(cx);
+                        if let Some(handle) = handle {
+                            notify_success(handle, cx, "添加账号成功");
+                        }
                     }
                     Err(error) => {
                         if let Some(form) = &mut page.key_form {
-                            form.error = Some(error);
-                        } else {
-                            page.action_error = Some(error);
+                            form.error = Some(error.clone());
+                        }
+                        if let Some(handle) = handle {
+                            notify_error(handle, cx, format!("添加账号失败：{error}"));
                         }
                         cx.notify();
                     }
@@ -2155,6 +2208,7 @@ impl ProvidersPage {
             form.error = None;
         }
         cx.notify();
+        let handle = window.window_handle();
         let (progress_tx, mut progress_rx) = tokio::sync::mpsc::unbounded_channel::<()>();
         let call = cx
             .global::<GatewayRuntime>()
@@ -2195,7 +2249,7 @@ impl ProvidersPage {
         cx.spawn(async move |this, cx| {
             let result = call.await;
             this.update(cx, |page, cx| {
-                page.finish_kiro_import(form_generation, result, cx)
+                page.finish_kiro_import(form_generation, result, handle, cx)
             })
             .ok();
         })
@@ -2219,11 +2273,15 @@ impl ProvidersPage {
         &mut self,
         generation: u64,
         result: Result<ImportOutcome, String>,
+        handle: AnyWindowHandle,
         cx: &mut Context<Self>,
     ) {
         let imported_any = result
             .as_ref()
             .is_ok_and(|outcome| outcome.failures.len() < outcome.total);
+        let clean_import = result
+            .as_ref()
+            .is_ok_and(|outcome| outcome.failures.is_empty());
         if imported_any {
             self.reload(cx);
             self.refresh_quotas(cx);
@@ -2232,7 +2290,7 @@ impl ProvidersPage {
             match result {
                 Ok(outcome) if outcome.failures.is_empty() => {
                     self.key_form = None;
-                    self.action_error = None;
+                    notify_success(handle, cx, "Kiro 账号导入成功");
                 }
                 Ok(outcome) => {
                     if let Some(form) = &mut self.key_form {
@@ -2247,17 +2305,21 @@ impl ProvidersPage {
                             progress.failures = outcome.failures;
                         }
                     }
+                    notify_error(handle, cx, "Kiro 账号导入存在失败项");
                 }
                 Err(error) => {
                     if let Some(form) = &mut self.key_form {
                         form.saving = false;
-                        form.error = Some(error);
+                        form.error = Some(error.clone());
                         if let Some(import) = &mut form.kiro_import {
                             import.progress = None;
                         }
                     }
+                    notify_error(handle, cx, format!("Kiro 账号导入失败：{error}"));
                 }
             }
+        } else if clean_import {
+            notify_success(handle, cx, "Kiro 账号导入成功");
         }
         cx.notify();
     }
@@ -2266,7 +2328,7 @@ impl ProvidersPage {
     /// the gateway to open a session with the vendor, then let the block poll
     /// it. The provider row is created here because a session needs a real
     /// provider id and the row may not exist yet.
-    fn start_account_login(&mut self, cx: &mut Context<Self>) {
+    fn start_account_login(&mut self, handle: AnyWindowHandle, cx: &mut Context<Self>) {
         let Some(form) = &self.key_form else { return };
         if form.saving {
             return; // one write in flight at a time
@@ -2377,8 +2439,10 @@ impl ProvidersPage {
             });
         cx.spawn(async move |this, cx| {
             let result = call.await;
-            this.update(cx, |page, cx| page.land_login_start(generation, result, cx))
-                .ok();
+            this.update(cx, |page, cx| {
+                page.land_login_start(generation, result, handle, cx)
+            })
+            .ok();
         })
         .detach();
     }
@@ -2391,6 +2455,7 @@ impl ProvidersPage {
         &mut self,
         generation: u64,
         result: Result<LoginStart, String>,
+        handle: AnyWindowHandle,
         cx: &mut Context<Self>,
     ) {
         let Some(login) = self.login_mut(generation) else {
@@ -2419,12 +2484,15 @@ impl ProvidersPage {
                 if let Some(form) = &mut self.key_form {
                     form.saving = false;
                 }
+                // Keep the vendor's message in the form only: the toast is a
+                // fixed short line, never the raw vendor/store response.
+                notify_error(handle, cx, "登录失败");
                 cx.notify();
                 return;
             }
         };
         cx.notify();
-        self.poll_account_login(generation, session, false, cx);
+        self.poll_account_login(generation, session, false, handle, cx);
     }
 
     /// Poll the login session once: wait the block's interval, read the
@@ -2434,6 +2502,7 @@ impl ProvidersPage {
         generation: u64,
         session: Arc<str>,
         retry: bool,
+        handle: AnyWindowHandle,
         cx: &mut Context<Self>,
     ) {
         let Some((kind, interval)) =
@@ -2476,7 +2545,7 @@ impl ProvidersPage {
                 .await;
             let result = call.await;
             this.update(cx, |page, cx| {
-                page.land_login_status(generation, session, result, retry, cx)
+                page.land_login_status(generation, session, result, retry, handle, cx)
             })
             .ok();
         })
@@ -2492,6 +2561,7 @@ impl ProvidersPage {
         session: Arc<str>,
         result: Result<LoginState, String>,
         retry: bool,
+        handle: AnyWindowHandle,
         cx: &mut Context<Self>,
     ) {
         if !self.login_waiting(generation, &session) {
@@ -2502,11 +2572,11 @@ impl ProvidersPage {
             // A dropped read is not a failed login: give it one more chance
             // before saying so — the user may be authorizing right now.
             Err(_) if !retry => {
-                self.poll_account_login(generation, session, true, cx);
+                self.poll_account_login(generation, session, true, handle, cx);
                 return;
             }
             Err(error) => {
-                self.fail_login(generation, error, cx);
+                self.fail_login(generation, error, handle, cx);
                 return;
             }
         };
@@ -2514,30 +2584,36 @@ impl ProvidersPage {
             "waiting" => {
                 // Repaint: the block's elapsed hint is derived at render time.
                 cx.notify();
-                self.poll_account_login(generation, session, false, cx);
+                self.poll_account_login(generation, session, false, handle, cx);
             }
             "succeeded" => {
                 // The gateway wrote the account, its model snapshot and the
                 // routes: this form is done, exactly like a finished save.
                 self.key_form = None;
-                self.action_error = None;
                 self.reload(cx);
                 self.refresh_quotas(cx);
+                notify_success(handle, cx, "登录成功");
                 cx.notify();
             }
             "failed" => {
                 let message = status.message.unwrap_or_else(|| "登录失败".to_string());
-                self.fail_login(generation, message, cx);
+                self.fail_login(generation, message, handle, cx);
             }
-            "expired" => self.reset_login(generation, "登录已过期，请重新开始", cx),
-            "cancelled" => self.reset_login(generation, "登录已取消", cx),
-            other => self.fail_login(generation, format!("未知的登录状态：{other}"), cx),
+            "expired" => self.reset_login(generation, "登录已过期，请重新开始", handle, cx),
+            "cancelled" => self.reset_login(generation, "登录已取消", handle, cx),
+            other => self.fail_login(generation, format!("未知的登录状态：{other}"), handle, cx),
         }
     }
 
     /// End the block's session with a message it shows; the form stays open so
     /// the login can be retried.
-    fn fail_login(&mut self, generation: u64, message: String, cx: &mut Context<Self>) {
+    fn fail_login(
+        &mut self,
+        generation: u64,
+        message: String,
+        handle: AnyWindowHandle,
+        cx: &mut Context<Self>,
+    ) {
         let Some(login) = self.login_mut(generation) else {
             return;
         };
@@ -2545,12 +2621,21 @@ impl ProvidersPage {
         if let Some(form) = &mut self.key_form {
             form.saving = false;
         }
+        // The message can carry vendor/store detail, so only a fixed short
+        // line reaches the toast; the form keeps the full text inline.
+        notify_error(handle, cx, "登录失败");
         cx.notify();
     }
 
     /// Return the block to idle with a hint on the form: the session ended
     /// without an account, so nothing was written.
-    fn reset_login(&mut self, generation: u64, hint: &str, cx: &mut Context<Self>) {
+    fn reset_login(
+        &mut self,
+        generation: u64,
+        hint: &str,
+        handle: AnyWindowHandle,
+        cx: &mut Context<Self>,
+    ) {
         let Some(login) = self.login_mut(generation) else {
             return;
         };
@@ -2559,6 +2644,7 @@ impl ProvidersPage {
             form.saving = false;
             form.error = Some(hint.to_string());
         }
+        notify_error(handle, cx, hint);
         cx.notify();
     }
 
@@ -2588,6 +2674,7 @@ impl ProvidersPage {
     /// polling the vendor and forgets the session's secret, so no account can
     /// land from it.
     fn cancel_account_login(&mut self, cx: &mut Context<Self>) {
+        let handle = cx.active_window();
         let Some(login) = self.key_form.as_ref().and_then(|form| form.login.as_ref()) else {
             return;
         };
@@ -2631,6 +2718,11 @@ impl ProvidersPage {
                 // either way, and the message says what happened.
                 if let Err(error) = result {
                     form.error = Some(error);
+                    if let Some(handle) = handle {
+                        notify_error(handle, cx, "取消登录失败");
+                    }
+                } else if let Some(handle) = handle {
+                    notify_success(handle, cx, "登录已取消");
                 }
                 cx.notify();
             })
@@ -3159,8 +3251,9 @@ impl ProvidersPage {
 
     /// Save the key editor (label, concurrency cap, model whitelist, groups;
     /// for custom rows also the provider's name, protocol, base_url and DNS
-    /// region), then reload.
+    /// region), then reload and toast the outcome.
     fn save_key_editor(&mut self, cx: &mut Context<Self>) {
+        let handle = cx.active_window();
         let Some(editor) = &self.key_editor else {
             return;
         };
@@ -3321,15 +3414,18 @@ impl ProvidersPage {
             this.update(cx, |page, cx| match result {
                 Ok(()) => {
                     page.key_editor = None;
-                    page.action_error = None;
                     page.reload(cx);
+                    if let Some(handle) = handle {
+                        notify_success(handle, cx, "保存账号成功");
+                    }
                 }
                 Err(error) => {
                     if let Some(editor) = &mut page.key_editor {
                         editor.saving = false;
-                        editor.error = Some(error);
-                    } else {
-                        page.action_error = Some(error);
+                        editor.error = Some(error.clone());
+                    }
+                    if let Some(handle) = handle {
+                        notify_error(handle, cx, format!("保存账号失败：{error}"));
                     }
                     cx.notify();
                     // An earlier step (provider PATCH) may have landed.
@@ -3540,16 +3636,6 @@ async fn import_kiro_accounts(
     })
 }
 
-impl crate::pages::ActionPage for ProvidersPage {
-    fn action_error_slot(&mut self) -> &mut Option<String> {
-        &mut self.action_error
-    }
-
-    fn reload(&mut self, cx: &mut Context<Self>) {
-        ProvidersPage::reload(self, cx);
-    }
-}
-
 impl Render for ProvidersPage {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         self.sync_group_manager(window, cx);
@@ -3586,9 +3672,6 @@ impl Render for ProvidersPage {
                 let now = chrono::Utc::now();
                 let any_visible = data.keys.iter().any(|card| visibility.admits(card.key.id));
                 frame
-                    .when_some(self.action_error.as_ref(), |this, error| {
-                        this.child(action_error_card(error, cx))
-                    })
                     .when_some(self.key_form.as_ref(), |this, form| {
                         this.child(self.key_form_card(form, cx))
                     })

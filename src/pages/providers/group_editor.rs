@@ -2,7 +2,7 @@
 //! and 管理分组 (one row per group: rename, delete). Both live above the
 //! account cards, are mutually exclusive, and show every write failure
 //! inside themselves — the server's message verbatim (409 duplicate name,
-//! 400 invalid name) — never in the page-level `action_error`.
+//! 400 invalid name) — plus a short in-app error toast.
 
 use std::collections::HashMap;
 
@@ -20,7 +20,7 @@ use gateway::store::KeyGroupView;
 use super::cards::{editor_field, inline_error};
 use super::groups::{GroupFilter, counts};
 use super::{LoadState, ProvidersData, ProvidersPage};
-use crate::pages::card;
+use crate::pages::{card, notify_error, notify_success};
 use crate::runtime::GatewayRuntime;
 
 /// 新建分组 card state.
@@ -117,6 +117,7 @@ impl ProvidersPage {
     /// 全部 (`GroupFilter::effective`: the id is not in the groups yet), then
     /// it resolves to the new group by itself.
     fn submit_group_create(&mut self, cx: &mut Context<Self>) {
+        let handle = cx.active_window();
         let Some(form) = &mut self.group_create else {
             return;
         };
@@ -141,14 +142,19 @@ impl ProvidersPage {
                 match result {
                     Ok(id) => {
                         page.group_create = None;
-                        page.action_error = None;
                         page.group_filter = GroupFilter::Named(id);
                         page.reload(cx);
+                        if let Some(handle) = handle {
+                            notify_success(handle, cx, "分组创建成功");
+                        }
                     }
                     Err(error) => {
                         if let Some(form) = &mut page.group_create {
                             form.saving = false;
-                            form.error = Some(error);
+                            form.error = Some(error.clone());
+                        }
+                        if let Some(handle) = handle {
+                            notify_error(handle, cx, format!("分组创建失败：{error}"));
                         }
                     }
                 }
@@ -161,11 +167,18 @@ impl ProvidersPage {
 
     /// Run one rename/delete write for a manager row: the row shows the
     /// in-flight state and, on failure, the server's message; success reloads.
-    fn run_group_row_write<F, Fut>(&mut self, id: i64, cx: &mut Context<Self>, f: F)
-    where
+    /// Both outcomes also toast with `label` naming the action.
+    fn run_group_row_write<F, Fut>(
+        &mut self,
+        label: &'static str,
+        id: i64,
+        cx: &mut Context<Self>,
+        f: F,
+    ) where
         F: FnOnce(GatewayHttpClient) -> Fut + Send + 'static,
         Fut: std::future::Future<Output = Result<(), ClientError>> + Send + 'static,
     {
+        let handle = cx.active_window();
         let Some(row) = self
             .group_manager
             .as_mut()
@@ -193,11 +206,17 @@ impl ProvidersPage {
                             row.saving = false;
                         }
                         page.reload(cx);
+                        if let Some(handle) = handle {
+                            notify_success(handle, cx, format!("{label}成功"));
+                        }
                     }
                     Err(error) => {
                         if let Some(row) = row {
                             row.saving = false;
-                            row.error = Some(error);
+                            row.error = Some(error.clone());
+                        }
+                        if let Some(handle) = handle {
+                            notify_error(handle, cx, format!("{label}失败：{error}"));
                         }
                     }
                 }
@@ -218,7 +237,7 @@ impl ProvidersPage {
             return;
         };
         let name = row.name.read(cx).value().trim().to_string();
-        self.run_group_row_write(id, cx, move |admin| async move {
+        self.run_group_row_write("保存分组", id, cx, move |admin| async move {
             admin.rename_key_group(id, &name).await
         });
     }
@@ -235,7 +254,7 @@ impl ProvidersPage {
             return;
         }
         manager.confirming_delete = None;
-        self.run_group_row_write(id, cx, move |admin| async move {
+        self.run_group_row_write("删除分组", id, cx, move |admin| async move {
             admin.delete_key_group(id).await
         });
     }

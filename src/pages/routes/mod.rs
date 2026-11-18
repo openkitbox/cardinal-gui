@@ -9,9 +9,9 @@
 mod stage;
 
 use gpui::{
-    App, AppContext as _, Context, Div, ElementId, Entity, Focusable as _, InteractiveElement,
-    IntoElement, ParentElement, Render, StatefulInteractiveElement, Styled, Window,
-    prelude::FluentBuilder as _, px,
+    AnyWindowHandle, App, AppContext as _, Context, Div, ElementId, Entity, Focusable as _,
+    InteractiveElement, IntoElement, ParentElement, Render, StatefulInteractiveElement, Styled,
+    Window, prelude::FluentBuilder as _, px,
 };
 use gpui_kit::assets::IconName;
 use gpui_kit::component::button::{Button, ButtonVariant, ButtonVariants};
@@ -28,8 +28,8 @@ use gateway::store::{
 
 use crate::activity::ActivityFeed;
 use crate::pages::{
-    LoadState, action_error_card, card, empty_card, error_card, loading_card, page_frame,
-    refresh_button,
+    LoadState, card, empty_card, error_card, loading_card, notify_error, notify_success,
+    page_frame, refresh_button,
 };
 use crate::runtime::{GatewayRuntime, RelayMode};
 
@@ -490,9 +490,6 @@ pub struct RoutesPage {
     /// Stale-overwrite guard: a reload started later always wins over one still in flight.
     generation: u64,
     editor: Option<RouteEditor>,
-    /// Failure of a manage write (entry move/remove, route delete); shown
-    /// above the stage.
-    action_error: Option<String>,
     /// Manage mode: the stage's sections carry edit/delete actions and each
     /// entry row its ▲▼/✕ (tab-row 管理/完成 toggle).
     manage: bool,
@@ -536,7 +533,6 @@ impl RoutesPage {
             state: LoadState::Loading,
             generation: 0,
             editor: None,
-            action_error: None,
             manage: false,
             manage_write_in_flight: false,
             stage_drop: None,
@@ -617,7 +613,10 @@ impl RoutesPage {
     pub(crate) fn actions(&mut self, cx: &mut Context<Self>) -> Vec<gpui::AnyElement> {
         let refresh = refresh_button(
             "routes-refresh",
-            cx.listener(|this, _, _, cx| this.reload(cx)),
+            cx.listener(|this, _, window, cx| {
+                let handle = window.window_handle();
+                this.reload_with_notice(cx, Some(handle));
+            }),
         );
         match &self.state {
             LoadState::Loaded(_) => vec![
@@ -651,6 +650,13 @@ impl RoutesPage {
     /// requests, model-success). ONE bootstrap call replaces the per-provider
     /// key fan-out this page used to make.
     pub(super) fn reload(&mut self, cx: &mut Context<Self>) {
+        self.reload_with_notice(cx, None);
+    }
+
+    /// Same load as [`Self::reload`], but toasts the outcome of an explicit
+    /// refresh. Internal reloads (tab activation, write follow-ups) pass `None`
+    /// and stay silent; a result superseded by a newer reload toasts nothing.
+    fn reload_with_notice(&mut self, cx: &mut Context<Self>, handle: Option<AnyWindowHandle>) {
         crate::pages::begin_load(&mut self.state);
         self.generation += 1;
         let generation = self.generation;
@@ -668,9 +674,19 @@ impl RoutesPage {
                 if page.generation != generation {
                     return; // a newer reload is in flight; this snapshot is stale
                 }
-                page.state = match result {
-                    Ok(data) => LoadState::Loaded(data),
-                    Err(error) => LoadState::Failed(error),
+                match result {
+                    Ok(data) => {
+                        page.state = LoadState::Loaded(data);
+                        if let Some(handle) = handle {
+                            notify_success(handle, cx, "刷新成功");
+                        }
+                    }
+                    Err(error) => {
+                        if let Some(handle) = handle {
+                            notify_error(handle, cx, format!("刷新失败：{error}"));
+                        }
+                        page.state = LoadState::Failed(error);
+                    }
                 };
                 page.seed_clients();
                 page.arm_prune(cx);
@@ -911,6 +927,7 @@ impl RoutesPage {
         if self.manage_write_in_flight {
             return;
         }
+        let handle = cx.active_window();
         let Some(editor) = &self.editor else { return };
         let alias = editor.alias.read(cx).value().trim().to_string();
         let context_window = editor.context_window;
@@ -989,14 +1006,18 @@ impl RoutesPage {
                 match result {
                     Ok(()) => {
                         page.editor = None;
-                        page.action_error = None;
                         page.reload(cx);
+                        if let Some(handle) = handle {
+                            notify_success(handle, cx, "保存路由成功");
+                        }
                     }
                     Err(error) => {
+                        let message = format!("保存路由失败：{error}");
                         if let Some(editor) = &mut page.editor {
-                            editor.error = Some(error);
-                        } else {
-                            page.action_error = Some(error);
+                            editor.error = Some(message.clone());
+                        }
+                        if let Some(handle) = handle {
+                            notify_error(handle, cx, message);
                         }
                         cx.notify();
                     }
@@ -1022,7 +1043,7 @@ impl RoutesPage {
                 .on_ok(move |_, _, cx| {
                     let alias = on_ok_alias.clone();
                     on_ok_page.update(cx, |page, cx| {
-                        page.manage_write(cx, move |admin| async move {
+                        page.manage_write(cx, "删除路由", move |admin| async move {
                             admin.delete_route(&alias).await
                         })
                     });
@@ -1064,7 +1085,7 @@ impl RoutesPage {
         let strategy = route.strategy;
         let note = route.note.clone();
         let alias = drag.alias.clone();
-        self.manage_write(cx, move |admin| async move {
+        self.manage_write(cx, "保存排序", move |admin| async move {
             admin
                 .put_route(
                     &alias,
@@ -1106,7 +1127,7 @@ impl RoutesPage {
         let context_window = route.context_window;
         let strategy = route.strategy;
         let note = route.note.clone();
-        self.manage_write(cx, move |admin| async move {
+        self.manage_write(cx, "调整顺序", move |admin| async move {
             admin
                 .put_route(
                     &alias,
@@ -1142,7 +1163,7 @@ impl RoutesPage {
         let context_window = route.context_window;
         let strategy = route.strategy;
         let note = route.note.clone();
-        self.manage_write(cx, move |admin| async move {
+        self.manage_write(cx, "更新暂停状态", move |admin| async move {
             admin
                 .put_route(
                     &alias,
@@ -1224,7 +1245,7 @@ impl RoutesPage {
                     let entries = on_ok_entries.clone();
                     let note = on_ok_note.clone();
                     on_ok_page.update(cx, |page, cx| {
-                        page.manage_write(cx, move |admin| async move {
+                        page.manage_write(cx, "移除模型", move |admin| async move {
                             admin
                                 .put_route(
                                     &alias,
@@ -1243,9 +1264,9 @@ impl RoutesPage {
     }
 
     /// One manage-mode write with in-flight serialization (see
-    /// `manage_write_in_flight`); on success clear the error and reload, on
-    /// failure show the message — same contract as `run_write`, plus the flag.
-    fn manage_write<F, Fut>(&mut self, cx: &mut Context<Self>, f: F)
+    /// `manage_write_in_flight`); on success reload and toast, on failure toast
+    /// the error. `label` names the action in both outcomes.
+    fn manage_write<F, Fut>(&mut self, cx: &mut Context<Self>, label: &'static str, f: F)
     where
         F: FnOnce(GatewayHttpClient) -> Fut + Send + 'static,
         Fut: std::future::Future<Output = Result<(), gateway::http_client::ClientError>>
@@ -1258,6 +1279,7 @@ impl RoutesPage {
             return;
         }
         self.manage_write_in_flight = true;
+        let handle = cx.active_window();
         let call = cx.global::<GatewayRuntime>().admin_call(f);
         cx.spawn(async move |this, cx| {
             let result = call.await;
@@ -1265,12 +1287,15 @@ impl RoutesPage {
                 page.manage_write_in_flight = false;
                 match result {
                     Ok(()) => {
-                        page.action_error = None;
                         page.reload(cx);
+                        if let Some(handle) = handle {
+                            notify_success(handle, cx, format!("{label}成功"));
+                        }
                     }
                     Err(error) => {
-                        page.action_error = Some(error);
-                        cx.notify();
+                        if let Some(handle) = handle {
+                            notify_error(handle, cx, format!("{label}失败：{error}"));
+                        }
                     }
                 }
             })
@@ -2054,16 +2079,6 @@ impl RoutesPage {
     }
 }
 
-impl crate::pages::ActionPage for RoutesPage {
-    fn action_error_slot(&mut self) -> &mut Option<String> {
-        &mut self.action_error
-    }
-
-    fn reload(&mut self, cx: &mut Context<Self>) {
-        RoutesPage::reload(self, cx);
-    }
-}
-
 impl Render for RoutesPage {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         // No header: the tab bar names the view and the actions live in the tab
@@ -2080,9 +2095,6 @@ impl Render for RoutesPage {
                     // column IS the route list — every route as a section.
                     .when_some(self.stage_card(data, cx), |this, stage| this.child(stage));
                 frame
-                    .when_some(self.action_error.as_ref(), |this, error| {
-                        this.child(action_error_card(error, cx))
-                    })
                     .when_some(self.editor.as_ref(), |this, editor| {
                         this.child(self.route_editor_card(editor, data, cx))
                     })

@@ -10,8 +10,7 @@ use gpui_kit::component::tab::{Tab, TabBar};
 use crate::app::{AppState, StatusTab};
 use crate::pages::users::ShowUserKeys;
 use crate::pages::{
-    ActionPage, GatewayKeysPage, ProvidersPage, RequestsPage, RoutesPage, SettingsPage, UsagePage,
-    UsersPage,
+    GatewayKeysPage, ProvidersPage, RequestsPage, RoutesPage, SettingsPage, UsagePage, UsersPage,
 };
 
 /// Container for the four status views. Owns their entities (created eagerly,

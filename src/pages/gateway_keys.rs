@@ -13,8 +13,9 @@
 use chrono::{DateTime, TimeZone as _, Utc};
 use gpui::prelude::FluentBuilder as _;
 use gpui::{
-    App, AppContext as _, Context, Div, ElementId, Entity, Focusable as _, InteractiveElement as _,
-    IntoElement, ParentElement, Render, StatefulInteractiveElement as _, Styled, Window, px,
+    AnyWindowHandle, App, AppContext as _, Context, Div, ElementId, Entity, Focusable as _,
+    InteractiveElement as _, IntoElement, ParentElement, Render, StatefulInteractiveElement as _,
+    Styled, Window, px,
 };
 use gpui_kit::assets::IconName;
 use gpui_kit::component::button::{Button, ButtonVariants as _};
@@ -28,8 +29,8 @@ use gateway::http_client::GatewayKeyUpdate;
 use gateway::store::{GatewayKeyRow, OWNER_LOGIN, UserRow};
 
 use crate::pages::{
-    ActionPage, LoadState, action_error_card, begin_load, card, empty_card, error_card,
-    loading_card, page_frame, refresh_button, run_write,
+    LoadState, begin_load, card, empty_card, error_card, loading_card, notify_error,
+    notify_success, page_frame, refresh_button,
 };
 use crate::runtime::GatewayRuntime;
 
@@ -93,7 +94,6 @@ impl UserPicker {
 /// Gateway key management page (the Key tab).
 pub struct GatewayKeysPage {
     state: LoadState<KeySnapshot>,
-    action_error: Option<String>,
     /// Label search; every keystroke filters the loaded rows, no new fetch.
     search: Entity<InputState>,
     query: String,
@@ -114,7 +114,6 @@ impl GatewayKeysPage {
         .detach();
         Self {
             state: LoadState::Loading,
-            action_error: None,
             search,
             query: String::new(),
             user_filter: None,
@@ -127,7 +126,9 @@ impl GatewayKeysPage {
     pub(crate) fn actions(&mut self, cx: &mut Context<Self>) -> Vec<gpui::AnyElement> {
         let refresh = refresh_button(
             "keys-refresh",
-            cx.listener(|this, _, _, cx| this.reload(cx)),
+            cx.listener(|this, _, window, cx| {
+                this.reload_with_notice(cx, Some(window.window_handle()));
+            }),
         );
         match &self.state {
             LoadState::Loaded(_) => vec![
@@ -328,6 +329,12 @@ impl GatewayKeysPage {
         editor.saving = true;
         editor.error = None;
         cx.notify();
+        let handle = cx.active_window();
+        let action = if editing.is_some() {
+            "保存 Key"
+        } else {
+            "创建 Key"
+        };
 
         let call = cx
             .global::<GatewayRuntime>()
@@ -353,10 +360,15 @@ impl GatewayKeysPage {
             this.update(cx, |page, cx| match result {
                 Ok(()) => {
                     page.editor = None;
-                    page.action_error = None;
                     page.reload(cx);
+                    if let Some(handle) = handle {
+                        notify_success(handle, cx, format!("{action}成功"));
+                    }
                 }
                 Err(error) => {
+                    if let Some(handle) = handle {
+                        notify_error(handle, cx, format!("{action}失败：{error}"));
+                    }
                     if let Some(editor) = &mut page.editor {
                         editor.saving = false;
                         editor.error = Some(error);
@@ -370,9 +382,31 @@ impl GatewayKeysPage {
     }
 
     fn toggle_key(&mut self, id: i64, enabled: bool, cx: &mut Context<Self>) {
-        run_write(cx, move |admin| async move {
-            admin.set_gateway_key_enabled(id, enabled).await
-        });
+        let handle = cx.active_window();
+        let action = if enabled { "启用 Key" } else { "暂停 Key" };
+        let call = cx
+            .global::<GatewayRuntime>()
+            .admin_call(
+                move |admin| async move { admin.set_gateway_key_enabled(id, enabled).await },
+            );
+        cx.spawn(async move |this, cx| {
+            let result = call.await;
+            this.update(cx, |page, cx| match result {
+                Ok(()) => {
+                    page.reload(cx);
+                    if let Some(handle) = handle {
+                        notify_success(handle, cx, format!("{action}成功"));
+                    }
+                }
+                Err(error) => {
+                    if let Some(handle) = handle {
+                        notify_error(handle, cx, format!("{action}失败：{error}"));
+                    }
+                }
+            })
+            .ok();
+        })
+        .detach();
     }
 
     /// Show only `user_id`'s keys (`None` = every user's), as if picked in
@@ -777,12 +811,15 @@ impl GatewayKeysPage {
     }
 }
 
-impl ActionPage for GatewayKeysPage {
-    fn action_error_slot(&mut self) -> &mut Option<String> {
-        &mut self.action_error
+impl GatewayKeysPage {
+    /// Silent reload for tab switches and write follow-ups.
+    pub(super) fn reload(&mut self, cx: &mut Context<Self>) {
+        self.reload_with_notice(cx, None);
     }
 
-    fn reload(&mut self, cx: &mut Context<Self>) {
+    /// Same load as [`Self::reload`], but toasts the outcome of an explicit
+    /// refresh from the tab row. Write follow-ups pass `None` and stay silent.
+    fn reload_with_notice(&mut self, cx: &mut Context<Self>, handle: Option<AnyWindowHandle>) {
         begin_load(&mut self.state);
         let call = cx
             .global::<GatewayRuntime>()
@@ -796,9 +833,19 @@ impl ActionPage for GatewayKeysPage {
         cx.spawn(async move |this, cx| {
             let result = call.await;
             this.update(cx, |page, cx| {
-                page.state = match result {
-                    Ok(snapshot) => LoadState::Loaded(snapshot),
-                    Err(error) => LoadState::Failed(error),
+                match result {
+                    Ok(snapshot) => {
+                        page.state = LoadState::Loaded(snapshot);
+                        if let Some(handle) = handle {
+                            notify_success(handle, cx, "刷新成功");
+                        }
+                    }
+                    Err(error) => {
+                        if let Some(handle) = handle {
+                            notify_error(handle, cx, format!("刷新失败：{error}"));
+                        }
+                        page.state = LoadState::Failed(error);
+                    }
                 };
                 cx.notify();
             })
@@ -811,10 +858,6 @@ impl ActionPage for GatewayKeysPage {
 impl Render for GatewayKeysPage {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let mut content = gpui::div().flex().flex_col().gap_4();
-
-        if let Some(error) = &self.action_error {
-            content = content.child(action_error_card(error, cx));
-        }
 
         let filter = self.user_dropdown(UserPicker::Filter, cx);
         content = content.child(

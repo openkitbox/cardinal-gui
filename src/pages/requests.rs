@@ -6,8 +6,8 @@
 use std::collections::{HashMap, HashSet};
 
 use gpui::{
-    App, AppContext, Context, Div, ElementId, InteractiveElement, IntoElement, ParentElement,
-    Render, StatefulInteractiveElement, Styled, Window, px,
+    AnyWindowHandle, App, AppContext, Context, Div, ElementId, InteractiveElement, IntoElement,
+    ParentElement, Render, StatefulInteractiveElement, Styled, Window, px,
 };
 use gpui_kit::assets::IconName;
 use gpui_kit::component::button::{Button, ButtonVariants};
@@ -25,7 +25,10 @@ use crate::activity::{
 };
 use crate::fmt::format_cost;
 use crate::fmt::usd_microus;
-use crate::pages::{LoadState, empty_card, error_card, loading_card, page_frame, refresh_button};
+use crate::pages::{
+    LoadState, empty_card, error_card, loading_card, notify_error, notify_success, page_frame,
+    refresh_button,
+};
 use crate::runtime::GatewayRuntime;
 
 fn project_request(row: gateway::activity::PersistedRequest, id: i64) -> RequestRow {
@@ -315,9 +318,22 @@ impl RequestsPage {
     }
 
     fn apply_reload(&mut self, event: LedgerReloadEvent, cx: &mut Context<Self>) {
+        self.apply_reload_with_notice(event, None, cx);
+    }
+
+    /// Same reload decision as [`Self::apply_reload`], but toasts the outcome
+    /// when an explicit refresh passes its window. Feed events, pagination and
+    /// tab switches stay silent; a snapshot superseded by a newer reload does
+    /// not toast either.
+    fn apply_reload_with_notice(
+        &mut self,
+        event: LedgerReloadEvent,
+        handle: Option<AnyWindowHandle>,
+        cx: &mut Context<Self>,
+    ) {
         match self.persisted_reload.reduce(self.active, event) {
             LedgerReloadAction::None => {}
-            LedgerReloadAction::ReloadNow => self.reload(cx),
+            LedgerReloadAction::ReloadNow => self.reload_with_notice(cx, handle),
             LedgerReloadAction::Schedule(token) => {
                 cx.spawn(async move |this, cx| {
                     cx.background_executor()
@@ -329,7 +345,7 @@ impl RequestsPage {
                                 .reduce(page.active, LedgerReloadEvent::TimerComplete(token)),
                             LedgerReloadAction::ReloadNow
                         ) {
-                            page.reload(cx);
+                            page.reload_with_notice(cx, handle);
                         }
                     })
                     .ok();
@@ -341,6 +357,12 @@ impl RequestsPage {
 
     /// (Re)load the page at the current cursor over the HTTP admin API.
     pub(super) fn reload(&mut self, cx: &mut Context<Self>) {
+        self.reload_with_notice(cx, None);
+    }
+
+    /// Same load as [`Self::reload`], but toasts the result of an explicit
+    /// refresh. Internal reloads pass `None` and stay silent.
+    fn reload_with_notice(&mut self, cx: &mut Context<Self>, handle: Option<AnyWindowHandle>) {
         crate::pages::begin_load(&mut self.state);
         self.persisted_reload.cancel();
         self.generation += 1;
@@ -384,9 +406,17 @@ impl RequestsPage {
                                 && error_detail_cache_is_current(state, Some(error))
                         });
                         page.state = LoadState::Loaded(rows);
+                        if let Some(handle) = handle {
+                            notify_success(handle, cx, "刷新成功");
+                        }
                         page.prepare_expanded_error_details(cx);
                     }
-                    Err(error) => page.state = LoadState::Failed(error),
+                    Err(error) => {
+                        if let Some(handle) = handle {
+                            notify_error(handle, cx, format!("刷新失败：{error}"));
+                        }
+                        page.state = LoadState::Failed(error);
+                    }
                 }
                 cx.notify();
             })
@@ -624,8 +654,12 @@ impl RequestsPage {
         vec![
             refresh_button(
                 "requests-refresh",
-                cx.listener(|this, _, _, cx| {
-                    this.apply_reload(LedgerReloadEvent::ManualReload, cx)
+                cx.listener(|this, _, window, cx| {
+                    this.apply_reload_with_notice(
+                        LedgerReloadEvent::ManualReload,
+                        Some(window.window_handle()),
+                        cx,
+                    )
                 }),
             )
             .into_any_element(),

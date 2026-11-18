@@ -6,7 +6,8 @@
 
 use gpui::prelude::FluentBuilder as _;
 use gpui::{
-    AppContext as _, Context, Entity, IntoElement, ParentElement, Render, Styled, Window, px,
+    AnyWindowHandle, AppContext as _, Context, Entity, IntoElement, ParentElement, Render, Styled,
+    Window, px,
 };
 use gpui_kit::component::ActiveTheme;
 use gpui_kit::component::button::Button;
@@ -14,7 +15,7 @@ use gpui_kit::component::input::{Input, InputState};
 use gpui_kit::component::switch::Switch;
 use gpui_kit::component::tag::Tag;
 
-use crate::pages::{card, page_frame};
+use crate::pages::{card, notify_error, notify_success, page_frame};
 use crate::runtime::GatewayRuntime;
 
 /// Startup state of the gateway connection.
@@ -68,12 +69,13 @@ impl SettingsPage {
     /// Save the timezone: parse the input, write it back to the open config
     /// file's `[gui].timezone`, and apply it immediately. A parse or write
     /// failure lands in `save_error`; an empty input clears the key.
-    fn save_timezone(&mut self, cx: &mut Context<Self>) {
+    fn save_timezone(&mut self, handle: AnyWindowHandle, cx: &mut Context<Self>) {
         let raw = self.timezone.read(cx).value().to_string();
         let offset = match crate::ui_tz::parse_timezone_input(&raw) {
             Ok(offset) => offset,
             Err(error) => {
-                self.save_error = Some(error);
+                self.save_error = Some(error.clone());
+                notify_error(handle, cx, format!("保存时区失败：{error}"));
                 cx.notify();
                 return;
             }
@@ -88,8 +90,12 @@ impl SettingsPage {
             Ok(()) => {
                 crate::ui_tz::set_display_tz(offset);
                 self.save_error = None;
+                notify_success(handle, cx, "保存时区成功");
             }
-            Err(error) => self.save_error = Some(error),
+            Err(error) => {
+                self.save_error = Some(error.clone());
+                notify_error(handle, cx, format!("保存时区失败：{error}"));
+            }
         }
         cx.notify();
     }
@@ -98,7 +104,7 @@ impl SettingsPage {
     /// failure keeps the old value — the switch must never claim a state the file
     /// does not hold, or the next start would silently disagree with what the card
     /// showed.
-    fn set_sales_mode(&mut self, on: bool, cx: &mut Context<Self>) {
+    fn set_sales_mode(&mut self, on: bool, handle: AnyWindowHandle, cx: &mut Context<Self>) {
         let outcome = match crate::load::config_path() {
             Some(path) => crate::sales_mode::save(&path, on),
             None => Err("无法确定打开的配置文件路径，无法保存".to_string()),
@@ -107,8 +113,12 @@ impl SettingsPage {
             Ok(()) => {
                 crate::sales_mode::set_enabled(on);
                 self.sales_error = None;
+                notify_success(handle, cx, "切换销售模式成功");
             }
-            Err(error) => self.sales_error = Some(error),
+            Err(error) => {
+                self.sales_error = Some(error.clone());
+                notify_error(handle, cx, format!("切换销售模式失败：{error}"));
+            }
         }
         cx.notify();
     }
@@ -190,8 +200,8 @@ impl Render for SettingsPage {
                                     .gap_2()
                                     .child(Input::new(&self.timezone).w(px(240.)))
                                     .child(Button::new("settings-tz-save").label("保存").on_click(
-                                        cx.listener(|this, _, _, cx| {
-                                            this.save_timezone(cx);
+                                        cx.listener(|this, _, window, cx| {
+                                            this.save_timezone(window.window_handle(), cx);
                                         }),
                                     )),
                             ),
@@ -239,8 +249,8 @@ impl Render for SettingsPage {
                             .child(
                                 Switch::new("settings-sales-mode")
                                     .checked(crate::sales_mode::enabled())
-                                    .on_change(cx.listener(|this, on: &bool, _window, cx| {
-                                        this.set_sales_mode(*on, cx);
+                                    .on_change(cx.listener(|this, on: &bool, window, cx| {
+                                        this.set_sales_mode(*on, window.window_handle(), cx);
                                     })),
                             ),
                     )

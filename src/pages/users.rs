@@ -16,9 +16,9 @@
 
 use gpui::prelude::FluentBuilder as _;
 use gpui::{
-    AppContext as _, Context, Div, ElementId, Entity, EventEmitter, Focusable as _,
-    InteractiveElement as _, IntoElement, ParentElement, Render, StatefulInteractiveElement as _,
-    Styled, Window, px,
+    AnyWindowHandle, AppContext as _, Context, Div, ElementId, Entity, EventEmitter,
+    Focusable as _, InteractiveElement as _, IntoElement, ParentElement, Render,
+    StatefulInteractiveElement as _, Styled, Window, px,
 };
 use gpui_kit::assets::IconName;
 use gpui_kit::component::button::{Button, ButtonVariants as _};
@@ -35,8 +35,8 @@ use crate::pages::user_groups::{
     GroupsChanged, INTERNAL_GROUP, UserGroupsView, rate_error, rate_text,
 };
 use crate::pages::{
-    ActionPage, LoadState, action_error_card, begin_load, card, display_time, editor_row,
-    empty_card, error_card, field_label, icon_button, inline_error, loading_card, page_frame,
+    LoadState, begin_load, card, display_time, editor_row, empty_card, error_card, field_label,
+    icon_button, inline_error, loading_card, notify_error, notify_success, page_frame,
     refresh_button, segmented,
 };
 use crate::runtime::GatewayRuntime;
@@ -147,7 +147,6 @@ pub struct UsersPage {
     active: bool,
     state: LoadState<Vec<UserRow>>,
     groups: Entity<UserGroupsView>,
-    action_error: Option<String>,
     /// Login search; every keystroke filters the loaded rows, no new fetch.
     search: Entity<InputState>,
     query: String,
@@ -174,7 +173,7 @@ impl UsersPage {
         // User rows carry the group name and rate: a group write reloads them.
         cx.subscribe(&groups, |page, _, _: &GroupsChanged, cx| {
             if page.active {
-                page.reload_users(cx);
+                page.reload_users(cx, None);
             }
         })
         .detach();
@@ -184,7 +183,6 @@ impl UsersPage {
             active: false,
             state: LoadState::Loading,
             groups,
-            action_error: None,
             search,
             query: String::new(),
             status_filter: StatusFilter::All,
@@ -218,7 +216,9 @@ impl UsersPage {
     pub(crate) fn actions(&mut self, cx: &mut Context<Self>) -> Vec<gpui::AnyElement> {
         let refresh = refresh_button(
             "users-refresh",
-            cx.listener(|this, _, _, cx| this.reload(cx)),
+            cx.listener(|this, _, window, cx| {
+                this.reload_with_notice(cx, Some(window.window_handle()));
+            }),
         );
         let create = match self.segment {
             Segment::Users => Button::new("user-create")
@@ -243,7 +243,10 @@ impl UsersPage {
         ]
     }
 
-    fn reload_users(&mut self, cx: &mut Context<Self>) {
+    /// Silent by default: tab switches, group writes and balance changes pass
+    /// `None`. An explicit refresh passes the requesting window so exactly one
+    /// toast reports the outcome of the primary users load.
+    fn reload_users(&mut self, cx: &mut Context<Self>, handle: Option<AnyWindowHandle>) {
         if !self.active {
             return;
         }
@@ -254,15 +257,43 @@ impl UsersPage {
         cx.spawn(async move |this, cx| {
             let result = call.await;
             this.update(cx, |page, cx| {
-                page.state = match result {
-                    Ok(users) => LoadState::Loaded(users),
-                    Err(error) => LoadState::Failed(error),
+                match result {
+                    Ok(users) => {
+                        page.state = LoadState::Loaded(users);
+                        if let Some(handle) = handle {
+                            notify_success(handle, cx, "刷新成功");
+                        }
+                    }
+                    Err(error) => {
+                        if let Some(handle) = handle {
+                            notify_error(handle, cx, format!("刷新失败：{error}"));
+                        }
+                        page.state = LoadState::Failed(error);
+                    }
                 };
                 cx.notify();
             })
             .ok();
         })
         .detach();
+    }
+
+    /// Silent reload for tab switches, group writes and balance changes.
+    pub(super) fn reload(&mut self, cx: &mut Context<Self>) {
+        self.reload_with_notice(cx, None);
+    }
+
+    /// Reload the users, the groups and the open ledger panel. Only the users
+    /// load toasts, so one explicit refresh produces one success/error notice.
+    fn reload_with_notice(&mut self, cx: &mut Context<Self>, handle: Option<AnyWindowHandle>) {
+        if !self.active {
+            return;
+        }
+        self.reload_users(cx, handle);
+        self.groups.update(cx, |groups, cx| groups.reload(cx));
+        if let Some(panel) = &self.detail {
+            panel.update(cx, |panel, cx| panel.reload(cx));
+        }
     }
 
     fn user(&self, id: i64) -> Option<&UserRow> {
@@ -444,6 +475,12 @@ impl UsersPage {
         editor.saving = true;
         editor.error = None;
         cx.notify();
+        let handle = cx.active_window();
+        let action = if submit.editing.is_some() {
+            "保存用户"
+        } else {
+            "创建用户"
+        };
         let call = cx
             .global::<GatewayRuntime>()
             .admin_call(move |admin| async move {
@@ -485,10 +522,15 @@ impl UsersPage {
             this.update(cx, |page, cx| match result {
                 Ok(()) => {
                     page.editor = None;
-                    page.action_error = None;
                     page.reload(cx);
+                    if let Some(handle) = handle {
+                        notify_success(handle, cx, format!("{action}成功"));
+                    }
                 }
                 Err(error) => {
+                    if let Some(handle) = handle {
+                        notify_error(handle, cx, format!("{action}失败：{error}"));
+                    }
                     if let Some(editor) = &mut page.editor {
                         editor.saving = false;
                         editor.error = Some(error);
@@ -513,7 +555,7 @@ impl UsersPage {
             let panel = cx.new(|cx| LedgerPanel::new(id, cx));
             // A top-up or adjustment changes the balance column.
             cx.subscribe(&panel, |page, _, _: &BalanceChanged, cx| {
-                page.reload_users(cx)
+                page.reload_users(cx, None)
             })
             .detach();
             self.detail = Some(panel);
@@ -1043,25 +1085,6 @@ impl UsersPage {
     }
 }
 
-impl ActionPage for UsersPage {
-    fn action_error_slot(&mut self) -> &mut Option<String> {
-        &mut self.action_error
-    }
-
-    /// Reload the users, the groups (filter, picker and the 用户组 segment)
-    /// and the open ledger panel.
-    fn reload(&mut self, cx: &mut Context<Self>) {
-        if !self.active {
-            return;
-        }
-        self.reload_users(cx);
-        self.groups.update(cx, |groups, cx| groups.reload(cx));
-        if let Some(panel) = &self.detail {
-            panel.update(cx, |panel, cx| panel.reload(cx));
-        }
-    }
-}
-
 impl Render for UsersPage {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let mut header = gpui::div().flex().items_center().gap_3().child(segmented(
@@ -1088,9 +1111,6 @@ impl Render for UsersPage {
             ));
         }
         let mut content = gpui::div().flex().flex_col().gap_4().child(header);
-        if let Some(error) = &self.action_error {
-            content = content.child(action_error_card(error, cx));
-        }
         content = match self.segment {
             Segment::Users => {
                 let groups = self.groups.read(cx).groups().unwrap_or(&[]);

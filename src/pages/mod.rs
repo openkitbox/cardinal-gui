@@ -28,18 +28,15 @@ pub use usage::UsagePage;
 pub use users::UsersPage;
 
 use gpui::{
-    App, ClickEvent, Context, Div, InteractiveElement, ParentElement, Stateful,
-    StatefulInteractiveElement, Styled, Window, px,
+    AnyWindowHandle, App, ClickEvent, Context, Div, InteractiveElement, ParentElement,
+    SharedString, Stateful, StatefulInteractiveElement, Styled, Window, px,
 };
 use gpui_kit::assets::IconName;
 use gpui_kit::component::button::{Button, ButtonVariants as _};
 use gpui_kit::component::input::Input;
+use gpui_kit::component::notification::Notification;
 use gpui_kit::component::spinner::Spinner;
-use gpui_kit::component::{ActiveTheme, Icon, Sizable};
-
-use gateway::http_client::GatewayHttpClient;
-
-use crate::runtime::GatewayRuntime;
+use gpui_kit::component::{ActiveTheme, Icon, Sizable, WindowExt};
 
 /// Async load lifecycle shared by the dashboard pages: first render kicks off
 /// the load, Refresh re-runs it; there are no polling timers.
@@ -49,41 +46,29 @@ pub(crate) enum LoadState<T> {
     Failed(String),
 }
 
-/// A dashboard page that runs admin writes: row-level failures surface above
-/// the page's content via an action-error slot; a successful write triggers a
-/// reload. (`Sized` is required by `Context<Self>`; the trait is only used
-/// generically.)
-pub(crate) trait ActionPage: Sized + 'static {
-    fn action_error_slot(&mut self) -> &mut Option<String>;
-    fn reload(&mut self, cx: &mut Context<Self>);
+/// In-app notification ids: pushing with the same id replaces the previous
+/// toast, so consecutive results of the same kind never stack up.
+struct SuccessNoticeId;
+struct ErrorNoticeId;
+
+/// Push a success toast into the captured window; a closed window is ignored.
+pub(crate) fn notify_success(
+    handle: AnyWindowHandle,
+    cx: &mut App,
+    message: impl Into<SharedString>,
+) {
+    let note = Notification::success(message).id::<SuccessNoticeId>();
+    let _ = handle.update(cx, |_, window, cx| window.push_notification(note, cx));
 }
 
-/// Run one write against the gateway's HTTP admin API on an [`ActionPage`]:
-/// on success clear the error and reload; on failure show the message.
-pub(crate) fn run_write<P, F, Fut>(cx: &mut Context<P>, f: F)
-where
-    P: ActionPage,
-    F: FnOnce(GatewayHttpClient) -> Fut + Send + 'static,
-    Fut: std::future::Future<Output = Result<(), gateway::http_client::ClientError>>
-        + Send
-        + 'static,
-{
-    let call = cx.global::<GatewayRuntime>().admin_call(f);
-    cx.spawn(async move |this, cx| {
-        let result = call.await;
-        this.update(cx, |page, cx| match result {
-            Ok(()) => {
-                *page.action_error_slot() = None;
-                page.reload(cx);
-            }
-            Err(error) => {
-                *page.action_error_slot() = Some(error);
-                cx.notify();
-            }
-        })
-        .ok();
-    })
-    .detach();
+/// Push an error toast into the captured window; a closed window is ignored.
+pub(crate) fn notify_error(
+    handle: AnyWindowHandle,
+    cx: &mut App,
+    message: impl Into<SharedString>,
+) {
+    let note = Notification::error(message).id::<ErrorNoticeId>();
+    let _ = handle.update(cx, |_, window, cx| window.push_notification(note, cx));
 }
 
 /// A refresh keeps the last snapshot visible (no flicker, no editor focus
@@ -191,48 +176,6 @@ pub(crate) fn error_card(message: &str, cx: &App) -> Div {
                 .text_color(cx.theme().muted_foreground)
                 .child(message.to_string()),
         )
-}
-
-/// Page-level write failure (toggle/archive/delete/cooldown clear), shown
-/// above the list; editor-level validation errors stay in their cards.
-/// The close button clears the page's error slot: a transient message must not
-/// permanently occupy the top of the page.
-pub(crate) fn action_error_card<P: ActionPage>(message: &str, cx: &mut Context<P>) -> Div {
-    card(cx).child(
-        gpui::div()
-            .flex()
-            .items_start()
-            .justify_between()
-            .gap_3()
-            .child(
-                gpui::div()
-                    .flex()
-                    .flex_col()
-                    .gap_1()
-                    .child(
-                        gpui::div()
-                            .font_weight(gpui::FontWeight::MEDIUM)
-                            .text_color(cx.theme().danger)
-                            .child("操作失败"),
-                    )
-                    .child(
-                        gpui::div()
-                            .text_size(px(12.))
-                            .text_color(cx.theme().muted_foreground)
-                            .child(message.to_string()),
-                    ),
-            )
-            .child(
-                Button::new("action-error-dismiss")
-                    .icon(Icon::new(IconName::Close).small())
-                    .ghost()
-                    .compact()
-                    .on_click(cx.listener(|page, _, _, cx| {
-                        *page.action_error_slot() = None;
-                        cx.notify();
-                    })),
-            ),
-    )
 }
 
 /// Empty-state card: a title plus a dimmed hint.
