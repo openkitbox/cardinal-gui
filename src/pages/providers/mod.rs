@@ -1076,8 +1076,9 @@ impl ProvidersPage {
     /// Re-probe ONE account from its card menu. The gateway's single-key
     /// endpoint avoids the all-keys fan-out, and archived cards use the same
     /// path. A click for a key already in flight (or no longer loaded) is a
-    /// no-op. The result merges into that card alone; a missing reading or a
-    /// request failure is reported at page level and never clears the old one.
+    /// no-op. The result merges into that card alone; a missing reading keeps
+    /// the old one and shows nothing, while a request failure is the only
+    /// page-level error.
     fn refresh_key_quota(&mut self, key_id: i64, cx: &mut Context<Self>) {
         let key_exists = match &self.state {
             LoadState::Loaded(data) => data.keys.iter().any(|card| card.key.id == key_id),
@@ -1107,9 +1108,9 @@ impl ProvidersPage {
                             page.action_error = None;
                         }
                     }
-                    Ok(None) => {
-                        page.action_error = Some(format!("账号 {key_id} 没有可用的配额读数"));
-                    }
+                    // No reading is not a failure; the card keeps its last
+                    // meter, exactly like the full fan-out.
+                    Ok(None) => {}
                     Err(error) => {
                         page.action_error = Some(format!("账号 {key_id} 刷新失败：{error}"));
                     }

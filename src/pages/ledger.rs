@@ -76,6 +76,16 @@ pub(crate) struct LedgerPanel {
 
 impl EventEmitter<BalanceChanged> for LedgerPanel {}
 
+impl crate::pages::ActionPage for LedgerPanel {
+    fn action_error_slot(&mut self) -> &mut Option<String> {
+        &mut self.action_error
+    }
+
+    fn reload(&mut self, cx: &mut Context<Self>) {
+        LedgerPanel::reload(self, cx);
+    }
+}
+
 impl LedgerPanel {
     /// A panel for `user_id`; it starts loading at once.
     pub(crate) fn new(user_id: i64, cx: &mut Context<Self>) -> Self {

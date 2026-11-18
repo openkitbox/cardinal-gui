@@ -195,20 +195,44 @@ pub(crate) fn error_card(message: &str, cx: &App) -> Div {
 
 /// Page-level write failure (toggle/archive/delete/cooldown clear), shown
 /// above the list; editor-level validation errors stay in their cards.
-pub(crate) fn action_error_card(message: &str, cx: &App) -> Div {
-    card(cx)
-        .child(
-            gpui::div()
-                .font_weight(gpui::FontWeight::MEDIUM)
-                .text_color(cx.theme().danger)
-                .child("操作失败"),
-        )
-        .child(
-            gpui::div()
-                .text_size(px(12.))
-                .text_color(cx.theme().muted_foreground)
-                .child(message.to_string()),
-        )
+/// The close button clears the page's error slot: a transient message must not
+/// permanently occupy the top of the page.
+pub(crate) fn action_error_card<P: ActionPage>(message: &str, cx: &mut Context<P>) -> Div {
+    card(cx).child(
+        gpui::div()
+            .flex()
+            .items_start()
+            .justify_between()
+            .gap_3()
+            .child(
+                gpui::div()
+                    .flex()
+                    .flex_col()
+                    .gap_1()
+                    .child(
+                        gpui::div()
+                            .font_weight(gpui::FontWeight::MEDIUM)
+                            .text_color(cx.theme().danger)
+                            .child("操作失败"),
+                    )
+                    .child(
+                        gpui::div()
+                            .text_size(px(12.))
+                            .text_color(cx.theme().muted_foreground)
+                            .child(message.to_string()),
+                    ),
+            )
+            .child(
+                Button::new("action-error-dismiss")
+                    .icon(Icon::new(IconName::Close).small())
+                    .ghost()
+                    .compact()
+                    .on_click(cx.listener(|page, _, _, cx| {
+                        *page.action_error_slot() = None;
+                        cx.notify();
+                    })),
+            ),
+    )
 }
 
 /// Empty-state card: a title plus a dimmed hint.
