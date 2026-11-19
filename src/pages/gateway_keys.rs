@@ -141,7 +141,7 @@ impl GatewayKeysPage {
         }
     }
 
-    /// Tab-bar actions (right-aligned): add-key button + refresh button.
+    /// Tab-bar actions: key filters, create, and refresh.
     pub(crate) fn actions(&mut self, cx: &mut Context<Self>) -> Vec<gpui::AnyElement> {
         let refresh = refresh_button(
             "keys-refresh",
@@ -156,12 +156,7 @@ impl GatewayKeysPage {
                     .flex()
                     .items_center()
                     .gap_2()
-                    .child(
-                        gpui::div()
-                            .w(px(130.))
-                            .h(px(28.))
-                            .child(Input::new(&self.search).small()),
-                    )
+                    .child(gpui::div().w(px(130.)).child(Input::new(&self.search)))
                     .child(filter);
                 vec![
                     filters.into_any_element(),

@@ -235,7 +235,7 @@ impl UsersPage {
         self.active = active;
     }
 
-    /// Tab-bar actions: the segment's create button + refresh.
+    /// Tab-bar actions: segment switch, user filters, create, and refresh.
     pub(crate) fn actions(&mut self, cx: &mut Context<Self>) -> Vec<gpui::AnyElement> {
         let refresh = refresh_button(
             "users-refresh",
@@ -257,6 +257,16 @@ impl UsersPage {
             }
         };
         let mut actions = Vec::new();
+        actions.push(
+            segmented(
+                "users-segment",
+                &[(Segment::Users, "用户"), (Segment::Groups, "用户组")],
+                self.segment,
+                cx,
+                Self::pick_segment,
+            )
+            .into_any_element(),
+        );
         if self.segment == Segment::Users {
             let groups = self.groups.read(cx).groups().unwrap_or(&[]);
             actions.push(
@@ -264,12 +274,7 @@ impl UsersPage {
                     .flex()
                     .items_center()
                     .gap_2()
-                    .child(
-                        gpui::div()
-                            .w(px(110.))
-                            .h(px(28.))
-                            .child(Input::new(&self.search).small()),
-                    )
+                    .child(gpui::div().w(px(110.)).child(Input::new(&self.search)))
                     .child(self.group_dropdown(GroupPicker::Filter, groups, cx))
                     .child(segmented(
                         "users-status",
@@ -1257,14 +1262,7 @@ impl UsersPage {
 
 impl Render for UsersPage {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        let header = gpui::div().flex().items_center().gap_3().child(segmented(
-            "users-segment",
-            &[(Segment::Users, "用户"), (Segment::Groups, "用户组")],
-            self.segment,
-            cx,
-            Self::pick_segment,
-        ));
-        let mut content = gpui::div().flex().flex_col().gap_4().child(header);
+        let mut content = gpui::div().flex().flex_col().gap_4();
         content = match self.segment {
             Segment::Users => {
                 let groups = self.groups.read(cx).groups().unwrap_or(&[]);
