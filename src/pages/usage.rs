@@ -12,7 +12,6 @@ use gpui::{
     ParentElement, Render, StatefulInteractiveElement, Styled, Window, px, relative,
 };
 use gpui_kit::component::ActiveTheme;
-use gpui_kit::component::Sizable;
 use gpui_kit::component::button::{Button, ButtonVariants};
 use gpui_kit::component::calendar::Date as PickerDate;
 use gpui_kit::component::date_picker::{
@@ -975,9 +974,8 @@ impl UsagePage {
         actions.push(
             DatePicker::new(&self.range_picker)
                 .placeholder("自定义")
-                .small()
                 .number_of_months(2)
-                .w(px(212.))
+                .w(px(170.))
                 .into_any_element(),
         );
         actions.push(self.client_dropdown(cx));
