@@ -14,6 +14,7 @@
 use std::fmt;
 
 use gateway::kiro::valid_region;
+use jiff::Timestamp;
 use serde_json::Map;
 use serde_json::Value;
 
@@ -415,9 +416,10 @@ fn unix_seconds(expires_at: &Value) -> Option<i64> {
             };
             i64::try_from(seconds).ok()
         }
-        Value::String(value) => chrono::DateTime::parse_from_rfc3339(value)
+        Value::String(value) => value
+            .parse::<Timestamp>()
             .ok()
-            .map(|timestamp| timestamp.timestamp())
+            .map(|timestamp| timestamp.as_second())
             .filter(|timestamp| *timestamp > 0),
         _ => None,
     }

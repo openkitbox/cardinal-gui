@@ -19,6 +19,7 @@ mod runtime;
 mod sales_mode;
 #[cfg(feature = "screenshot-test")]
 mod screenshots;
+mod time;
 mod ui_tz;
 
 use app::App;

@@ -15,9 +15,9 @@
 
 use std::rc::Rc;
 
-use chrono::{DateTime, Duration, Utc};
 use gpui::{App, Div, ParentElement, Styled, px, relative};
 use gpui_kit::component::ActiveTheme;
+use jiff::{SignedDuration, Timestamp};
 
 use gateway::quota::{Balance, BalanceStep};
 use gateway::store::BalanceHistoryPoint;
@@ -38,7 +38,7 @@ pub(super) struct BalanceView {
     /// The current segment's amounts, oldest first: the opener (the base)
     /// first, the current reading folded in last. Never empty once built;
     /// the opener's instant is when the segment (or the top-up) was seen.
-    segment: Vec<(DateTime<Utc>, f64)>,
+    segment: Vec<(Timestamp, f64)>,
     /// The increase that opened the segment; `None` when it is the key's
     /// first record.
     topup: Option<f64>,
@@ -52,7 +52,7 @@ enum Depletion {
     /// Further out than [`FORECAST_CAP_DAYS`].
     Capped,
     /// The projected instant the balance reaches zero.
-    At(DateTime<Utc>),
+    At(Timestamp),
     /// Already at (or below) zero.
     Empty,
 }
@@ -63,7 +63,7 @@ impl BalanceView {
     pub(super) fn new(
         balance: Balance,
         history: &[BalanceHistoryPoint],
-        probed_at: DateTime<Utc>,
+        probed_at: Timestamp,
     ) -> Self {
         let topup = history
             .first()
@@ -85,9 +85,9 @@ impl BalanceView {
     /// The live stamp is the GUI clock while the segment carries gateway
     /// times; it never goes before the segment's last point, so a GUI clock
     /// behind the gateway's cannot drop the reading from the chart.
-    pub(super) fn live(mut self, balance: Balance, probed_at: DateTime<Utc>) -> Self {
+    pub(super) fn live(mut self, balance: Balance, probed_at: Timestamp) -> Self {
         let probed_at = self.segment.last().map_or(probed_at, |(at, _)| {
-            probed_at.max(*at + Duration::seconds(1))
+            probed_at.max(*at + SignedDuration::from_secs(1))
         });
         self.balance = balance;
         self.fold(probed_at);
@@ -96,7 +96,7 @@ impl BalanceView {
 
     /// Fold the current reading into the segment with the gateway's rule: an
     /// increase opens a new segment, a decrease extends it.
-    fn fold(&mut self, probed_at: DateTime<Utc>) {
+    fn fold(&mut self, probed_at: Timestamp) {
         let amount = self.balance.amount;
         let last = self.segment.last().copied();
         match gateway::quota::classify(last.map(|(_, previous)| previous), amount) {
@@ -115,7 +115,7 @@ impl BalanceView {
     }
 
     /// The segment opener: when it opened and its amount (the 100% base).
-    fn opener(&self) -> Option<(DateTime<Utc>, f64)> {
+    fn opener(&self) -> Option<(Timestamp, f64)> {
         self.segment.first().copied()
     }
 
@@ -127,7 +127,7 @@ impl BalanceView {
 
 /// The chart input and depletion estimate. `None` without a positive base
 /// (nothing to take shares of): the meter renders alone.
-fn balance_trend(view: &BalanceView, probed_at: DateTime<Utc>) -> Option<(Trend, Depletion)> {
+fn balance_trend(view: &BalanceView, probed_at: Timestamp) -> Option<(Trend, Depletion)> {
     let (start, base) = view.opener()?;
     if base <= 0. {
         return None;
@@ -155,21 +155,21 @@ fn balance_trend(view: &BalanceView, probed_at: DateTime<Utc>) -> Option<(Trend,
 
     let elapsed = now - start;
     let (end, forecast, crossing, depletion) = if used_pct >= 100. {
-        let end = now.max(start + Duration::hours(1));
+        let end = now.max(start + SignedDuration::from_hours(1));
         (end, Some(100.), None, Depletion::Empty)
-    } else if elapsed < Duration::hours(1) || used_pct <= 0. {
+    } else if elapsed < SignedDuration::from_hours(1) || used_pct <= 0. {
         // At least a day of span so the axis is never degenerate.
-        let end = now.max(start + Duration::days(1));
+        let end = now.max(start + SignedDuration::from_hours(24));
         (end, None, None, Depletion::Unknown)
     } else {
-        let rate = used_pct / elapsed.num_seconds() as f64;
+        let rate = used_pct / elapsed.as_secs() as f64;
         let to_empty = (100. - used_pct) / rate;
-        let cap = Duration::days(FORECAST_CAP_DAYS);
-        if to_empty > cap.num_seconds() as f64 {
-            let projected = used_pct + rate * cap.num_seconds() as f64;
+        let cap = SignedDuration::from_hours(FORECAST_CAP_DAYS * 24);
+        if to_empty > cap.as_secs() as f64 {
+            let projected = used_pct + rate * cap.as_secs() as f64;
             (now + cap, Some(projected), None, Depletion::Capped)
         } else {
-            let end = now + Duration::seconds(to_empty.ceil() as i64);
+            let end = now + SignedDuration::from_secs(to_empty.ceil() as i64);
             (end, Some(100.), None, Depletion::At(end))
         }
     };
@@ -191,7 +191,7 @@ fn balance_trend(view: &BalanceView, probed_at: DateTime<Utc>) -> Option<(Trend,
 /// The balance meter: label + "remaining/base" above the bar, the depletion
 /// chart (when the segment has a positive base), and the segment's origin
 /// (top-up or first record) below.
-pub(super) fn balance_row(view: &BalanceView, probed_at: DateTime<Utc>, cx: &App) -> Div {
+pub(super) fn balance_row(view: &BalanceView, probed_at: Timestamp, cx: &App) -> Div {
     let theme = cx.theme();
     let balance = &view.balance;
     let base = view.opener().filter(|(_, base)| *base > 0.);
@@ -210,9 +210,8 @@ pub(super) fn balance_row(view: &BalanceView, probed_at: DateTime<Utc>, cx: &App
         Some((_, base)) => format!("{balance}/{}{base:.2}", balance.symbol),
         None => balance.to_string(),
     };
-    let display_tz = crate::ui_tz::display_tz();
     let origin_line = view.opener().map(|(opened_at, _)| {
-        let date = short_date(opened_at.with_timezone(&display_tz));
+        let date = short_date(trend::display_datetime(opened_at));
         match view.topup {
             Some(topup) => format!("{date} 充值 +{}{topup:.2}", balance.symbol),
             None => format!("{date} 起记录"),
@@ -265,7 +264,7 @@ pub(super) fn balance_row(view: &BalanceView, probed_at: DateTime<Utc>, cx: &App
 }
 
 /// Header (spent amount / depletion estimate) plus the chart canvas.
-fn trend_section(view: &BalanceView, probed_at: DateTime<Utc>, cx: &App) -> Option<Div> {
+fn trend_section(view: &BalanceView, probed_at: Timestamp, cx: &App) -> Option<Div> {
     let (trend, depletion) = balance_trend(view, probed_at)?;
     let theme = cx.theme();
     let (_, base) = view.opener()?;
@@ -278,12 +277,12 @@ fn trend_section(view: &BalanceView, probed_at: DateTime<Utc>, cx: &App) -> Opti
         ),
         Depletion::Empty => ("已耗尽".to_string(), theme.danger),
         Depletion::At(end) => {
-            let color = if end - trend.now < Duration::days(URGENT_DAYS) {
+            let color = if end - trend.now < SignedDuration::from_hours(URGENT_DAYS * 24) {
                 theme.danger
             } else {
                 theme.muted_foreground
             };
-            let date = short_date(end.with_timezone(&crate::ui_tz::display_tz()));
+            let date = short_date(trend::display_datetime(end));
             (format!("预计 {date} 耗尽"), color)
         }
     };

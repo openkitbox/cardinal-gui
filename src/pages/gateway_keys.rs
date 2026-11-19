@@ -10,7 +10,6 @@
 //! sent as the typed decimal USD string and parsed by the gateway — no float
 //! arithmetic happens here.
 
-use chrono::{DateTime, TimeZone as _, Utc};
 use gpui::prelude::FluentBuilder as _;
 use gpui::{
     AnyWindowHandle, App, AppContext as _, Context, Div, ElementId, Entity, Focusable as _,
@@ -24,6 +23,8 @@ use gpui_kit::component::checkbox::Checkbox;
 use gpui_kit::component::date_picker::{DatePicker, DatePickerState};
 use gpui_kit::component::input::{Input, InputEvent, InputState};
 use gpui_kit::component::{ActiveTheme, Disableable as _, Icon, Sizable as _};
+use jiff::Timestamp;
+use jiff::civil::Time;
 
 use gateway::http_client::GatewayKeyUpdate;
 use gateway::store::{GatewayKeyRow, OWNER_LOGIN, UserRow};
@@ -65,7 +66,7 @@ struct KeyEditor {
     /// The edited key's current terms, kept so a PATCH only carries fields
     /// the user actually changed (an untouched past expiry must not be
     /// revalidated, and an untouched quota must not be rewritten).
-    original_expiry: Option<DateTime<Utc>>,
+    original_expiry: Option<Timestamp>,
     original_quota: Option<i64>,
     original_enabled: bool,
     /// Owner of a new key; preselected to the `owner` user. `None` (no users
@@ -168,13 +169,14 @@ impl GatewayKeysPage {
     /// One date picker with past days disabled: the gateway refuses an expiry
     /// at or before now, and the picker submits the day's 23:59:59.
     fn date_picker(window: &mut Window, cx: &mut App) -> Entity<DatePickerState> {
-        let today = Utc::now()
-            .with_timezone(&crate::ui_tz::display_tz())
-            .date_naive();
+        let today = crate::time::date(Timestamp::now(), crate::ui_tz::display_tz());
         cx.new(|cx| {
-            DatePickerState::new(window, cx)
-                .first_day_of_week(chrono::Weekday::Mon)
-                .disabled_matcher(Matcher::custom(move |day| *day < today))
+            crate::time::monday_picker(DatePickerState::new(window, cx)).disabled_matcher(
+                Matcher::custom(move |day| {
+                    crate::time::picker_date(PickerDate::Single(Some(*day)))
+                        .is_none_or(|date| date < today)
+                }),
+            )
         })
     }
 
@@ -247,9 +249,9 @@ impl GatewayKeysPage {
         let expiry = Self::date_picker(window, cx);
         let picked = key
             .expires_at
-            .map(|at| at.with_timezone(&crate::ui_tz::display_tz()).date_naive());
+            .map(|at| crate::time::date(at, crate::ui_tz::display_tz()));
         expiry.update(cx, |state, cx| {
-            state.set_date(PickerDate::Single(picked), window, cx);
+            state.set_date(crate::time::picker_value(picked), window, cx);
         });
         let focus = label.read(cx).focus_handle(cx);
         self.editor = Some(KeyEditor {
@@ -292,17 +294,17 @@ impl GatewayKeysPage {
 
     /// The expiry the editor submits: the picked day's 23:59:59 in the display
     /// timezone, converted to UTC. `None` means never expires.
-    fn picked_expiry(editor: &KeyEditor, cx: &App) -> Option<DateTime<Utc>> {
+    fn picked_expiry(editor: &KeyEditor, cx: &App) -> Option<Timestamp> {
         let PickerDate::Single(Some(day)) = editor.expiry.read(cx).date() else {
             return None;
         };
-        day.and_hms_opt(23, 59, 59)
-            .and_then(|local| {
-                crate::ui_tz::display_tz()
-                    .from_local_datetime(&local)
-                    .single()
-            })
-            .map(|at| at.with_timezone(&Utc))
+        crate::time::picker_date(PickerDate::Single(Some(day))).and_then(|date| {
+            crate::time::local_timestamp(
+                date,
+                Time::constant(23, 59, 59, 0),
+                crate::ui_tz::display_tz(),
+            )
+        })
     }
 
     /// The typed quota: empty means unlimited, anything else is sent verbatim
@@ -341,12 +343,13 @@ impl GatewayKeysPage {
         // key can still be renamed or disabled).
         let original_day = editor
             .original_expiry
-            .map(|at| at.with_timezone(&crate::ui_tz::display_tz()).date_naive());
+            .map(|at| crate::time::date(at, crate::ui_tz::display_tz()));
         let PickerDate::Single(picked_day) = editor.expiry.read(cx).date() else {
             return;
         };
-        let expiry_changed = editing.is_none() || picked_day != original_day;
-        if expiry_changed && expires_at.is_some_and(|at| at <= Utc::now()) {
+        let expiry_changed = editing.is_none()
+            || crate::time::picker_date(PickerDate::Single(picked_day)) != original_day;
+        if expiry_changed && expires_at.is_some_and(|at| at <= Timestamp::now()) {
             editor.error = Some("过期时间必须晚于现在".to_string());
             cx.notify();
             return;
@@ -835,7 +838,7 @@ impl GatewayKeysPage {
     }
 
     fn key_row(&self, key: &GatewayKeyRow, cx: &mut Context<Self>) -> Div {
-        let now = Utc::now();
+        let now = Timestamp::now();
         let expired = key.expires_at.is_some_and(|at| at <= now);
         let used_up = key
             .quota_microus
@@ -896,11 +899,7 @@ impl GatewayKeysPage {
                     })
                     .child(key.expires_at.map_or_else(
                         || "永不过期".to_string(),
-                        |at| {
-                            at.with_timezone(&crate::ui_tz::display_tz())
-                                .format("%Y-%m-%d")
-                                .to_string()
-                        },
+                        |at| crate::time::format(at, crate::ui_tz::display_tz(), "%Y-%m-%d"),
                     )),
             )
             .child(
@@ -1076,10 +1075,8 @@ fn quota_text(key: &GatewayKeyRow) -> String {
     }
 }
 
-fn display_time(at: DateTime<Utc>) -> String {
-    at.with_timezone(&crate::ui_tz::display_tz())
-        .format("%Y-%m-%d %H:%M")
-        .to_string()
+fn display_time(at: Timestamp) -> String {
+    crate::pages::display_time(at)
 }
 
 fn field_label(label: &'static str, cx: &App) -> Div {

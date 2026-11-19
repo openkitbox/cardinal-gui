@@ -199,22 +199,3 @@ fn dollars(negative: bool, whole: u64, fraction_digits: &str) -> String {
     let sign = if negative { "-" } else { "" };
     format!("{sign}${whole}.{fraction}")
 }
-
-/// How long ago a quota snapshot was probed, humanized for the card header:
-/// <60s 「刚刚」, <1h 「N 分钟前」, <24h 「N 小时前」, else 「N 天前」.
-/// A future timestamp (clock skew) reads as 「刚刚」.
-pub(crate) fn probe_age(
-    probed_at: chrono::DateTime<chrono::Utc>,
-    now: chrono::DateTime<chrono::Utc>,
-) -> String {
-    let secs = now.signed_duration_since(probed_at).num_seconds().max(0);
-    if secs < 60 {
-        "刚刚".to_string()
-    } else if secs < 3600 {
-        format!("{} 分钟前", secs / 60)
-    } else if secs < 86400 {
-        format!("{} 小时前", secs / 3600)
-    } else {
-        format!("{} 天前", secs / 86400)
-    }
-}

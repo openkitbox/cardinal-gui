@@ -6,7 +6,6 @@
 //! (`usage_window`); the trend reads bucket × category aggregates
 //! (`usage_trend`).
 
-use chrono::{DateTime, Duration, LocalResult, NaiveDate, TimeZone as _, Utc};
 use gpui::prelude::FluentBuilder as _;
 use gpui::{
     AnyWindowHandle, AppContext as _, Context, Div, ElementId, InteractiveElement, IntoElement,
@@ -19,6 +18,8 @@ use gpui_kit::component::calendar::Date as PickerDate;
 use gpui_kit::component::date_picker::{
     DatePicker, DatePickerEvent, DatePickerState, DateTime as PickerValue,
 };
+use jiff::civil::Date;
+use jiff::{SignedDuration, Timestamp};
 
 use gateway::http_client::UsageScope;
 use gateway::store::{GatewayKeyRow, OWNER_LOGIN, TrendRow, TrendSplit, UsageWindow, UserRow};
@@ -59,7 +60,7 @@ pub(super) enum UsageRange {
     /// A rolling window of the last N days (`ts >= now() - N days`).
     Days(i32),
     /// A custom local-date range, both ends inclusive.
-    Custom(NaiveDate, NaiveDate),
+    Custom(Date, Date),
 }
 
 /// The query form of a [`UsageRange`]: `[since, until)` in UTC plus the local
@@ -67,9 +68,9 @@ pub(super) enum UsageRange {
 /// so a load's query and chart agree even across an offset change.
 #[derive(Clone, Copy)]
 pub(crate) struct ResolvedRange {
-    pub since: DateTime<Utc>,
-    pub until: DateTime<Utc>,
-    pub offset: Duration,
+    pub since: Timestamp,
+    pub until: Timestamp,
+    pub offset: SignedDuration,
 }
 
 impl UsageRange {
@@ -83,19 +84,24 @@ impl UsageRange {
 
     fn resolve(self) -> ResolvedRange {
         let tz = crate::ui_tz::display_tz();
-        let now = Utc::now();
-        let offset = Duration::seconds(i64::from(tz.local_minus_utc()));
+        let now = Timestamp::now();
+        let offset = crate::time::offset(now, tz.clone());
         let (since, until) = match self {
-            Self::Today => (local_midnight(tz, now.with_timezone(&tz).date_naive()), now),
-            Self::Days(days) => (now - Duration::days(i64::from(days)), now),
+            Self::Today => (
+                local_midnight(tz.clone(), crate::time::date(now, tz.clone())),
+                now,
+            ),
+            Self::Days(days) => (now - SignedDuration::from_hours(24 * i64::from(days)), now),
             // The picker speaks inclusive dates; the query is half-open.
             Self::Custom(start, end) => (
-                local_midnight(tz, start),
-                local_midnight(tz, end + Duration::days(1)),
+                local_midnight(tz.clone(), start),
+                local_midnight(tz, end.tomorrow().unwrap_or(end)),
             ),
         };
         ResolvedRange {
-            since: since.clamp(until - Duration::days(MAX_SPAN_DAYS), until),
+            since: since
+                .max(until - SignedDuration::from_hours(24 * MAX_SPAN_DAYS))
+                .min(until),
             until,
             offset,
         }
@@ -111,16 +117,11 @@ impl UsageRange {
     }
 }
 
-/// The UTC instant of a display-day's 00:00. A fixed offset has no DST, so
-/// the lookup is always unambiguous; the `LocalResult` arms stay for the
-/// follow-the-system case where `display_tz` snapshots the local offset.
-fn local_midnight(tz: chrono::FixedOffset, date: NaiveDate) -> DateTime<Utc> {
-    let midnight = chrono::NaiveDateTime::new(date, chrono::NaiveTime::MIN);
-    match tz.from_local_datetime(&midnight) {
-        LocalResult::Single(local) => local.with_timezone(&Utc),
-        LocalResult::Ambiguous(earliest, _) => earliest.with_timezone(&Utc),
-        LocalResult::None => midnight.and_utc(),
-    }
+/// The UTC instant of a display-day's 00:00. The display zone is a fixed
+/// offset, so DST transitions cannot skip or repeat midnight.
+fn local_midnight(tz: jiff::tz::TimeZone, date: Date) -> Timestamp {
+    crate::time::local_timestamp(date, jiff::civil::Time::midnight(), tz)
+        .unwrap_or(Timestamp::UNIX_EPOCH)
 }
 
 /// Interpolate a fractional KPI value without rounding before formatting.
@@ -593,7 +594,7 @@ impl UsagePage {
         cx: &mut Context<Self>,
     ) -> Self {
         let range_picker =
-            cx.new(|cx| DatePickerState::range(window, cx).first_day_of_week(chrono::Weekday::Mon));
+            cx.new(|cx| crate::time::monday_picker(DatePickerState::range(window, cx)));
         // A custom range counts once both dates are picked; half-picked edits and
         // the chip-driven clear (Range(None, None)) don't move the window.
         cx.subscribe(
@@ -603,7 +604,13 @@ impl UsagePage {
                 else {
                     return;
                 };
-                let range = UsageRange::Custom(start.date(), end.date());
+                let (Some(start), Some(end)) = (
+                    crate::time::picker_date(PickerDate::Single(Some(start.date()))),
+                    crate::time::picker_date(PickerDate::Single(Some(end.date()))),
+                ) else {
+                    return;
+                };
+                let range = UsageRange::Custom(start, end);
                 if page.range != range {
                     page.range = range;
                     page.apply_reload(UsageReloadEvent::Manual, cx);

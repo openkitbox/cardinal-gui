@@ -34,7 +34,7 @@ use crate::runtime::GatewayRuntime;
 fn project_request(row: gateway::activity::PersistedRequest, id: i64) -> RequestRow {
     RequestRow {
         id,
-        ts: chrono::Utc::now(),
+        ts: jiff::Timestamp::now(),
         protocol: String::new(),
         client_protocol: None,
         effort: None,
@@ -942,12 +942,16 @@ fn request_row(page: &RequestsPage, row: &RequestRow, cx: &mut Context<RequestsP
         .hover(move |this| this.bg(accent))
         .on_click(cx.listener(move |this, _, _, cx| this.toggle_row(row_id, cx)))
         .child(
-            gpui::div().flex_none().w(px(90.)).px_2().py_1().child(
-                row.ts
-                    .with_timezone(&crate::ui_tz::display_tz())
-                    .format("%H:%M:%S")
-                    .to_string(),
-            ),
+            gpui::div()
+                .flex_none()
+                .w(px(90.))
+                .px_2()
+                .py_1()
+                .child(crate::time::format(
+                    row.ts,
+                    crate::ui_tz::display_tz(),
+                    "%H:%M:%S",
+                )),
         )
         .child(protocol_cell(
             row.client_protocol.as_deref(),

@@ -56,6 +56,7 @@ use gateway::probe::ProbeModel;
 use gateway::quota::KeyQuota;
 use gateway::store::{KeyGroupView, ProviderInput, ProviderKeyView, ProviderRow, RestRow};
 use gateway::upstream::Dns;
+use jiff::Timestamp;
 
 use cards::CardDrag;
 use catalog::{
@@ -129,7 +130,7 @@ impl ProvidersData {
     fn from_bootstrap(document: &Bootstrap) -> Self {
         let providers: HashMap<i64, &ProviderRow> =
             document.providers.iter().map(|row| (row.id, row)).collect();
-        let mut snapshots: HashMap<i64, (KeyQuota, chrono::DateTime<chrono::Utc>)> = document
+        let mut snapshots: HashMap<i64, (KeyQuota, Timestamp)> = document
             .quota_snapshots
             .iter()
             .map(|row| (row.key_id, (row.quota.clone(), row.fetched_at)))
@@ -806,7 +807,7 @@ fn merge_key_quota(
     cards: &mut [KeyCardData],
     key_id: i64,
     quota: KeyQuota,
-    now: chrono::DateTime<chrono::Utc>,
+    now: Timestamp,
 ) -> bool {
     let Some(card) = cards.iter_mut().find(|card| card.key.id == key_id) else {
         return false;
@@ -1077,7 +1078,7 @@ impl ProvidersPage {
                     .into_iter()
                     .map(|row| (row.key_id, row.quota))
                     .collect();
-                let now = chrono::Utc::now();
+                let now = crate::time::now();
                 for (key_id, quota) in quotas {
                     merge_key_quota(&mut data.keys, key_id, quota, now);
                 }
@@ -1113,7 +1114,7 @@ impl ProvidersPage {
                 match result {
                     Ok(Some(row)) => {
                         if let LoadState::Loaded(data) = &mut page.state {
-                            merge_key_quota(&mut data.keys, key_id, row.quota, chrono::Utc::now());
+                            merge_key_quota(&mut data.keys, key_id, row.quota, crate::time::now());
                         }
                         if let Some(handle) = handle {
                             notify_success(handle, cx, format!("账号 {key_id} 额度已刷新"));
@@ -1187,8 +1188,8 @@ impl ProvidersPage {
                         let expiry = credit
                             .expires_at
                             .map(|date| {
-                                date.with_timezone(&crate::ui_tz::display_tz())
-                                    .format("%Y-%m-%d %H:%M")
+                                trend::display_datetime(date)
+                                    .strftime("%Y-%m-%d %H:%M")
                                     .to_string()
                             })
                             .unwrap_or_else(|| "过期时间未知".to_string());
@@ -3669,7 +3670,7 @@ impl Render for ProvidersPage {
                 };
                 // One clock reading for the whole render: every card judges
                 // expired cooldowns and renewed windows against the same instant.
-                let now = chrono::Utc::now();
+                let now = crate::time::now();
                 let any_visible = data.keys.iter().any(|card| visibility.admits(card.key.id));
                 frame
                     .when_some(self.key_form.as_ref(), |this, form| {
@@ -3775,13 +3776,11 @@ mod tests {
                 archived_at: None,
                 proxy_configured: false,
             },
-            quota: quota.map(|quota| KeyQuotaView::new(quota, chrono::Utc::now(), &[], &[])),
+            quota: quota.map(|quota| KeyQuotaView::new(quota, crate::time::now(), &[], &[])),
         }
     }
 
-    fn snapshots(
-        cards: &[KeyCardData],
-    ) -> Vec<Option<(String, chrono::DateTime<chrono::Utc>, usize)>> {
+    fn snapshots(cards: &[KeyCardData]) -> Vec<Option<(String, Timestamp, usize)>> {
         cards
             .iter()
             .map(|card| {
@@ -3798,7 +3797,7 @@ mod tests {
 
     #[test]
     fn merging_one_reading_touches_only_its_card() {
-        let now = chrono::Utc::now();
+        let now = crate::time::now();
         let mut cards = vec![
             card(1, Some(reading("5h", 10., "old-1"))),
             card(2, Some(reading("5h", 20., "old-2"))),
@@ -3834,7 +3833,7 @@ mod tests {
 
     #[test]
     fn merging_one_reading_creates_a_reading_when_absent() {
-        let now = chrono::Utc::now();
+        let now = crate::time::now();
         let mut cards = vec![card(1, None), card(2, Some(reading("5h", 20., "old-2")))];
 
         assert!(merge_key_quota(
@@ -3878,7 +3877,7 @@ mod tests {
             &mut cards,
             99,
             reading("5h", 90., "stranger"),
-            chrono::Utc::now(),
+            crate::time::now(),
         ));
         assert_eq!(snapshots(&cards), before);
     }

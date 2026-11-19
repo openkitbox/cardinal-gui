@@ -360,11 +360,12 @@ fn prepare(
 /// exclusive). Local midnight/hour boundaries are 0 mod 86400/3600 in the
 /// shifted clock, so plain epoch-stepping produces aligned labels.
 fn bucket_grid(range: ResolvedRange) -> Vec<String> {
-    let offset = range.offset.num_seconds();
-    let shift = |t: chrono::DateTime<chrono::Utc>| t.timestamp() + offset;
+    let offset = range.offset.as_secs();
+    let shift = |t: jiff::Timestamp| t.as_second() + offset;
     let label = |ts: i64, hourly: bool| {
-        chrono::DateTime::from_timestamp(ts, 0).map(|t| {
-            t.format(if hourly { "%Y-%m-%d %H:00" } else { "%Y-%m-%d" })
+        jiff::Timestamp::from_second(ts).ok().map(|t| {
+            t.to_zoned_datetime(jiff::tz::TimeZone::UTC)
+                .strftime(if hourly { "%Y-%m-%d %H:00" } else { "%Y-%m-%d" })
                 .to_string()
         })
     };

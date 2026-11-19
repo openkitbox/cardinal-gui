@@ -14,11 +14,11 @@
 
 use std::rc::Rc;
 
-use chrono::{DateTime, Datelike, Duration, Timelike, Utc};
 use gpui::prelude::FluentBuilder;
 use gpui::{App, Div, IntoElement, ParentElement, Styled, px, relative};
 use gpui_kit::component::ActiveTheme;
 use gpui_kit::component::button::Button;
+use jiff::{SignedDuration, Timestamp};
 
 use gateway::http_client::{OpenaiResetCredit, OpenaiResetDetails};
 use gateway::quota::{CodexResetSummary, KeyQuota, QuotaWindow};
@@ -62,7 +62,7 @@ pub(super) struct QuotaWindowView {
     /// Share of the window already used, 0–100.
     used_pct: f64,
     /// When the window resets, when the vendor says so.
-    resets_at: Option<chrono::DateTime<chrono::Utc>>,
+    resets_at: Option<Timestamp>,
     /// Approximate window length in minutes (sort key, and the trend chart's
     /// x-axis span). `None` in snapshots written before the field existed.
     period_minutes: Option<i64>,
@@ -76,7 +76,7 @@ pub(super) struct QuotaWindowView {
     /// Probe samples recorded for this window name, oldest first — all of the
     /// gateway's 35-day series, including a previous window's points; the
     /// chart trims them to the current window.
-    history: Vec<(chrono::DateTime<chrono::Utc>, f64)>,
+    history: Vec<(Timestamp, f64)>,
 }
 
 impl QuotaWindowView {
@@ -84,7 +84,7 @@ impl QuotaWindowView {
         QuotaBand::from_pct(self.used_pct)
     }
 
-    fn new(window: QuotaWindow, history: Vec<(chrono::DateTime<chrono::Utc>, f64)>) -> Self {
+    fn new(window: QuotaWindow, history: Vec<(Timestamp, f64)>) -> Self {
         Self {
             name: window.name,
             used_pct: window.used_pct,
@@ -113,7 +113,7 @@ pub(super) struct KeyQuotaView {
     /// Display-ready info lines (plan, expiry, usage counters).
     pub(super) details: Vec<String>,
     /// When this reading was probed (snapshot time; a live refresh stamps now).
-    pub(super) probed_at: chrono::DateTime<chrono::Utc>,
+    pub(super) probed_at: Timestamp,
 }
 
 pub(crate) type CodexResetSummaryView = CodexResetSummary;
@@ -126,7 +126,7 @@ impl KeyQuotaView {
     /// current point and the projection alone.
     pub(super) fn new(
         quota: KeyQuota,
-        probed_at: chrono::DateTime<chrono::Utc>,
+        probed_at: Timestamp,
         history: &[QuotaHistoryPoint],
         balance_history: &[BalanceHistoryPoint],
     ) -> Self {
@@ -137,7 +137,7 @@ impl KeyQuotaView {
             plan,
             details,
         } = quota;
-        let mut by_window: std::collections::HashMap<&str, Vec<(chrono::DateTime<Utc>, f64)>> =
+        let mut by_window: std::collections::HashMap<&str, Vec<(Timestamp, f64)>> =
             std::collections::HashMap::new();
         for point in history {
             by_window
@@ -170,7 +170,7 @@ impl KeyQuotaView {
     /// Replace the readings with a live probe, keeping each window's recorded
     /// history and the balance segment (the live endpoint returns no series;
     /// a window or balance that was not present before starts its series now).
-    pub(super) fn live(self, quota: KeyQuota, probed_at: chrono::DateTime<chrono::Utc>) -> Self {
+    pub(super) fn live(self, quota: KeyQuota, probed_at: Timestamp) -> Self {
         let KeyQuota {
             windows,
             balance,
@@ -178,7 +178,7 @@ impl KeyQuotaView {
             plan,
             details,
         } = quota;
-        let mut histories: std::collections::HashMap<String, Vec<(DateTime<Utc>, f64)>> = self
+        let mut histories: std::collections::HashMap<String, Vec<(Timestamp, f64)>> = self
             .windows
             .into_iter()
             .map(|window| (window.name, window.history))
@@ -248,16 +248,11 @@ pub(super) fn earliest_codex_reset_details(
         .min_by_key(|credit| codex_expiry_key(credit.expires_at))
 }
 
-fn codex_expiry_key(
-    expiry: Option<chrono::DateTime<chrono::Utc>>,
-) -> (bool, Option<chrono::DateTime<chrono::Utc>>) {
+fn codex_expiry_key(expiry: Option<Timestamp>) -> (bool, Option<Timestamp>) {
     (expiry.is_none(), expiry)
 }
 
-fn codex_expiry_cmp(
-    left: Option<chrono::DateTime<chrono::Utc>>,
-    right: Option<chrono::DateTime<chrono::Utc>>,
-) -> std::cmp::Ordering {
+fn codex_expiry_cmp(left: Option<Timestamp>, right: Option<Timestamp>) -> std::cmp::Ordering {
     codex_expiry_key(left).cmp(&codex_expiry_key(right))
 }
 
@@ -274,8 +269,8 @@ pub(super) fn codex_reset_row(
         let expiry = credit
             .expires_at
             .map(|date| {
-                date.with_timezone(&crate::ui_tz::display_tz())
-                    .format("%Y-%m-%d %H:%M")
+                trend::display_datetime(date)
+                    .strftime("%Y-%m-%d %H:%M")
                     .to_string()
             })
             .unwrap_or_else(|| "过期时间未知".to_string());
@@ -283,8 +278,8 @@ pub(super) fn codex_reset_row(
         let granted = credit
             .granted_at
             .map(|date| {
-                date.with_timezone(&crate::ui_tz::display_tz())
-                    .format("%Y-%m-%d %H:%M")
+                trend::display_datetime(date)
+                    .strftime("%Y-%m-%d %H:%M")
                     .to_string()
             })
             .unwrap_or_else(|| "发放时间未知".to_string());
@@ -322,11 +317,7 @@ pub(super) fn codex_reset_row(
 /// Quota windows, one full-width meter per row: name + reset countdown above
 /// the bar. The bar fill is the REMAINING share; long windows also carry a
 /// cumulative trend chart under the bar.
-pub(super) fn quota_row(
-    windows: &[QuotaWindowView],
-    probed_at: chrono::DateTime<chrono::Utc>,
-    cx: &App,
-) -> Div {
+pub(super) fn quota_row(windows: &[QuotaWindowView], probed_at: Timestamp, cx: &App) -> Div {
     gpui::div().flex().flex_col().gap_3().children(
         windows
             .iter()
@@ -362,11 +353,7 @@ fn parse_amount(total: &str) -> Option<(&str, f64, &str)> {
 }
 
 /// One window column: name + reset line, bar, trend (long windows).
-fn quota_meter(
-    window: &QuotaWindowView,
-    probed_at: chrono::DateTime<chrono::Utc>,
-    cx: &App,
-) -> Div {
+fn quota_meter(window: &QuotaWindowView, probed_at: Timestamp, cx: &App) -> Div {
     let remaining = (100. - window.used_pct).clamp(0., 100.);
     let fill_color = match window.band() {
         QuotaBand::Ok => cx.theme().success,
@@ -431,7 +418,7 @@ fn quota_meter(
                 .children(
                     window
                         .resets_at
-                        .map(|resets_at| reset_line(resets_at, chrono::Utc::now())),
+                        .map(|resets_at| reset_line(resets_at, crate::time::now())),
                 ),
         )
         // The cumulative trend + forecast (weekly / monthly only) follows the
@@ -443,7 +430,7 @@ fn quota_meter(
 
 /// The window's chart input. `None` when the window is too short to chart,
 /// has no reset instant (nothing to project onto), or carries no period.
-fn window_trend(window: &QuotaWindowView, probed_at: DateTime<Utc>) -> Option<Trend> {
+fn window_trend(window: &QuotaWindowView, probed_at: Timestamp) -> Option<Trend> {
     let end = window.resets_at?;
     let period = window.period_minutes?;
     if period < TREND_MIN_PERIOD_MINUTES {
@@ -455,8 +442,8 @@ fn window_trend(window: &QuotaWindowView, probed_at: DateTime<Utc>) -> Option<Tr
     // boundary. A sample-to-sample drop marks a renewal; otherwise the
     // first sample at or after the calculated boundary is the best observed
     // start of the current cycle.
-    let cycle_start = end - Duration::minutes(period);
-    let mut last_drop: Option<DateTime<Utc>> = None;
+    let cycle_start = end - SignedDuration::from_mins(period);
+    let mut last_drop: Option<Timestamp> = None;
     let mut previous_pct: Option<f64> = None;
     for (at, pct) in &window.history {
         if previous_pct.is_some_and(|previous| *pct < previous) {
@@ -474,9 +461,9 @@ fn window_trend(window: &QuotaWindowView, probed_at: DateTime<Utc>) -> Option<Tr
         return None;
     }
     let now = probed_at.max(start).min(end);
-    let span_seconds = (end - start).num_seconds().max(1) as f64;
-    let elapsed = (now - start).num_seconds() as f64 / span_seconds;
-    let forecast = ((now - start) >= Duration::hours(1) && elapsed > 0.)
+    let span_seconds = (end - start).as_secs().max(1) as f64;
+    let elapsed = (now - start).as_secs() as f64 / span_seconds;
+    let forecast = ((now - start) >= SignedDuration::from_hours(1) && elapsed > 0.)
         .then(|| (window.used_pct / elapsed).min(999.));
 
     let mut points: Vec<TrendPoint> = window
@@ -495,9 +482,9 @@ fn window_trend(window: &QuotaWindowView, probed_at: DateTime<Utc>) -> Option<Tr
     let crossing = match forecast {
         Some(_) if window.used_pct >= 100. => Some(now),
         Some(projected) if projected > 100. => {
-            let remaining = (end - now).num_seconds() as f64;
+            let remaining = (end - now).as_secs() as f64;
             let share = ((100. - window.used_pct) / (projected - window.used_pct)).clamp(0., 1.);
-            Some(now + Duration::seconds((remaining * share) as i64))
+            Some(now + SignedDuration::from_secs((remaining * share) as i64))
         }
         _ => None,
     };
@@ -515,7 +502,7 @@ fn window_trend(window: &QuotaWindowView, probed_at: DateTime<Utc>) -> Option<Tr
 
 /// The chart's two rows: a header (used share, the amount spent when the
 /// vendor reports one, and the projection) and the canvas.
-fn trend_section(window: &QuotaWindowView, probed_at: DateTime<Utc>, cx: &App) -> Option<Div> {
+fn trend_section(window: &QuotaWindowView, probed_at: Timestamp, cx: &App) -> Option<Div> {
     let trend = Rc::new(window_trend(window, probed_at)?);
     let theme = cx.theme();
     let (forecast_text, forecast_color) = match trend.forecast {
@@ -523,7 +510,7 @@ fn trend_section(window: &QuotaWindowView, probed_at: DateTime<Utc>, cx: &App) -
             let text = match trend.crossing {
                 Some(at) => format!(
                     "预计 {projected:.0}% · {} 超额",
-                    short_date(at.with_timezone(&crate::ui_tz::display_tz()))
+                    short_date(trend::display_datetime(at))
                 ),
                 None => format!("预计 {projected:.0}%"),
             };
@@ -566,13 +553,10 @@ fn trend_section(window: &QuotaWindowView, probed_at: DateTime<Utc>, cx: &App) -
 
 /// Reset line under a bar: "重置 21:40 · 4 小时后" when the reset is within
 /// 24 hours, "重置 10月12日 17:40 · 2 天后" beyond that.
-fn reset_line(
-    resets_at: chrono::DateTime<chrono::Utc>,
-    now: chrono::DateTime<chrono::Utc>,
-) -> String {
-    let until = resets_at.signed_duration_since(now);
-    let local = resets_at.with_timezone(&crate::ui_tz::display_tz());
-    let time = if until <= chrono::Duration::hours(24) {
+fn reset_line(resets_at: Timestamp, now: Timestamp) -> String {
+    let until = resets_at - now;
+    let local = trend::display_datetime(resets_at);
+    let time = if until <= SignedDuration::from_hours(24) {
         format!("{:02}:{:02}", local.hour(), local.minute())
     } else {
         format!(
@@ -587,14 +571,14 @@ fn reset_line(
 }
 
 /// Countdown to the reset: "已到期" when past, then minutes / hours / days.
-fn until_label(until: chrono::Duration) -> String {
-    if until <= chrono::Duration::zero() {
+fn until_label(until: SignedDuration) -> String {
+    if until <= SignedDuration::ZERO {
         "已到期".to_string()
-    } else if until < chrono::Duration::minutes(90) {
-        format!("{} 分钟后", until.num_minutes().max(1))
-    } else if until < chrono::Duration::hours(48) {
-        format!("{} 小时后", (until.num_minutes() + 59) / 60)
+    } else if until < SignedDuration::from_mins(90) {
+        format!("{} 分钟后", (until.as_secs() / 60).max(1))
+    } else if until < SignedDuration::from_hours(48) {
+        format!("{} 小时后", (until.as_secs() / 60 + 59) / 60)
     } else {
-        format!("{} 天后", (until.num_hours() + 23) / 24)
+        format!("{} 天后", (until.as_secs() / 3600 + 23) / 24)
     }
 }

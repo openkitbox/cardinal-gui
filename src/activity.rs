@@ -12,6 +12,8 @@ use std::collections::{HashMap, VecDeque};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
+use jiff::Timestamp;
+
 use gpui::{Context, Hsla};
 
 use gateway::activity::{ActivityEvent, EndMetrics, EndStatus, PersistedRequest, StartEvent};
@@ -438,7 +440,7 @@ impl LiveAttempt {
             agent: self.agent,
             status,
             metrics,
-            settled_at: chrono::Utc::now(),
+            settled_at: Timestamp::now(),
             duration: now.saturating_duration_since(self.started),
         }
     }
@@ -471,7 +473,7 @@ pub(crate) struct SettledAttempt {
     /// settled row's speed reads them (output tokens over the decode window).
     pub metrics: EndMetrics,
     /// When End landed: the row's timestamp.
-    pub settled_at: chrono::DateTime<chrono::Utc>,
+    pub settled_at: Timestamp,
     /// Start → End on the feed's own clock — the same clock the live row
     /// counted up, so a row does not jump when it settles. The ledger's
     /// `total_ms` (in [`Self::metrics`]) is what the speed divides by.

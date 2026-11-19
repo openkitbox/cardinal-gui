@@ -47,7 +47,7 @@ tracing = "0.1"
 tokio = { version = "1", features = ["macros", "sync", "rt-multi-thread"] }
 clap = { version = "4", features = ["derive"] }
 serde_json = "1"
-chrono = { version = "0.4", default-features = false, features = ["clock", "std"] }
+jiff = { version = "1.0.1", features = ["serde", "tz-system"] }
 uuid = { version = "1", features = ["v4"] }
 # GUI config access: `serde`/`toml` for the `[gui]` section, `toml_edit` for the
 # comment-preserving write-back the settings page does (load.rs / ui_tz.rs).

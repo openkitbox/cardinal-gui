@@ -17,6 +17,7 @@ use gpui_kit::component::input::{Input, InputState, Textarea};
 use gpui_kit::component::menu::{DropdownMenu, PopupMenu, PopupMenuItem};
 use gpui_kit::component::tag::Tag;
 use gpui_kit::component::{ActiveTheme, Disableable, Icon, Sizable};
+use jiff::Timestamp;
 
 use gateway::http_client::KeyUpdate;
 use gateway::probe::ProbeModel;
@@ -34,6 +35,7 @@ use super::groups::{group_chips, group_tags};
 use super::kiro_import;
 use super::order::DropSide;
 use super::quota::{codex_reset_row, quota_row};
+use super::trend;
 use super::{
     AccountLoginForm, CredentialMode, FormSource, KeyCardData, KeyEditor, KeyForm, KiroImportForm,
     LoginProgress, ProvidersPage,
@@ -817,7 +819,7 @@ impl ProvidersPage {
         card_data: &KeyCardData,
         rests: &[RestRow],
         groups: &[KeyGroupView],
-        now: chrono::DateTime<chrono::Utc>,
+        now: Timestamp,
         drag: CardDrag,
         cx: &mut Context<Self>,
     ) -> Div {
@@ -1588,7 +1590,7 @@ impl Render for DragGhost {
 /// rows only when it builds the snapshot, and the page keeps rendering that
 /// snapshot, so a cooldown that ended since must not show as resting.
 #[must_use]
-fn live_rests(rests: &[RestRow], now: chrono::DateTime<chrono::Utc>) -> Vec<&RestRow> {
+fn live_rests(rests: &[RestRow], now: Timestamp) -> Vec<&RestRow> {
     rests.iter().filter(|rest| rest.rest_until > now).collect()
 }
 
@@ -1600,19 +1602,21 @@ fn live_rests(rests: &[RestRow], now: chrono::DateTime<chrono::Utc>) -> Vec<&Res
 fn rest_tags(
     key_id: i64,
     rests: &[&RestRow],
-    now: chrono::DateTime<chrono::Utc>,
+    now: Timestamp,
     cx: &mut Context<ProvidersPage>,
 ) -> Div {
     let mut footer = gpui::div().flex().items_center().gap_1().pt_1();
-    let today = now.with_timezone(&crate::ui_tz::display_tz()).date_naive();
+    let today = trend::display_datetime(now).date();
     for (index, rest) in rests.iter().enumerate() {
         // Same calendar day shows just the clock; anything further (a monthly
         // quota reset, an 8-day cap) must carry the date.
-        let until = rest.rest_until.with_timezone(&crate::ui_tz::display_tz());
-        let until = if until.date_naive() == today {
-            until.format("%H:%M").to_string()
+        let until = rest
+            .rest_until
+            .to_zoned_datetime(crate::ui_tz::display_tz());
+        let until = if until.date() == today {
+            until.strftime("%H:%M").to_string()
         } else {
-            until.format("%m-%d %H:%M").to_string()
+            until.strftime("%m-%d %H:%M").to_string()
         };
         let tag = match &rest.model {
             Some(model) => format!("冷却 {model} · {until} 恢复"),
@@ -1891,11 +1895,21 @@ fn archived_badge(cx: &App) -> Div {
 }
 
 /// The quota reading's age, shown on the header row next to the label.
-fn probe_age_label(probed_at: chrono::DateTime<chrono::Utc>, cx: &App) -> Div {
+fn probe_age_label(probed_at: Timestamp, cx: &App) -> Div {
+    let secs = (crate::time::now() - probed_at).as_secs().max(0);
+    let age = if secs < 60 {
+        "刚刚".to_string()
+    } else if secs < 3600 {
+        format!("{} 分钟前", secs / 60)
+    } else if secs < 86400 {
+        format!("{} 小时前", secs / 3600)
+    } else {
+        format!("{} 天前", secs / 86400)
+    };
     gpui::div()
         .text_size(px(11.))
         .text_color(cx.theme().muted_foreground)
-        .child(crate::fmt::probe_age(probed_at, chrono::Utc::now()))
+        .child(age)
 }
 
 /// The account's concurrency occupancy, shown once per card on the header row:

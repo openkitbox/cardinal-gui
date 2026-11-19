@@ -5,6 +5,8 @@
 
 use std::rc::Rc;
 
+use jiff::Timestamp;
+
 use gpui::{
     App, AppContext as _, Bounds, Context, Div, ElementId, Hsla, InteractiveElement, ParentElement,
     PathBuilder, StatefulInteractiveElement, Styled, Window, canvas, point,
@@ -79,12 +81,13 @@ impl RoutesPage {
             return;
         };
         let now = std::time::Instant::now();
-        let utc_now = chrono::Utc::now();
+        let utc_now = Timestamp::now();
         let seeded_from = self.clients.len();
         // recent is newest-first; iterate in reverse for chronological node order.
         for request in data.recent.iter().rev() {
-            let age = (utc_now - request.ts)
-                .to_std()
+            let age = utc_now
+                .duration_since(request.ts)
+                .try_into()
                 .unwrap_or(std::time::Duration::ZERO);
             if age >= CLIENT_LINGER {
                 continue;
@@ -338,7 +341,7 @@ struct StageAccount {
     paused: bool,
     /// Latest successful request time for this account on this model — shown in
     /// the serving-caption slot once the entry goes idle.
-    last_success: Option<chrono::DateTime<chrono::Utc>>,
+    last_success: Option<Timestamp>,
 }
 
 /// One in-flight call of this route, as the entry aggregation reads it. The
@@ -446,9 +449,9 @@ struct EntryState {
     /// The moment dispatch may use this entry again: set only while the account
     /// is cooling on this model and the entry is not stopped for another
     /// reason.
-    cool_until: Option<chrono::DateTime<chrono::Utc>>,
+    cool_until: Option<Timestamp>,
     /// Newest success of this account on this model.
-    last_success: Option<chrono::DateTime<chrono::Utc>>,
+    last_success: Option<Timestamp>,
 }
 
 /// Aggregate one entry's stage state over the single account it names.
@@ -468,7 +471,7 @@ fn entry_state(
     calls: &[LiveCall<'_>],
     rests: &[RestRow],
     success: &[ModelSuccessRow],
-    now: chrono::DateTime<chrono::Utc>,
+    now: Timestamp,
 ) -> EntryState {
     let stopped = entry_stopped(account, model);
     let Some(account) = account else {
@@ -527,16 +530,13 @@ fn entry_state(
 /// `now` is the render's single clock read, the same one the cooldown-expiry
 /// check in [`entry_state`] used, so the two always agree.
 #[must_use]
-fn cool_until_label(
-    until: chrono::DateTime<chrono::Utc>,
-    now: chrono::DateTime<chrono::Utc>,
-    tz: chrono::FixedOffset,
-) -> String {
-    let local = until.with_timezone(&tz);
-    if local.date_naive() == now.with_timezone(&tz).date_naive() {
-        format!("冷却至 {}", local.format("%H:%M"))
+fn cool_until_label(until: Timestamp, now: Timestamp, tz: jiff::tz::TimeZone) -> String {
+    let local = until.to_zoned_datetime(tz.clone());
+    let today = now.to_zoned_datetime(tz).date();
+    if local.date() == today {
+        format!("冷却至 {}", local.strftime("%H:%M"))
     } else {
-        format!("冷却至 {}", local.format("%m-%d %H:%M"))
+        format!("冷却至 {}", local.strftime("%m-%d %H:%M"))
     }
 }
 
@@ -596,7 +596,7 @@ impl RoutesPage {
         // One clock read for the whole render: cooldown expiry and the 冷却至
         // date comparison must agree with each other. The display offset is
         // read once alongside it for the same reason.
-        let now = chrono::Utc::now();
+        let now = Timestamp::now();
         let tz = crate::ui_tz::display_tz();
         let feed = self.feed.read(cx);
         // Every routed in-flight attempt. Wire routes are clipped to 64 bytes;
@@ -693,7 +693,7 @@ impl RoutesPage {
                         .join(" · ");
                         let cool_until = state
                             .cool_until
-                            .map(|until| cool_until_label(until, now, tz));
+                            .map(|until| cool_until_label(until, now, tz.clone()));
                         StageAccount {
                             head,
                             model: entry.label.clone().unwrap_or_else(|| entry.model.clone()),
@@ -1314,16 +1314,15 @@ impl RoutesPage {
                 // The serving caption's idle counterpart: the latest successful call,
                 // in the same slot (传输中 → lands → the time appears in place).
                 row.when_some(account.last_success, |row, ok| {
-                    let local = ok.with_timezone(&crate::ui_tz::display_tz());
-                    let now = chrono::Utc::now().with_timezone(&crate::ui_tz::display_tz());
-                    let stamp = if local.date_naive() == now.date_naive() {
-                        format!("{}", local.format("%H:%M"))
-                    } else if local.date_naive()
-                        == now.date_naive().pred_opt().unwrap_or(local.date_naive())
-                    {
-                        format!("昨天 {}", local.format("%H:%M"))
+                    let zone = crate::ui_tz::display_tz();
+                    let local = ok.to_zoned_datetime(zone.clone());
+                    let now = Timestamp::now().to_zoned_datetime(zone);
+                    let stamp = if local.date() == now.date() {
+                        local.strftime("%H:%M").to_string()
+                    } else if local.date() == now.date().yesterday().unwrap_or(now.date()) {
+                        format!("昨天 {}", local.strftime("%H:%M"))
                     } else {
-                        format!("{}", local.format("%m-%d %H:%M"))
+                        local.strftime("%m-%d %H:%M").to_string()
                     };
                     row.child(
                         gpui::div()

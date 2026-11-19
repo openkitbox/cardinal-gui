@@ -339,17 +339,16 @@ fn feed_line(theme: &Theme, line: FeedLine) -> Div {
 /// The row's wall-clock stamp for a settled attempt: `HH:MM:SS` today, `昨天
 /// HH:MM` yesterday, `MM-DD HH:MM` older — a settled row survives in memory
 /// across days, so a bare clock would make a stale row read as fresh.
-fn stamp_of(at: chrono::DateTime<chrono::Utc>) -> String {
-    let local = at.with_timezone(&crate::ui_tz::display_tz());
-    let today = chrono::Utc::now()
-        .with_timezone(&crate::ui_tz::display_tz())
-        .date_naive();
-    if local.date_naive() == today {
-        local.format("%H:%M:%S").to_string()
-    } else if local.date_naive() == today.pred_opt().unwrap_or(today) {
-        format!("昨天 {}", local.format("%H:%M"))
+fn stamp_of(at: jiff::Timestamp) -> String {
+    let zone = crate::ui_tz::display_tz();
+    let local = at.to_zoned_datetime(zone.clone());
+    let today = jiff::Timestamp::now().to_zoned_datetime(zone).date();
+    if local.date() == today {
+        local.strftime("%H:%M:%S").to_string()
+    } else if local.date() == today.yesterday().unwrap_or(today) {
+        format!("昨天 {}", local.strftime("%H:%M"))
     } else {
-        local.format("%m-%d %H:%M").to_string()
+        local.strftime("%m-%d %H:%M").to_string()
     }
 }
 

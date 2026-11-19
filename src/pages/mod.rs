@@ -281,10 +281,8 @@ pub(crate) fn icon_button(
 }
 
 /// `YYYY-MM-DD HH:MM` in the GUI display timezone.
-pub(crate) fn display_time(at: chrono::DateTime<chrono::Utc>) -> String {
-    at.with_timezone(&crate::ui_tz::display_tz())
-        .format("%Y-%m-%d %H:%M")
-        .to_string()
+pub(crate) fn display_time(at: jiff::Timestamp) -> String {
+    crate::time::format(at, crate::ui_tz::display_tz(), "%Y-%m-%d %H:%M")
 }
 
 /// Small inline error text under an editor field or form.

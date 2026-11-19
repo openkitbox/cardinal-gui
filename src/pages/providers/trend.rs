@@ -10,13 +10,14 @@
 
 use std::rc::Rc;
 
-use chrono::{DateTime, Datelike, Utc};
 use gpui::{
     App, BorderStyle, Bounds, Corners, Div, Edges, Hsla, ParentElement, Path, PathBuilder, Pixels,
     Point, ShapedLine, SharedString, Styled, TextAlign, TextRun, Window, canvas, point, px, quad,
     size,
 };
 use gpui_kit::component::ActiveTheme;
+use jiff::tz::TimeZone;
+use jiff::{Timestamp, ZonedDateTime};
 
 /// Chart element height: plot + one label row. 60% of the original 88px — the
 /// chart is a trend hint under a meter, not the card's subject, and the taller
@@ -34,7 +35,7 @@ const AXIS_LINE_HEIGHT: f32 = 12.;
 /// One plotted sample: the window's cumulative used share at an instant.
 #[derive(Clone, Debug)]
 pub(super) struct TrendPoint {
-    pub(super) at: DateTime<Utc>,
+    pub(super) at: Timestamp,
     pub(super) pct: f64,
 }
 
@@ -42,10 +43,10 @@ pub(super) struct TrendPoint {
 /// its recorded samples. The projection is pure arithmetic:
 /// `used_pct / elapsed_fraction`, extended to the window's end.
 pub(super) struct Trend {
-    pub(super) start: DateTime<Utc>,
-    pub(super) end: DateTime<Utc>,
+    pub(super) start: Timestamp,
+    pub(super) end: Timestamp,
     /// The reading instant, clamped into the window.
-    pub(super) now: DateTime<Utc>,
+    pub(super) now: Timestamp,
     /// Current used share (the projection's anchor).
     pub(super) used_pct: f64,
     /// Samples within the current window, oldest first; the current reading is
@@ -56,7 +57,7 @@ pub(super) struct Trend {
     pub(super) forecast: Option<f64>,
     /// When the projection pins at the 100% cap (already over the limit counts
     /// as now).
-    pub(super) crossing: Option<DateTime<Utc>>,
+    pub(super) crossing: Option<Timestamp>,
 }
 
 /// The chart canvas, `TREND_HEIGHT` tall and full width; the caller supplies
@@ -133,9 +134,9 @@ fn prepaint_trend(
     let plot_left = origin_x + widest + 4.;
     let plot_right = (origin_x + width - TREND_RIGHT).max(plot_left + 1.);
 
-    let span = (trend.end - trend.start).num_seconds().max(1) as f32;
-    let x_of = |at: DateTime<Utc>| {
-        let rel = ((at - trend.start).num_seconds() as f32 / span).clamp(0., 1.);
+    let span = (trend.end - trend.start).as_secs().max(1) as f32;
+    let x_of = |at: Timestamp| {
+        let rel = ((at - trend.start).as_secs() as f32 / span).clamp(0., 1.);
         plot_left + (plot_right - plot_left) * rel
     };
     let y_of = |pct: f64| {
@@ -199,7 +200,7 @@ fn prepaint_trend(
             |builder| {
                 // The run from `from` to the reset: to the projected share
                 // under the limit, or up to the pin and flat at 100%.
-                let emit = |builder: &mut PathBuilder, from_at: DateTime<Utc>, from_pct: f64| {
+                let emit = |builder: &mut PathBuilder, from_at: Timestamp, from_pct: f64| {
                     builder.move_to(point(px(x_of(from_at)), px(y_of(from_pct))));
                     if projected > TREND_TOP_PCT {
                         let crossing = trend.crossing.unwrap_or(from_at);
@@ -230,7 +231,7 @@ fn prepaint_trend(
     let mut x_labels = vec![(
         shape(
             window,
-            &short_date(trend.start.with_timezone(&crate::ui_tz::display_tz())),
+            &short_date(trend.start.to_zoned_datetime(crate::ui_tz::display_tz())),
         ),
         point(px(plot_left), px(baseline + 2.)),
     )];
@@ -243,7 +244,7 @@ fn prepaint_trend(
     {
         let line = shape(
             window,
-            &short_date(trend.end.with_timezone(&crate::ui_tz::display_tz())),
+            &short_date(trend.end.to_zoned_datetime(crate::ui_tz::display_tz())),
         );
         let w: f32 = line.width().into();
         x_labels.push((line, point(px(plot_right - w), px(baseline + 2.))));
@@ -338,6 +339,12 @@ fn paint_trend(pre: TrendPaint, window: &mut Window, cx: &mut App) {
 }
 
 /// `MM-DD` in the display timezone (the chart's axis labels).
-pub(super) fn short_date(at: DateTime<chrono::FixedOffset>) -> String {
+pub(super) fn short_date(at: ZonedDateTime) -> String {
     format!("{:02}-{:02}", at.month(), at.day())
+}
+
+pub(super) fn display_datetime(at: Timestamp) -> ZonedDateTime {
+    let tz = crate::ui_tz::display_tz();
+    let offset = at.to_zoned_datetime(tz).offset();
+    at.to_zoned_datetime(TimeZone::fixed(offset))
 }
