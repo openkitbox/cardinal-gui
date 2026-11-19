@@ -27,7 +27,7 @@ use crate::activity::{
     LedgerRevisionChange, LedgerRevisionObserver, UsageReloadAction, UsageReloadEvent,
     UsageReloadState,
 };
-use crate::fmt::{humanize_count, usd_microus};
+use crate::fmt::{humanize_count_overview, usd_microus};
 use crate::pages::usage_trend::{TrendData, TrendGeometryCell, TrendMetric};
 use crate::pages::{
     LoadState, card, empty_card, error_card, loading_card, notify_error, notify_success,
@@ -1034,8 +1034,8 @@ impl Render for UsagePage {
                                     "tokens",
                                     visible.map(|values| values.tokens),
                                     kpi.tokens,
-                                    humanize_count,
-                                    humanize_count(kpi.tokens),
+                                    humanize_count_overview,
+                                    humanize_count_overview(kpi.tokens),
                                     cx,
                                 ),
                                 token_sub(window),
@@ -1227,9 +1227,9 @@ fn kpi_value(value: String, cx: &gpui::App) -> gpui::AnyElement {
 fn token_sub(window: &UsageWindow) -> String {
     format!(
         "输入 {} · 输出 {} · 缓存 {}",
-        humanize_count(window.input_tokens),
-        humanize_count(window.output_tokens),
-        humanize_count(window.cached_input_tokens)
+        humanize_count_overview(window.input_tokens),
+        humanize_count_overview(window.output_tokens),
+        humanize_count_overview(window.cached_input_tokens)
     )
 }
 

@@ -42,9 +42,20 @@ pub(crate) fn mask_email(email: &str) -> String {
 /// Humanize a token/request count: `406200` → `406.2k`, `1230000` → `1.2M`,
 /// `3400000000` → `3.4B`.
 pub(crate) fn humanize_count(n: i64) -> String {
+    humanize_count_with_billion_precision(n, 1)
+}
+
+/// Humanize an overview token count, keeping two fraction digits at billions.
+#[must_use]
+pub(crate) fn humanize_count_overview(n: i64) -> String {
+    humanize_count_with_billion_precision(n, 2)
+}
+
+#[must_use]
+fn humanize_count_with_billion_precision(n: i64, billion_fraction_digits: usize) -> String {
     let abs = n.unsigned_abs();
     if abs >= 1_000_000_000 {
-        format!("{:.1}B", n as f64 / 1_000_000_000.0)
+        format!("{:.billion_fraction_digits$}B", n as f64 / 1_000_000_000.0)
     } else if abs >= 1_000_000 {
         format!("{:.1}M", n as f64 / 1_000_000.0)
     } else if abs >= 1_000 {

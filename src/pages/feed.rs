@@ -232,7 +232,7 @@ fn settled_meta(status: &str, duration: &str, metrics: &EndMetrics) -> String {
 }
 
 /// The token group `总2.6K 入2.3K 出385 缓0` — the ledger's split, compact
-/// ([`crate::fmt::humanize_count`]). 总 is `input + output`: the kernel's
+/// ([`crate::fmt::humanize_count_overview`]). 总 is `input + output`: the kernel's
 /// `input_tokens` is the whole prompt with cache reads already inside it, so
 /// nothing is double-counted; 缓 is that prompt's cache-read slice. None when
 /// the attempt billed no tokens at all (a pre-response failure); a measured
@@ -243,10 +243,10 @@ fn token_group(metrics: &EndMetrics) -> Option<String> {
     let cached = metrics.cached_input_tokens.unwrap_or(0);
     Some(format!(
         "{}/{}/{}/{}",
-        crate::fmt::humanize_count(input + output),
-        crate::fmt::humanize_count(input),
-        crate::fmt::humanize_count(output),
-        crate::fmt::humanize_count(cached),
+        crate::fmt::humanize_count_overview(input + output),
+        crate::fmt::humanize_count_overview(input),
+        crate::fmt::humanize_count_overview(output),
+        crate::fmt::humanize_count_overview(cached),
     ))
 }
 

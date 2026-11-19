@@ -21,7 +21,7 @@ use gpui::{
 };
 use gpui_kit::component::ActiveTheme;
 
-use crate::fmt::{humanize_count, usd_microus};
+use crate::fmt::{humanize_count_overview, usd_microus};
 use crate::pages::card;
 use crate::pages::usage::{ResolvedRange, UsagePage};
 
@@ -114,7 +114,7 @@ impl TrendMetric {
     /// Short axis/rank format.
     fn format(self, value: f64) -> String {
         match self {
-            Self::Tokens => humanize_count(value.round() as i64),
+            Self::Tokens => humanize_count_overview(value.round() as i64),
             Self::Requests => format!("{}", value.round() as i64),
             Self::Revenue => usd_microus(value.round() as i64),
             // No more digits than it takes.
@@ -750,7 +750,10 @@ impl UsagePage {
             ));
         }
         if metric != TrendMetric::Tokens {
-            stats.push(format!("{} token", humanize_count(category.tokens)));
+            stats.push(format!(
+                "{} token",
+                humanize_count_overview(category.tokens)
+            ));
         }
         if metric != TrendMetric::Cost
             && let Some(cost) = category.cost
