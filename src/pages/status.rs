@@ -117,7 +117,7 @@ impl StatusPage {
         let mut this = Self {
             providers: cx.new(|cx| ProvidersPage::new(feed.clone(), cx)),
             routes: cx.new(|cx| RoutesPage::new(feed.clone(), cx)),
-            requests: cx.new(|cx| RequestsPage::new(feed.clone(), cx)),
+            requests: cx.new(|cx| RequestsPage::new(feed.clone(), window, cx)),
             usage: cx.new(|cx| UsagePage::new(feed.clone(), window, cx)),
             users,
             keys,

@@ -74,14 +74,14 @@ pub(crate) struct ResolvedRange {
 
 impl UsageRange {
     /// Chip row: preset ranges and their labels.
-    const PRESETS: [(UsageRange, &'static str); 4] = [
+    pub(super) const PRESETS: [(UsageRange, &'static str); 4] = [
         (UsageRange::Today, "今天"),
         (UsageRange::Days(7), "7 天"),
         (UsageRange::Days(30), "30 天"),
         (UsageRange::Days(90), "90 天"),
     ];
 
-    fn resolve(self) -> ResolvedRange {
+    pub(super) fn resolve(self) -> ResolvedRange {
         let tz = crate::ui_tz::display_tz();
         let now = Timestamp::now();
         let offset = crate::time::offset(now, tz.clone());
@@ -107,7 +107,7 @@ impl UsageRange {
     }
 
     /// The empty-card period line ("今天内没有计量的请求。").
-    fn label(self) -> String {
+    pub(super) fn label(self) -> String {
         match self {
             Self::Today => "今天".to_string(),
             Self::Days(days) => format!("{days} 天"),

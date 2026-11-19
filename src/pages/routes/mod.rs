@@ -664,7 +664,13 @@ impl RoutesPage {
             .global::<GatewayRuntime>()
             .admin_call(|admin| async move {
                 let document = admin.bootstrap().await?;
-                let recent = admin.recent_requests(RECENT_LIMIT as i64, None).await?;
+                let recent = admin
+                    .recent_requests(
+                        RECENT_LIMIT as i64,
+                        None,
+                        gateway::store::RequestFilter::default(),
+                    )
+                    .await?;
                 let success = admin.model_success().await?;
                 Ok(RoutesData::from_bootstrap(&document, recent, success))
             });

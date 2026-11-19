@@ -11,13 +11,18 @@ use gpui::{
 };
 use gpui_kit::assets::IconName;
 use gpui_kit::component::button::{Button, ButtonVariants};
+use gpui_kit::component::calendar::Date as PickerDate;
+use gpui_kit::component::date_picker::{
+    DatePicker, DatePickerEvent, DatePickerState, DateTime as PickerValue,
+};
 use gpui_kit::component::pagination::Pagination;
 use gpui_kit::component::text::TextView;
 use gpui_kit::component::{ActiveTheme, Icon, Sizable};
 
+use gateway::activity::PersistedRequest;
 use gateway::body_log::CapturedBodies;
 use gateway::relay::trace::{DispatchTrace, SkipReason};
-use gateway::store::RequestRow;
+use gateway::store::{GatewayKeyRow, OWNER_LOGIN, RequestFilter, RequestRow, RequestStatus};
 
 use crate::activity::{
     LedgerReloadAction, LedgerReloadEvent, LedgerReloadState, LedgerRevisionChange,
@@ -25,11 +30,75 @@ use crate::activity::{
 };
 use crate::fmt::format_cost;
 use crate::fmt::usd_microus;
+use crate::pages::usage::UsageRange;
 use crate::pages::{
     LoadState, empty_card, error_card, loading_card, notify_error, notify_success, page_frame,
-    refresh_button,
+    refresh_button, segmented,
 };
 use crate::runtime::GatewayRuntime;
+
+/// One 调用方 option: the raw caller label carried by live summaries, the
+/// composite display text, and the owning user id that disambiguates keys
+/// sharing a label (the persisted query filters by the exact key id).
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct KeyChoice {
+    id: i64,
+    label: String,
+    display: String,
+    user_id: i64,
+}
+
+/// Whether a live summary (which has no database id) belongs in the currently
+/// filtered page. Preset `until` values mean "now at resolve time", so only a
+/// fixed Custom range can exclude a row whose timestamp is the later merge
+/// time. Key identity needs both the caller label and its owner user id.
+fn live_summary_matches(
+    row: &PersistedRequest,
+    filter: RequestFilter,
+    key: Option<&KeyChoice>,
+    range: UsageRange,
+    now: jiff::Timestamp,
+) -> bool {
+    let fixed_until = matches!(range, UsageRange::Custom(..));
+    if filter.since.is_some_and(|since| since > now)
+        || (fixed_until && filter.until.is_some_and(|until| until <= now))
+    {
+        return false;
+    }
+    if filter
+        .user_id
+        .is_some_and(|user_id| row.user_id != Some(user_id))
+    {
+        return false;
+    }
+    if filter.key_id.is_some() {
+        let Some(key) = key else {
+            return false;
+        };
+        if row.caller_key.as_deref() != Some(key.label.as_str()) || row.user_id != Some(key.user_id)
+        {
+            return false;
+        }
+    }
+    let ok = (200..300).contains(&row.status);
+    match filter.status {
+        RequestStatus::All => true,
+        RequestStatus::Ok => ok,
+        RequestStatus::Error => !ok,
+    }
+}
+
+/// Built once from the pushed bootstrap document.
+fn key_options(keys: &[GatewayKeyRow]) -> Vec<KeyChoice> {
+    keys.iter()
+        .map(|key| KeyChoice {
+            id: key.id,
+            label: key.label.clone(),
+            display: format!("{} · {}", key.label, key.login),
+            user_id: key.user_id,
+        })
+        .collect()
+}
 
 fn project_request(row: gateway::activity::PersistedRequest, id: i64) -> RequestRow {
     RequestRow {
@@ -174,6 +243,22 @@ pub struct RequestsPage {
     traces: HashMap<i64, LoadState<Option<DispatchTrace>>>,
     /// Per-row vendor error details, prepared off the render path on expand.
     error_details: HashMap<i64, LoadState<ErrorView>>,
+    /// Period selected in the tab row (shared with the overview's presets).
+    range: UsageRange,
+    /// The custom-range picker, created at construction like the overview's.
+    range_picker: gpui::Entity<DatePickerState>,
+    /// Selected user / gateway key; the key keeps its raw caller label and
+    /// owner id for live summaries plus the composite trigger text.
+    user_selection: Option<(i64, String)>,
+    key_selection: Option<KeyChoice>,
+    status_selection: RequestStatus,
+    /// Dropdown options; a failed users read degrades to an empty group.
+    user_options: Vec<(i64, String)>,
+    key_options: Vec<KeyChoice>,
+    user_list_open: bool,
+    key_list_open: bool,
+    /// Bootstrap revision whose key options were last applied.
+    seen_bootstrap: u64,
 }
 
 /// Display-ready captured bodies (prettied and fenced at fetch time — a
@@ -250,9 +335,34 @@ fn error_detail_cache_is_current(
 impl RequestsPage {
     pub(crate) fn new(
         feed: gpui::Entity<crate::activity::ActivityFeed>,
+        window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Self {
-        let this = Self {
+        let seen_bootstrap = feed.read(cx).bootstrap_rev();
+        let range_picker =
+            cx.new(|cx| crate::time::monday_picker(DatePickerState::range(window, cx)));
+        cx.subscribe(
+            &range_picker,
+            |page, _picker, event: &DatePickerEvent, cx| {
+                let DatePickerEvent::Change(PickerValue::Range(Some(start), Some(end))) = event
+                else {
+                    return;
+                };
+                let (Some(start), Some(end)) = (
+                    crate::time::picker_date(PickerDate::Single(Some(start.date()))),
+                    crate::time::picker_date(PickerDate::Single(Some(end.date()))),
+                ) else {
+                    return;
+                };
+                let range = UsageRange::Custom(start, end);
+                if page.range != range {
+                    page.range = range;
+                    page.reset_to_latest(cx);
+                }
+            },
+        )
+        .detach();
+        let mut this = Self {
             state: LoadState::Loading,
             persisted_reload: LedgerReloadState::default(),
             revision_observer: LedgerRevisionObserver::new(
@@ -268,9 +378,29 @@ impl RequestsPage {
             bodies: HashMap::new(),
             traces: HashMap::new(),
             error_details: HashMap::new(),
+            range: UsageRange::Today,
+            range_picker,
+            user_selection: None,
+            key_selection: None,
+            status_selection: RequestStatus::All,
+            user_options: Vec::new(),
+            key_options: Vec::new(),
+            user_list_open: false,
+            key_list_open: false,
+            seen_bootstrap,
             feed,
         };
         cx.observe(&this.feed.clone(), |page, feed, cx| {
+            // The pushed bootstrap carries the gateway keys; the users list is
+            // read over the admin API. Both degrade to no options on failure.
+            let bootstrap_rev = feed.read(cx).bootstrap_rev();
+            if bootstrap_rev != page.seen_bootstrap {
+                page.seen_bootstrap = bootstrap_rev;
+                if let Some(document) = feed.read(cx).bootstrap() {
+                    page.key_options = key_options(&document.gateway_keys);
+                }
+                page.reload_users(cx);
+            }
             let (persisted, resync) = {
                 let feed = feed.read(cx);
                 (feed.persisted(), feed.resync())
@@ -302,6 +432,24 @@ impl RequestsPage {
             cx.notify();
         })
         .detach();
+        if seen_bootstrap > 0
+            && let Some(document) = this.feed.read(cx).bootstrap()
+        {
+            this.key_options = key_options(&document.gateway_keys);
+            let load = cx
+                .global::<GatewayRuntime>()
+                .admin_call(|admin| async move { admin.users().await });
+            cx.spawn(async move |this, cx| {
+                if let Ok(users) = load.await {
+                    this.update(cx, |page, cx| {
+                        page.apply_users(&users);
+                        cx.notify();
+                    })
+                    .ok();
+                }
+            })
+            .detach();
+        }
         this
     }
 
@@ -315,6 +463,65 @@ impl RequestsPage {
         let _ = self
             .persisted_reload
             .reduce(false, LedgerReloadEvent::TabInvalidation);
+    }
+
+    /// Keep only real users as 用户 options; the built-in `owner` has no
+    /// per-user request rows to select.
+    fn apply_users(&mut self, users: &[gateway::store::UserRow]) {
+        self.user_options = users
+            .iter()
+            .filter(|user| user.login != OWNER_LOGIN)
+            .map(|user| (user.id, user.login.clone()))
+            .collect();
+    }
+
+    /// (Re)load the 用户 dropdown. A failure leaves the previous options alone.
+    fn reload_users(&mut self, cx: &mut Context<Self>) {
+        let load = cx
+            .global::<GatewayRuntime>()
+            .admin_call(|admin| async move { admin.users().await });
+        cx.spawn(async move |this, cx| {
+            if let Ok(users) = load.await {
+                this.update(cx, |page, cx| {
+                    page.apply_users(&users);
+                    cx.notify();
+                })
+                .ok();
+            }
+        })
+        .detach();
+    }
+
+    /// The wire filter for the current selections. Resolved at call time so a
+    /// preset's `now` stays live across refreshes and pagination.
+    fn current_filter(&self) -> RequestFilter {
+        let range = self.range.resolve();
+        RequestFilter {
+            since: Some(range.since),
+            until: Some(range.until),
+            user_id: self.user_selection.as_ref().map(|(id, _)| *id),
+            key_id: self.key_selection.as_ref().map(|key| key.id),
+            status: self.status_selection,
+        }
+    }
+
+    /// A filter change makes the cached page and its row-local caches stale:
+    /// re-read the newest page with the new predicates.
+    fn reset_to_latest(&mut self, cx: &mut Context<Self>) {
+        self.cursor = None;
+        self.expanded.clear();
+        self.bodies.clear();
+        self.traces.clear();
+        self.error_details.clear();
+        self.apply_reload(LedgerReloadEvent::CursorInvalidation, cx);
+        cx.notify();
+    }
+
+    fn set_status(&mut self, status: RequestStatus, cx: &mut Context<Self>) {
+        if self.status_selection != status {
+            self.status_selection = status;
+            self.reset_to_latest(cx);
+        }
     }
 
     fn apply_reload(&mut self, event: LedgerReloadEvent, cx: &mut Context<Self>) {
@@ -368,9 +575,12 @@ impl RequestsPage {
         self.generation += 1;
         let generation = self.generation;
         let cursor = self.cursor;
+        let filter = self.current_filter();
         let load = cx
             .global::<GatewayRuntime>()
-            .admin_call(move |admin| async move { admin.recent_requests(PAGE_SIZE, cursor).await });
+            .admin_call(move |admin| async move {
+                admin.recent_requests(PAGE_SIZE, cursor, filter).await
+            });
         cx.spawn(async move |this, cx| {
             let result = load.await;
             this.update(cx, |page, cx| {
@@ -432,11 +642,18 @@ impl RequestsPage {
         rows: Vec<gateway::activity::PersistedRequest>,
         cx: &mut Context<Self>,
     ) {
+        let filter = self.current_filter();
+        let key = self.key_selection.as_ref();
+        let range = self.range;
+        let now = jiff::Timestamp::now();
         let LoadState::Loaded(current) = &mut self.state else {
             return;
         };
         let mut incoming: Vec<RequestRow> = Vec::new();
         for row in rows {
+            if !live_summary_matches(&row, filter, key, range, now) {
+                continue;
+            }
             let id = self.next_local_id;
             self.next_local_id = self.next_local_id.saturating_sub(1);
             incoming.push(project_request(row, id));
@@ -649,12 +866,259 @@ impl RequestsPage {
         .detach();
     }
 
-    /// Tab-row action (rendered by the Status container): refresh.
+    /// One line in a filter dropdown. `on_pick` owns the selection change and
+    /// the resulting reload; the helper only handles the shared presentation.
+    fn filter_option(
+        &self,
+        id: impl Into<ElementId>,
+        text: String,
+        selected: bool,
+        on_pick: impl Fn(&mut RequestsPage, &mut Context<RequestsPage>) + 'static,
+        cx: &mut Context<Self>,
+    ) -> gpui::Stateful<Div> {
+        let mut option = gpui::div()
+            .id(id)
+            .cursor_pointer()
+            .px_2()
+            .py_1()
+            .text_size(px(12.))
+            .text_color(if selected {
+                cx.theme().foreground
+            } else {
+                cx.theme().muted_foreground
+            })
+            .hover(|this| this.bg(cx.theme().accent));
+        if selected {
+            option = option.font_weight(gpui::FontWeight::SEMIBOLD);
+        }
+        option
+            .child(if selected {
+                format!("✓ {text}")
+            } else {
+                text
+            })
+            .on_click(cx.listener(move |page, _, _, cx| on_pick(page, cx)))
+    }
+
+    /// The 用户 dropdown: a fixed 全部 entry followed by the real users. The
+    /// floating list is deferred so it never stretches the tab row.
+    fn user_dropdown(&mut self, cx: &mut Context<Self>) -> gpui::AnyElement {
+        let label = self
+            .user_selection
+            .as_ref()
+            .map_or_else(|| "全部用户".to_owned(), |(_, login)| login.clone());
+        let trigger = Button::new("requests-user-filter")
+            .label(label)
+            .outline()
+            .compact()
+            .on_click(cx.listener(|this, _, _, cx| {
+                this.user_list_open = !this.user_list_open;
+                this.key_list_open = false;
+                cx.notify();
+            }));
+        if !self.user_list_open {
+            return trigger.into_any_element();
+        }
+        let mut options = gpui::div()
+            .id("requests-user-list")
+            .flex()
+            .flex_col()
+            .border_1()
+            .rounded_md()
+            .border_color(cx.theme().border)
+            .bg(cx.theme().popover)
+            .shadow_lg()
+            .max_h(px(240.))
+            .overflow_y_scroll()
+            .child(self.filter_option(
+                "requests-user-all",
+                "全部用户".to_owned(),
+                self.user_selection.is_none(),
+                |page, cx| {
+                    page.user_list_open = false;
+                    page.user_selection = None;
+                    page.reset_to_latest(cx);
+                },
+                cx,
+            ));
+        for (id, login) in &self.user_options {
+            let element_id =
+                gpui::ElementId::from(gpui::SharedString::from(format!("requests-user-{id}")));
+            let selected = self
+                .user_selection
+                .as_ref()
+                .is_some_and(|(selected_id, _)| *selected_id == *id);
+            let selection = Some((*id, login.clone()));
+            options = options.child(self.filter_option(
+                element_id,
+                login.clone(),
+                selected,
+                move |page, cx| {
+                    page.user_list_open = false;
+                    if page.user_selection != selection {
+                        page.user_selection = selection.clone();
+                        page.reset_to_latest(cx);
+                    } else {
+                        cx.notify();
+                    }
+                },
+                cx,
+            ));
+        }
+        gpui::div()
+            .relative()
+            .child(trigger)
+            .child(
+                gpui::deferred(
+                    gpui::div()
+                        .absolute()
+                        .top(px(24.))
+                        .left(px(0.))
+                        .w(px(180.))
+                        .child(options),
+                )
+                .with_priority(1),
+            )
+            .into_any_element()
+    }
+
+    /// The 调用方 dropdown: one entry per gateway key, shown as `label · login`
+    /// so duplicate labels from different users stay distinguishable.
+    fn key_dropdown(&mut self, cx: &mut Context<Self>) -> gpui::AnyElement {
+        let label = self
+            .key_selection
+            .as_ref()
+            .map_or_else(|| "全部调用方".to_owned(), |key| key.display.clone());
+        let trigger = Button::new("requests-key-filter")
+            .label(label)
+            .outline()
+            .compact()
+            .on_click(cx.listener(|this, _, _, cx| {
+                this.key_list_open = !this.key_list_open;
+                this.user_list_open = false;
+                cx.notify();
+            }));
+        if !self.key_list_open {
+            return trigger.into_any_element();
+        }
+        let mut options = gpui::div()
+            .id("requests-key-list")
+            .flex()
+            .flex_col()
+            .border_1()
+            .rounded_md()
+            .border_color(cx.theme().border)
+            .bg(cx.theme().popover)
+            .shadow_lg()
+            .max_h(px(240.))
+            .overflow_y_scroll()
+            .child(self.filter_option(
+                "requests-key-all",
+                "全部调用方".to_owned(),
+                self.key_selection.is_none(),
+                |page, cx| {
+                    page.key_list_open = false;
+                    page.key_selection = None;
+                    page.reset_to_latest(cx);
+                },
+                cx,
+            ));
+        for key in &self.key_options {
+            let element_id =
+                gpui::ElementId::from(gpui::SharedString::from(format!("requests-key-{}", key.id)));
+            let selected = self
+                .key_selection
+                .as_ref()
+                .is_some_and(|selected| selected.id == key.id);
+            let selection = Some(key.clone());
+            options = options.child(self.filter_option(
+                element_id,
+                key.display.clone(),
+                selected,
+                move |page, cx| {
+                    page.key_list_open = false;
+                    if page.key_selection != selection {
+                        page.key_selection = selection.clone();
+                        page.reset_to_latest(cx);
+                    } else {
+                        cx.notify();
+                    }
+                },
+                cx,
+            ));
+        }
+        gpui::div()
+            .relative()
+            .child(trigger)
+            .child(
+                gpui::deferred(
+                    gpui::div()
+                        .absolute()
+                        .top(px(24.))
+                        .left(px(0.))
+                        .w(px(200.))
+                        .child(options),
+                )
+                .with_priority(1),
+            )
+            .into_any_element()
+    }
+
+    /// Tab-row actions: period chips, custom range, 用户 / 调用方 dropdowns,
+    /// 状态 segmented and refresh — all in the tab row, no page header.
     pub(crate) fn actions(&mut self, cx: &mut Context<Self>) -> Vec<gpui::AnyElement> {
-        vec![
+        let mut actions: Vec<gpui::AnyElement> = UsageRange::PRESETS
+            .iter()
+            .map(|&(range, label)| {
+                let button = Button::new(gpui::ElementId::Name(
+                    format!("requests-period-{label}").into(),
+                ))
+                .label(label)
+                .compact()
+                .on_click(cx.listener(move |this, _, window, cx| {
+                    if this.range != range {
+                        this.range = range;
+                        this.range_picker.update(cx, |picker, cx| {
+                            picker.set_date(PickerDate::Range(None, None), window, cx);
+                        });
+                        this.reset_to_latest(cx);
+                    }
+                }));
+                if range == self.range {
+                    button.secondary().into_any_element()
+                } else {
+                    button.ghost().into_any_element()
+                }
+            })
+            .collect();
+        actions.push(
+            DatePicker::new(&self.range_picker)
+                .placeholder("自定义")
+                .number_of_months(2)
+                .w(px(170.))
+                .into_any_element(),
+        );
+        actions.push(self.user_dropdown(cx));
+        actions.push(self.key_dropdown(cx));
+        actions.push(
+            segmented(
+                "requests-status",
+                &[
+                    (RequestStatus::All, "全部"),
+                    (RequestStatus::Ok, "正常"),
+                    (RequestStatus::Error, "错误"),
+                ],
+                self.status_selection,
+                cx,
+                |page, status, cx| page.set_status(status, cx),
+            )
+            .into_any_element(),
+        );
+        actions.push(
             refresh_button(
                 "requests-refresh",
                 cx.listener(|this, _, window, cx| {
+                    this.reload_users(cx);
                     this.apply_reload_with_notice(
                         LedgerReloadEvent::ManualReload,
                         Some(window.window_handle()),
@@ -663,7 +1127,8 @@ impl RequestsPage {
                 }),
             )
             .into_any_element(),
-        ]
+        );
+        actions
     }
 }
 
@@ -789,7 +1254,7 @@ fn supplier_header(cx: &App) -> Div {
         .flex_none()
         .w(px(SUPPLIER_W))
         .px_2()
-        .py_1()
+        .py_2()
         .text_size(px(12.))
         .text_color(cx.theme().muted_foreground)
         .child("供应商")
@@ -825,7 +1290,7 @@ fn protocol_header(cx: &App) -> Div {
         .flex_none()
         .w(px(72.))
         .px_2()
-        .py_1()
+        .py_2()
         .text_size(px(12.))
         .text_color(cx.theme().muted_foreground)
         .child("模式")
@@ -850,7 +1315,7 @@ fn fixed_header(text: &str, cx: &App) -> Div {
         .flex_none()
         .w(px(56.))
         .px_2()
-        .py_1()
+        .py_2()
         .text_size(px(12.))
         .text_color(cx.theme().muted_foreground)
         .child(text.to_string())
@@ -888,7 +1353,7 @@ fn requests_header(cx: &App) -> Div {
     let label = |text: &str, right: bool| {
         let cell = gpui::div()
             .px_2()
-            .py_1()
+            .py_2()
             .text_size(px(12.))
             .text_color(cx.theme().muted_foreground)
             .child(text.to_string());
@@ -909,7 +1374,7 @@ fn requests_header(cx: &App) -> Div {
                 .flex_none()
                 .w(px(90.))
                 .px_2()
-                .py_1()
+                .py_2()
                 .text_size(px(12.))
                 .text_color(cx.theme().muted_foreground)
                 .child("时间"),
@@ -1355,7 +1820,7 @@ fn status_header(cx: &App) -> Div {
         .flex_none()
         .w(px(48.))
         .px_2()
-        .py_1()
+        .py_2()
         .text_size(px(12.))
         .text_color(cx.theme().muted_foreground)
         .flex()
@@ -1381,7 +1846,7 @@ fn ttft_header(cx: &App) -> Div {
         .flex_none()
         .w(px(56.))
         .px_2()
-        .py_1()
+        .py_2()
         .text_size(px(12.))
         .text_color(cx.theme().muted_foreground)
         .flex()
@@ -1406,7 +1871,7 @@ fn route_header(cx: &App) -> Div {
         .flex_none()
         .w(px(72.))
         .px_2()
-        .py_1()
+        .py_2()
         .text_size(px(12.))
         .text_color(cx.theme().muted_foreground)
         .child("路由")
@@ -1430,7 +1895,7 @@ fn speed_header(cx: &App) -> Div {
         .flex_none()
         .w(px(72.))
         .px_2()
-        .py_1()
+        .py_2()
         .text_size(px(12.))
         .text_color(cx.theme().muted_foreground)
         .flex()
@@ -1455,7 +1920,7 @@ fn caller_header(cx: &App) -> Div {
         .flex_none()
         .w(px(120.))
         .px_2()
-        .py_1()
+        .py_2()
         .text_size(px(12.))
         .text_color(cx.theme().muted_foreground)
         .child("调用方")
@@ -1478,7 +1943,7 @@ fn user_header(cx: &App) -> Div {
         .flex_none()
         .w(px(96.))
         .px_2()
-        .py_1()
+        .py_2()
         .text_size(px(12.))
         .text_color(cx.theme().muted_foreground)
         .child("用户")
