@@ -13,8 +13,8 @@
 use gpui::prelude::FluentBuilder as _;
 use gpui::{
     AnyWindowHandle, App, AppContext as _, Context, Div, ElementId, Entity, Focusable as _,
-    InteractiveElement as _, IntoElement, ParentElement, Pixels, Rems, Render,
-    StatefulInteractiveElement as _, Styled, Window, px, rems,
+    InteractiveElement as _, IntoElement, ParentElement, Pixels, Render,
+    StatefulInteractiveElement as _, Styled, Window, px,
 };
 use gpui_kit::assets::IconName;
 use gpui_kit::component::button::{Button, ButtonVariants as _};
@@ -35,15 +35,16 @@ use crate::pages::{
 };
 use crate::runtime::GatewayRuntime;
 
-const KEY_LABEL_WIDTH: Pixels = px(120.);
-const KEY_OWNER_WIDTH: Pixels = px(80.);
+const KEY_LABEL_WIDTH: Pixels = px(96.);
+const KEY_OWNER_WIDTH: Pixels = px(64.);
 const KEY_COLUMN_WIDTH: Pixels = px(360.);
-const KEY_STATUS_WIDTH: Pixels = px(44.);
-const KEY_EXPIRY_WIDTH: Pixels = px(88.);
-const KEY_QUOTA_WIDTH: Pixels = px(150.);
+const KEY_STATUS_WIDTH: Pixels = px(36.);
+const KEY_EXPIRY_WIDTH: Pixels = px(72.);
+const KEY_QUOTA_WIDTH: Pixels = px(132.);
 const KEY_TIME_WIDTH: Pixels = px(108.);
-const KEY_ACTIONS_WIDTH: Pixels = px(96.);
-const KEY_TABLE_SPACING: Rems = rems(0.75);
+const KEY_ACTIONS_WIDTH: Pixels = px(88.);
+const KEY_TABLE_GAP: Pixels = px(4.);
+const KEY_TABLE_PADDING: Pixels = px(8.);
 
 /// The list and the users the pickers need, fetched together so a row always
 /// resolves its owner against a snapshot taken at the same time.
@@ -823,29 +824,10 @@ impl GatewayKeysPage {
 
     /// The key table: label, owner, full key, status, expiry, quota, created,
     /// last used and the row actions.
-    fn key_table(
-        &self,
-        keys: &[&GatewayKeyRow],
-        window: &Window,
-        cx: &mut Context<Self>,
-    ) -> gpui::Stateful<Div> {
-        // Fit all nine columns, eight gaps, both paddings and both borders
-        // before flex layout can shrink any of the other cells.
-        let spacing = window.pixel_snap(KEY_TABLE_SPACING.to_pixels(window.rem_size()));
-        let min_width = KEY_LABEL_WIDTH
-            + KEY_OWNER_WIDTH
-            + KEY_COLUMN_WIDTH
-            + KEY_STATUS_WIDTH
-            + KEY_EXPIRY_WIDTH
-            + KEY_QUOTA_WIDTH
-            + KEY_TIME_WIDTH * 2.
-            + KEY_ACTIONS_WIDTH
-            + spacing * 10.
-            + px(2.);
+    fn key_table(&self, keys: &[&GatewayKeyRow], cx: &mut Context<Self>) -> Div {
         let mut table = gpui::div()
             .flex()
             .flex_col()
-            .min_w(min_width)
             .rounded_md()
             .border_1()
             .border_color(cx.theme().border);
@@ -853,33 +835,37 @@ impl GatewayKeysPage {
             gpui::div()
                 .flex()
                 .items_center()
-                .gap(KEY_TABLE_SPACING)
-                .px(KEY_TABLE_SPACING)
+                .gap(KEY_TABLE_GAP)
+                .px(KEY_TABLE_PADDING)
                 .py_2()
                 .border_b_1()
                 .border_color(cx.theme().border)
                 .text_size(px(12.))
                 .text_color(cx.theme().muted_foreground)
-                .child(gpui::div().w(KEY_LABEL_WIDTH).child("Label"))
-                .child(gpui::div().w(KEY_OWNER_WIDTH).child("归属"))
+                .child(gpui::div().w(KEY_LABEL_WIDTH).flex_none().child("Label"))
+                .child(gpui::div().w(KEY_OWNER_WIDTH).flex_none().child("归属"))
                 .child(gpui::div().w(KEY_COLUMN_WIDTH).flex_none().child("Key"))
-                .child(gpui::div().w(KEY_STATUS_WIDTH).child("状态"))
-                .child(gpui::div().w(KEY_EXPIRY_WIDTH).child("过期时间"))
-                .child(gpui::div().w(KEY_QUOTA_WIDTH).child("已用 / 额度"))
-                .child(gpui::div().w(KEY_TIME_WIDTH).child("创建时间"))
-                .child(gpui::div().w(KEY_TIME_WIDTH).child("最后使用"))
-                .child(gpui::div().w(KEY_ACTIONS_WIDTH).child("操作")),
+                .child(gpui::div().w(KEY_STATUS_WIDTH).flex_none().child("状态"))
+                .child(
+                    gpui::div()
+                        .w(KEY_EXPIRY_WIDTH)
+                        .flex_none()
+                        .child("过期时间"),
+                )
+                .child(
+                    gpui::div()
+                        .w(KEY_QUOTA_WIDTH)
+                        .flex_none()
+                        .child("已用 / 额度"),
+                )
+                .child(gpui::div().w(KEY_TIME_WIDTH).flex_none().child("创建时间"))
+                .child(gpui::div().w(KEY_TIME_WIDTH).flex_none().child("最后使用"))
+                .child(gpui::div().w(KEY_ACTIONS_WIDTH).flex_none().child("操作")),
         );
         for key in keys {
             table = table.child(self.key_row(key, cx));
         }
-        gpui::div()
-            .id("key-table-viewport")
-            .w_full()
-            .min_w(px(0.))
-            .overflow_x_scroll()
-            .restrict_scroll_to_axis()
-            .child(table)
+        table
     }
 
     fn key_row(&self, key: &GatewayKeyRow, cx: &mut Context<Self>) -> Div {
@@ -901,8 +887,8 @@ impl GatewayKeysPage {
         gpui::div()
             .flex()
             .items_center()
-            .gap(KEY_TABLE_SPACING)
-            .px(KEY_TABLE_SPACING)
+            .gap(KEY_TABLE_GAP)
+            .px(KEY_TABLE_PADDING)
             .py_2()
             .border_b_1()
             .border_color(cx.theme().border.opacity(0.5))
@@ -910,12 +896,14 @@ impl GatewayKeysPage {
             .child(
                 gpui::div()
                     .w(KEY_LABEL_WIDTH)
+                    .flex_none()
                     .text_color(cx.theme().foreground)
                     .child(key.label.clone()),
             )
             .child(
                 gpui::div()
                     .w(KEY_OWNER_WIDTH)
+                    .flex_none()
                     .text_color(cx.theme().muted_foreground)
                     .child(key.login.clone()),
             )
@@ -932,12 +920,14 @@ impl GatewayKeysPage {
             .child(
                 gpui::div()
                     .w(KEY_STATUS_WIDTH)
+                    .flex_none()
                     .text_color(status_color)
                     .child(status_text),
             )
             .child(
                 gpui::div()
                     .w(KEY_EXPIRY_WIDTH)
+                    .flex_none()
                     .text_color(if expired {
                         cx.theme().danger
                     } else {
@@ -951,6 +941,7 @@ impl GatewayKeysPage {
             .child(
                 gpui::div()
                     .w(KEY_QUOTA_WIDTH)
+                    .flex_none()
                     .text_color(if used_up {
                         cx.theme().danger
                     } else {
@@ -961,12 +952,14 @@ impl GatewayKeysPage {
             .child(
                 gpui::div()
                     .w(KEY_TIME_WIDTH)
+                    .flex_none()
                     .text_color(cx.theme().muted_foreground)
                     .child(display_time(key.created_at)),
             )
             .child(
                 gpui::div()
                     .w(KEY_TIME_WIDTH)
+                    .flex_none()
                     .text_color(cx.theme().muted_foreground)
                     .child(
                         key.last_used_at
@@ -976,6 +969,7 @@ impl GatewayKeysPage {
             .child(
                 gpui::div()
                     .w(KEY_ACTIONS_WIDTH)
+                    .flex_none()
                     .flex()
                     .items_center()
                     .gap_1()
@@ -1060,7 +1054,7 @@ impl GatewayKeysPage {
 }
 
 impl Render for GatewayKeysPage {
-    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let mut content = gpui::div().flex().flex_col().gap_4();
 
         if let Some(editor) = self.editor_card(cx) {
@@ -1089,12 +1083,15 @@ impl Render for GatewayKeysPage {
                     content =
                         content.child(empty_card("没有匹配的 Key", "换个用户或搜索词试试。", cx));
                 } else {
-                    content = content.child(self.key_table(&visible, window, cx));
+                    content = content.child(self.key_table(&visible, cx));
                 }
             }
         }
 
-        page_frame("", "", cx).child(content)
+        // GPUI otherwise remaps horizontal wheel input to vertical scrolling.
+        page_frame("", "", cx)
+            .restrict_scroll_to_axis()
+            .child(content)
     }
 }
 
