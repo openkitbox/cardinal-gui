@@ -40,8 +40,11 @@ use gpui::{
     IntoElement, ParentElement, Render, Styled, Window, prelude::FluentBuilder as _,
 };
 use gpui_kit::assets::IconName;
+use gpui_kit::component::IndexPath;
 use gpui_kit::component::button::{Button, ButtonVariant};
+use gpui_kit::component::combobox::{ComboboxEvent, ComboboxState};
 use gpui_kit::component::input::{InputEvent, InputState, TextareaState};
+use gpui_kit::component::searchable_list::SearchableVec;
 use gpui_kit::component::{Disableable, Icon, Sizable, WindowExt};
 
 use gateway::admin_ops::Bootstrap;
@@ -58,7 +61,7 @@ use gateway::store::{KeyGroupView, ProviderInput, ProviderKeyView, ProviderRow, 
 use gateway::upstream::Dns;
 use jiff::Timestamp;
 
-use cards::CardDrag;
+use cards::{CardDrag, ProviderPickerItem, provider_picker_items, provider_picker_selection};
 use catalog::{
     AccountLogin, PROTOCOL_CHOICES, PROVIDER_SPECS, ProtocolChoice, ProviderSpec, Region,
     is_custom, protocol_choice, resolve,
@@ -331,6 +334,7 @@ struct KeyForm {
     /// Which credential the form writes for a vendor that offers both: the
     /// console login (default) or a pasted API key.
     credential_mode: CredentialMode,
+    provider_picker: Entity<ComboboxState<SearchableVec<ProviderPickerItem>>>,
     /// Optional per-key concurrency cap (empty = 不限).
     max_concurrency: Entity<InputState>,
     /// Optional per-key HTTPS/SOCKS5 egress proxy. Empty = no proxy; the
@@ -1751,6 +1755,30 @@ impl ProvidersPage {
         let focus = label.read(cx).focus_handle(cx);
         window.focus(&focus, cx);
         let source = FormSource::Catalog(0);
+        let provider_picker = cx.new(|cx| {
+            ComboboxState::new(
+                SearchableVec::new(provider_picker_items()),
+                vec![IndexPath::default()],
+                window,
+                cx,
+            )
+            .searchable(true)
+            .multiple(false)
+        });
+        cx.subscribe_in(
+            &provider_picker,
+            window,
+            |page, _, event: &ComboboxEvent<SearchableVec<ProviderPickerItem>>, window, cx| {
+                let ComboboxEvent::Confirm(values) = event else {
+                    return;
+                };
+                let Some(source) = values.first().copied() else {
+                    return;
+                };
+                page.select_form_provider(provider_picker_selection(source), window, cx);
+            },
+        )
+        .detach();
         self.key_form = Some(KeyForm {
             source,
             // Region/plan intentionally survive switching between vendors: they act
@@ -1765,6 +1793,7 @@ impl ProvidersPage {
             kiro_import: None,
             login: source.login_form(self.form_generation),
             credential_mode: CredentialMode::AccountLogin,
+            provider_picker,
             max_concurrency,
             proxy_url,
             probed_models: None,
@@ -1799,6 +1828,9 @@ impl ProvidersPage {
             return;
         };
         form.source = source;
+        form.provider_picker.update(cx, |picker, cx| {
+            picker.set_selected_values(&[provider_picker_selection(source)], window, cx);
+        });
         form.probed_models = None;
         form.selected_models.clear();
         form.probing = false;

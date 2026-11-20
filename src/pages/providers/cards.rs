@@ -8,13 +8,16 @@ use std::sync::Arc;
 
 use gpui::{
     Anchor, App, AppContext as _, Context, Div, ElementId, Entity, Image, ImageFormat,
-    InteractiveElement, IntoElement, ParentElement, Render, StatefulInteractiveElement, Styled,
-    WeakEntity, Window, img, prelude::FluentBuilder as _, px, relative,
+    InteractiveElement, IntoElement, ParentElement, Render, SharedString,
+    StatefulInteractiveElement, Styled, WeakEntity, Window, img, prelude::FluentBuilder as _, px,
+    relative,
 };
 use gpui_kit::assets::IconName;
 use gpui_kit::component::button::{Button, ButtonVariants};
+use gpui_kit::component::combobox::{Caret, Combobox};
 use gpui_kit::component::input::{Input, InputState, Textarea};
 use gpui_kit::component::menu::{DropdownMenu, PopupMenu, PopupMenuItem};
+use gpui_kit::component::searchable_list::SearchableListItem;
 use gpui_kit::component::tag::Tag;
 use gpui_kit::component::{ActiveTheme, Disableable, Icon, Sizable};
 use jiff::Timestamp;
@@ -53,6 +56,67 @@ const KEY_CARD_WIDTH: f32 = 268.;
 /// 「其他模型 N 个」 hint line.
 const KEY_MODEL_ROWS: usize = 2;
 
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(super) struct ProviderPickerItem {
+    pub(super) source: FormSource,
+}
+
+pub(super) fn provider_picker_items() -> Vec<ProviderPickerItem> {
+    PROVIDER_SPECS
+        .iter()
+        .enumerate()
+        .map(|(index, _)| ProviderPickerItem {
+            source: FormSource::Catalog(index),
+        })
+        .chain(std::iter::once(ProviderPickerItem {
+            source: FormSource::Custom {
+                protocol: PROTOCOL_CHOICES[0],
+            },
+        }))
+        .collect()
+}
+
+pub(super) fn provider_picker_selection(source: FormSource) -> FormSource {
+    match source {
+        FormSource::Catalog(index) => FormSource::Catalog(index),
+        FormSource::Custom { .. } => FormSource::Custom {
+            protocol: PROTOCOL_CHOICES[0],
+        },
+    }
+}
+
+impl SearchableListItem for ProviderPickerItem {
+    type Value = FormSource;
+
+    fn title(&self) -> SharedString {
+        match self.source {
+            FormSource::Catalog(index) => PROVIDER_SPECS[index].display.into(),
+            FormSource::Custom { .. } => "自定义".into(),
+        }
+    }
+
+    fn value(&self) -> &Self::Value {
+        &self.source
+    }
+
+    fn render(&self, _: &mut Window, cx: &mut App) -> impl IntoElement {
+        provider_picker_item(self, 16., cx)
+    }
+}
+
+fn provider_picker_item(item: &ProviderPickerItem, height: f32, cx: &App) -> Div {
+    let icon = match item.source {
+        FormSource::Catalog(index) => provider_icon(&PROVIDER_SPECS[index], height, cx),
+        FormSource::Custom { .. } => letter_tile("自", height, cx),
+    };
+    gpui::div()
+        .flex()
+        .items_center()
+        .gap_2()
+        .child(icon)
+        .child(item.title())
+}
+
 impl ProvidersPage {
     /// The add-key form card: provider picker (catalog), label, credential,
     /// concurrency cap.
@@ -84,87 +148,32 @@ impl ProvidersPage {
                 gpui::div()
                     .flex()
                     .items_center()
-                    .flex_wrap()
-                    .gap_1()
+                    .gap_2()
                     .child(field_label("Provider", cx))
-                    .children(PROVIDER_SPECS.iter().enumerate().map(|(index, spec)| {
-                        let selected = form.source == FormSource::Catalog(index);
-                        gpui::div()
-                            .id(("key-form-provider", index))
-                            .flex()
-                            .items_center()
-                            .gap_1()
-                            .rounded_md()
-                            .border_1()
-                            .px_2()
-                            .py_1()
-                            .cursor_pointer()
-                            .border_color(if selected {
-                                cx.theme().primary
-                            } else {
-                                cx.theme().border
-                            })
-                            .when(selected, |this| this.bg(cx.theme().accent))
-                            .hover(|style| style.bg(cx.theme().secondary_hover))
-                            .on_click(cx.listener(move |this, _, window, cx| {
-                                if this.key_form.as_ref().is_some_and(|form| !form.saving) {
-                                    this.select_form_provider(
-                                        FormSource::Catalog(index),
-                                        window,
-                                        cx,
-                                    );
-                                }
-                            }))
-                            .child(provider_icon(spec, 14., cx))
-                            .child(
+                    .child(
+                        Combobox::new(&form.provider_picker)
+                            .placeholder("选择 Provider")
+                            .search_placeholder("搜索 Provider")
+                            .disabled(form.saving)
+                            .render_trigger(|trigger, _, cx| {
+                                let selected = trigger.selection().first().map(|(_, item)| item);
                                 gpui::div()
-                                    .text_size(px(12.))
-                                    .text_color(cx.theme().foreground)
-                                    .child(spec.display),
-                            )
-                    }))
-                    .child({
-                        let selected = matches!(form.source, FormSource::Custom { .. });
-                        gpui::div()
-                            .id("key-form-provider-custom")
-                            .flex()
-                            .items_center()
-                            .gap_1()
-                            .rounded_md()
-                            .border_1()
-                            .px_2()
-                            .py_1()
-                            .cursor_pointer()
-                            .border_color(if selected {
-                                cx.theme().primary
-                            } else {
-                                cx.theme().border
+                                    .flex()
+                                    .items_center()
+                                    .gap_2()
+                                    .w_full()
+                                    .when_some(selected, |this, item| {
+                                        this.child(provider_picker_item(item, 16., cx))
+                                    })
+                                    .when(selected.is_none(), |this| {
+                                        this.text_color(cx.theme().muted_foreground)
+                                            .child("选择 Provider")
+                                    })
+                                    .child(Caret::new(trigger.size()))
+                                    .into_any_element()
                             })
-                            .when(selected, |this| this.bg(cx.theme().accent))
-                            .hover(|style| style.bg(cx.theme().secondary_hover))
-                            .on_click(cx.listener(|this, _, window, cx| {
-                                let Some(form) = this.key_form.as_ref().filter(|f| !f.saving)
-                                else {
-                                    return;
-                                };
-                                if matches!(form.source, FormSource::Custom { .. }) {
-                                    return;
-                                }
-                                this.select_form_provider(
-                                    FormSource::Custom {
-                                        protocol: PROTOCOL_CHOICES[0],
-                                    },
-                                    window,
-                                    cx,
-                                );
-                            }))
-                            .child(
-                                gpui::div()
-                                    .text_size(px(12.))
-                                    .text_color(cx.theme().foreground)
-                                    .child("自定义"),
-                            )
-                    }),
+                            .w(px(240.)),
+                    ),
             )
             // 自定义 provider：协议/DNS 单选 + base_url；label 兼作 provider 名。
             .when_some(
@@ -2421,4 +2430,41 @@ fn variant_marker(text: &'static str, cx: &App) -> Div {
         .border_color(cx.theme().accent)
         .text_color(cx.theme().muted_foreground)
         .child(text)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn provider_picker_items_keep_catalog_order_and_custom_last() {
+        let items = provider_picker_items();
+
+        assert_eq!(items.len(), PROVIDER_SPECS.len() + 1);
+        assert!(
+            items
+                .iter()
+                .take(PROVIDER_SPECS.len())
+                .enumerate()
+                .all(|(index, item)| item.source == FormSource::Catalog(index))
+        );
+        assert_eq!(
+            items.last().map(|item| item.source),
+            Some(FormSource::Custom {
+                protocol: PROTOCOL_CHOICES[0],
+            })
+        );
+        assert_eq!(
+            items.last().map(|item| item.title().to_string()),
+            Some("自定义".to_owned())
+        );
+        assert_eq!(
+            provider_picker_selection(FormSource::Custom {
+                protocol: PROTOCOL_CHOICES[1],
+            }),
+            FormSource::Custom {
+                protocol: PROTOCOL_CHOICES[0],
+            }
+        );
+    }
 }
