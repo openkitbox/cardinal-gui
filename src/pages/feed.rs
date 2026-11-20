@@ -14,8 +14,12 @@
 //! caller ids) matches only [`UsageScope::All`].
 
 use std::borrow::Cow;
+use std::time::Duration;
 
-use gpui::{App, Div, Entity, Hsla, ParentElement, Styled, px};
+use gpui::{
+    Animation, AnimationExt as _, App, Div, ElementId, Entity, Hsla, InteractiveElement,
+    ParentElement, Styled, px,
+};
 use gpui_kit::component::{ActiveTheme, Theme};
 
 use gateway::activity::{EndMetrics, EndStatus};
@@ -41,6 +45,16 @@ const FEED_LIMIT: usize = 17;
 pub(crate) enum FeedRow {
     Live(LiveAttempt),
     Settled(SettledAttempt),
+}
+
+impl FeedRow {
+    fn element_id(&self) -> ElementId {
+        let (origin, seq) = match self {
+            Self::Live(attempt) => (attempt.origin, attempt.seq),
+            Self::Settled(attempt) => (attempt.origin, attempt.seq),
+        };
+        format!("activity-row-{origin}-{seq}").into()
+    }
 }
 
 /// Whether an attempt by this caller belongs in a feed scoped that way. A
@@ -117,7 +131,14 @@ pub(crate) fn feed_card(feed: &Entity<ActivityFeed>, scope: UsageScope, cx: &App
         );
     } else {
         for row in &rows {
-            body = body.child(feed_row(row, cx));
+            let id = row.element_id();
+            let animation_id: ElementId = format!("activity-row-fade-{id}").into();
+            let row = feed_row(row, cx).id(id).with_animation(
+                animation_id,
+                Animation::new(Duration::from_millis(120)),
+                |row, progress| row.opacity(progress),
+            );
+            body = body.child(row);
         }
     }
     // The body is the card's only child — no header row.

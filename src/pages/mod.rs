@@ -28,7 +28,7 @@ pub use usage::UsagePage;
 pub use users::UsersPage;
 
 use gpui::{
-    AnyWindowHandle, App, ClickEvent, Context, Div, InteractiveElement, ParentElement,
+    AnyWindowHandle, App, ClickEvent, Context, Div, InteractiveElement, IntoElement, ParentElement,
     SharedString, Stateful, StatefulInteractiveElement, Styled, Window, px,
 };
 use gpui_kit::assets::IconName;
@@ -36,6 +36,7 @@ use gpui_kit::component::button::{Button, ButtonVariants as _};
 use gpui_kit::component::input::Input;
 use gpui_kit::component::notification::Notification;
 use gpui_kit::component::spinner::Spinner;
+use gpui_kit::component::tab::{Tab, TabBar};
 use gpui_kit::component::{ActiveTheme, Icon, Sizable, WindowExt};
 
 /// Async load lifecycle shared by the dashboard pages: first render kicks off
@@ -195,51 +196,28 @@ pub(crate) fn empty_card(title: &'static str, hint: impl Into<String>, cx: &App)
         )
 }
 
-/// Segmented control: a pill track with the active option on a raised
-/// thumb. `on_pick` runs on the page when an option is clicked.
+/// Segmented control backed by GPUI Kit's animated tab indicator.
 pub(crate) fn segmented<P: 'static, T: Copy + Eq + 'static>(
     id_prefix: &'static str,
     options: &[(T, &'static str)],
     current: T,
     cx: &mut Context<P>,
     on_pick: impl Fn(&mut P, T, &mut Context<P>) + Copy + 'static,
-) -> Div {
-    let mut track = gpui::div()
-        .flex()
-        .flex_shrink_0()
-        .p(px(2.))
-        .rounded(px(7.))
-        .bg(cx.theme().muted);
-    for (index, &(value, label)) in options.iter().enumerate() {
-        let on = value == current;
-        let foreground = cx.theme().foreground;
-        let mut option = gpui::div()
-            .id(gpui::ElementId::NamedInteger(
-                id_prefix.into(),
-                index as u64,
-            ))
-            .h(px(22.))
-            .px(px(10.))
-            .flex()
-            .items_center()
-            .rounded(px(5.))
-            .text_size(px(12.))
-            .cursor_pointer()
-            .text_color(if on {
-                foreground
-            } else {
-                cx.theme().muted_foreground
-            })
-            .child(label);
-        if on {
-            option = option.bg(cx.theme().popover).shadow_sm();
-        } else {
-            option = option.hover(move |style| style.text_color(foreground));
-        }
-        track = track
-            .child(option.on_click(cx.listener(move |page, _, _, cx| on_pick(page, value, cx))));
-    }
-    track
+) -> impl IntoElement {
+    let selected_index = options
+        .iter()
+        .position(|(value, _)| *value == current)
+        .unwrap_or(0);
+    let on_pick = std::rc::Rc::new(on_pick);
+    TabBar::new(id_prefix)
+        .segmented()
+        .selected_index(selected_index)
+        .children(options.iter().map(|&(value, label)| {
+            let on_pick = std::rc::Rc::clone(&on_pick);
+            Tab::new()
+                .label(label)
+                .on_click(cx.listener(move |page, _, _, cx| on_pick(page, value, cx)))
+        }))
 }
 
 /// Fixed-width dimmed label at the start of an editor row.

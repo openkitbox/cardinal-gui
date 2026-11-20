@@ -105,7 +105,7 @@ impl ProvidersPage {
                                 cx.theme().border
                             })
                             .when(selected, |this| this.bg(cx.theme().accent))
-                            .hover(|style| style.bg(cx.theme().accent))
+                            .hover(|style| style.bg(cx.theme().secondary_hover))
                             .on_click(cx.listener(move |this, _, window, cx| {
                                 if this.key_form.as_ref().is_some_and(|form| !form.saving) {
                                     this.select_form_provider(
@@ -141,7 +141,7 @@ impl ProvidersPage {
                                 cx.theme().border
                             })
                             .when(selected, |this| this.bg(cx.theme().accent))
-                            .hover(|style| style.bg(cx.theme().accent))
+                            .hover(|style| style.bg(cx.theme().secondary_hover))
                             .on_click(cx.listener(|this, _, window, cx| {
                                 let Some(form) = this.key_form.as_ref().filter(|f| !f.saving)
                                 else {
@@ -266,7 +266,7 @@ impl ProvidersPage {
                                         cx.theme().border
                                     })
                                     .when(selected, |this| this.bg(cx.theme().accent))
-                                    .hover(|style| style.bg(cx.theme().accent))
+                                    .hover(|style| style.bg(cx.theme().secondary_hover))
                                     .on_click(cx.listener(move |this, _, _, cx| {
                                         if let Some(form) = &mut this.key_form
                                             && !form.saving
@@ -302,7 +302,7 @@ impl ProvidersPage {
                                         cx.theme().border
                                     })
                                     .when(selected, |this| this.bg(cx.theme().accent))
-                                    .hover(|style| style.bg(cx.theme().accent))
+                                    .hover(|style| style.bg(cx.theme().secondary_hover))
                                     .on_click(cx.listener(|this, _, _, cx| {
                                         if let Some(form) = &mut this.key_form
                                             && !form.saving

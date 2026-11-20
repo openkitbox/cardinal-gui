@@ -4,7 +4,10 @@
 //! the tab bar highlight and this page stay in sync without cross-entity
 //! calls; this container only renders whichever child is active.
 
+use std::time::Duration;
+
 use gpui::{AppContext as _, Context, Entity, IntoElement, ParentElement, Render, Styled, Window};
+use gpui_kit::base::{Presence, Transition};
 use gpui_kit::component::tab::{Tab, TabBar};
 
 use crate::app::{AppState, StatusTab};
@@ -30,6 +33,7 @@ pub struct StatusPage {
     /// snapshot reloads silently (`begin_load` keeps the old data on screen —
     /// no flicker) so a freshly shown tab is never stale.
     active_tab: Option<StatusTab>,
+    content_epoch: u64,
 }
 
 impl StatusPage {
@@ -77,6 +81,9 @@ impl StatusPage {
     #[cfg(feature = "screenshot-test")]
     #[doc(hidden)]
     pub(crate) fn activate_tab_for_screenshot(&mut self, tab: StatusTab, cx: &mut Context<Self>) {
+        if self.active_tab != Some(tab) {
+            self.content_epoch = self.content_epoch.wrapping_add(1);
+        }
         self.active_tab = Some(tab);
         self.set_child_active(tab, cx);
         self.refresh_child(tab, cx);
@@ -94,6 +101,7 @@ impl StatusPage {
             let active = Some(state.read(cx).status_tab);
             if page.active_tab != active {
                 page.active_tab = active;
+                page.content_epoch = page.content_epoch.wrapping_add(1);
                 if let Some(tab) = active {
                     page.set_child_active(tab, cx);
                     page.refresh_child(tab, cx);
@@ -124,6 +132,7 @@ impl StatusPage {
             settings: cx.new(|cx| SettingsPage::new(window, cx)),
             state,
             active_tab: None,
+            content_epoch: 0,
         };
         this.active_tab = Some(StatusTab::Usage);
         this.set_child_active(StatusTab::Usage, cx);
@@ -163,7 +172,7 @@ impl StatusPage {
 }
 
 impl Render for StatusPage {
-    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let tab = self.state.read(cx).status_tab;
         let state = self.state.clone();
         // Per-tab actions render right-aligned in the tab row; each page
@@ -186,6 +195,9 @@ impl Render for StatusPage {
             StatusTab::Keys => self.keys.clone().into_any_element(),
             StatusTab::Settings => self.settings.clone().into_any_element(),
         };
+        let presence = Presence::new(format!("status-content-{}", self.content_epoch), true)
+            .transition(Transition::new(Duration::from_millis(120)))
+            .sample(window, cx);
 
         gpui::div()
             .flex()
@@ -230,7 +242,12 @@ impl Render for StatusPage {
                     .flex_1()
                     .min_h_0()
                     .overflow_hidden()
-                    .child(content),
+                    .child(
+                        gpui::div()
+                            .size_full()
+                            .opacity(presence.progress)
+                            .child(content),
+                    ),
             )
     }
 }

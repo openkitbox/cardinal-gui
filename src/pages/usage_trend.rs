@@ -20,6 +20,7 @@ use gpui::{
     TextRun, Window, canvas, div, point, prelude::FluentBuilder as _, px, relative,
 };
 use gpui_kit::component::ActiveTheme;
+use gpui_kit::component::tab::{Tab, TabBar};
 
 use crate::fmt::{humanize_count_overview, usd_microus};
 use crate::pages::card;
@@ -794,8 +795,7 @@ impl UsagePage {
     }
 }
 
-/// Segmented control: a pill track, the active option on a
-/// raised thumb.
+/// Segmented control backed by GPUI Kit's animated tab indicator.
 fn segs<T: Copy + Eq + 'static>(
     id_prefix: &'static str,
     options: impl Iterator<Item = (T, &'static str)>,
@@ -803,35 +803,19 @@ fn segs<T: Copy + Eq + 'static>(
     cx: &mut Context<UsagePage>,
     on_pick: impl Fn(&mut UsagePage, T, &mut Context<UsagePage>) + 'static + Copy,
 ) -> impl IntoElement {
-    let theme = cx.theme();
-    let mut track = div().flex().p(px(2.)).rounded(px(7.)).bg(theme.muted);
-    for (i, (value, label)) in options.enumerate() {
-        let on = value == current;
-        let mut option = div()
-            .id(ElementId::Name(format!("{id_prefix}-{i}").into()))
-            .h(px(22.))
-            .px(px(10.))
-            .flex()
-            .items_center()
-            .rounded(px(5.))
-            .text_size(px(12.))
-            .cursor_pointer()
-            .text_color(if on {
-                theme.foreground
-            } else {
-                theme.muted_foreground
-            })
-            .when(!on, |option| {
-                option.hover(|s| s.text_color(theme.foreground))
-            })
-            .child(label);
-        if on {
-            option = option.bg(theme.popover).shadow_sm();
-        }
-        track = track
-            .child(option.on_click(cx.listener(move |page, _, _, cx| on_pick(page, value, cx))));
-    }
-    track
+    let options: Vec<(T, &'static str)> = options.collect();
+    let selected_index = options
+        .iter()
+        .position(|(value, _)| *value == current)
+        .unwrap_or(0);
+    TabBar::new(id_prefix)
+        .segmented()
+        .selected_index(selected_index)
+        .children(options.into_iter().map(|(value, label)| {
+            Tab::new()
+                .label(label)
+                .on_click(cx.listener(move |page, _, _, cx| on_pick(page, value, cx)))
+        }))
 }
 
 /// Chart prepaint: compute geometry (stored for the mouse handlers), shape

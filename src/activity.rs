@@ -381,6 +381,9 @@ pub(crate) const SETTLED_CAP: usize = 256;
 /// One in-flight relay attempt (one ledger row once it settles).
 #[derive(Clone)]
 pub(crate) struct LiveAttempt {
+    /// Gateway identity shared by the live and settled projections.
+    pub origin: u32,
+    pub seq: u64,
     pub client_model: String,
     /// Route alias when the client hit a route (None = direct provider/model).
     pub route: Option<String>,
@@ -430,6 +433,8 @@ impl LiveAttempt {
     /// just calls it.
     fn into_settled(self, status: EndStatus, metrics: EndMetrics, now: Instant) -> SettledAttempt {
         SettledAttempt {
+            origin: self.origin,
+            seq: self.seq,
             client_model: self.client_model,
             route: self.route,
             account: self.account,
@@ -452,6 +457,9 @@ impl LiveAttempt {
 /// (the 请求 page owns the full record).
 #[derive(Clone)]
 pub(crate) struct SettledAttempt {
+    /// Gateway identity inherited from the live attempt.
+    pub origin: u32,
+    pub seq: u64,
     /// Model id as the client sent it (route alias or `provider/model`).
     pub client_model: String,
     /// Route alias when the client hit a route (None = direct provider/model).
@@ -921,6 +929,8 @@ fn apply_to(
             live.insert(
                 (origin, seq),
                 LiveAttempt {
+                    origin,
+                    seq,
                     client_model,
                     route,
                     account,
