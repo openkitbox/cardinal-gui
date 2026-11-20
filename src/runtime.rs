@@ -30,6 +30,8 @@ use gateway::activity::ActivityReceiver;
 use gateway::http_client::{GatewayHttpClient, UNREACHABLE_MESSAGE};
 use tokio::sync::watch;
 
+use crate::portal_settings::PortalApi;
+
 pub(crate) enum ActivitySubscription {
     Acquired(ActivityReservation),
     Busy,
@@ -111,6 +113,10 @@ pub(crate) struct GatewayRuntime {
     /// process), built once on the admin runtime. `None` only on a failed
     /// runtime.
     client: Option<GatewayHttpClient>,
+    /// Admin client for the DB-backed portal settings endpoints. Built on the
+    /// same admin runtime as `client`; the settings page reaches it through
+    /// `admin_call` so the startup link state still gates every request.
+    portal: Option<PortalApi>,
     /// Base URL of the relay (`http(s)://{listen}`) for the chat panel.
     chat_url: String,
     /// Startup probe state. The admin runtime drives it; pages clone the
@@ -144,6 +150,7 @@ fn failed(message: String) -> GatewayRuntime {
     GatewayRuntime {
         handle: None,
         client: None,
+        portal: None,
         chat_url: String::new(),
         link,
         link_tx: None,
@@ -208,10 +215,11 @@ pub(crate) fn spawn(config: gateway::config::Config) -> GatewayRuntime {
     let build_config = config.clone();
     drop(handle.spawn(async move {
         let client = GatewayHttpClient::new(&build_config.listen, &build_config.gateway_key);
-        let _ = client_tx.send(client);
+        let portal = PortalApi::new(&build_config.listen, &build_config.gateway_key);
+        let _ = client_tx.send((client, portal));
     }));
-    let client = match client_rx.recv_timeout(Duration::from_secs(10)) {
-        Ok(client) => client,
+    let (client, portal) = match client_rx.recv_timeout(Duration::from_secs(10)) {
+        Ok(clients) => clients,
         Err(_) => return failed("timed out building the gateway client".to_string()),
     };
 
@@ -222,6 +230,7 @@ pub(crate) fn spawn(config: gateway::config::Config) -> GatewayRuntime {
     GatewayRuntime {
         handle: Some(handle),
         client: Some(client),
+        portal: Some(portal),
         chat_url,
         link,
         link_tx: Some(link_tx),
@@ -431,6 +440,11 @@ impl GatewayRuntime {
                 _ => Err(UNREACHABLE_MESSAGE.to_string()),
             }
         }
+    }
+
+    /// The portal-settings admin client, cloned for use inside `admin_call`.
+    pub(crate) fn portal(&self) -> Option<PortalApi> {
+        self.portal.clone()
     }
 
     /// The gateway's base URL (for the settings page).
