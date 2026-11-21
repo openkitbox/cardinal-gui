@@ -16,12 +16,16 @@ use std::{
     time::Duration,
 };
 
-/// A path → JSON body map plus the first SSE frame pushed on `/api/activity`.
+/// A path → JSON body map plus the SSE frames pushed on `/api/activity`.
 pub(crate) struct MockRoutes {
     pub bodies: HashMap<String, String>,
     /// The `data:` payload of the first activity frame (a serialized
     /// `ActivityEvent::Bootstrap`). Sent once, then the stream is held open.
     pub bootstrap_event: String,
+    /// An optional second frame (e.g. a serialized `ActivityEvent::Start`),
+    /// sent immediately after the bootstrap frame. None keeps the original
+    /// one-frame behavior.
+    pub live_event: Option<String>,
 }
 
 /// A loopback fixture server. Dropping it stops the accept loop.
@@ -143,7 +147,11 @@ fn serve(
     seen.lock().expect("mock seen lock").push(path.clone());
 
     if path == "/api/activity" {
-        serve_sse(stream, &routes.bootstrap_event);
+        serve_sse(
+            stream,
+            &routes.bootstrap_event,
+            routes.live_event.as_deref(),
+        );
         return;
     }
 
@@ -163,7 +171,7 @@ fn serve(
     let _ = stream.flush();
 }
 
-fn serve_sse(stream: &mut std::net::TcpStream, bootstrap_event: &str) {
+fn serve_sse(stream: &mut std::net::TcpStream, bootstrap_event: &str, live_event: Option<&str>) {
     // SSE is long-lived: the generic per-connection read timeout would close
     // it and trigger an endless reconnect/reseed loop in the GUI.
     let _ = stream.set_read_timeout(None);
@@ -177,6 +185,12 @@ fn serve_sse(stream: &mut std::net::TcpStream, bootstrap_event: &str) {
     let frame = format!("data: {bootstrap_event}\n\n");
     if stream.write_all(header.as_bytes()).is_err() || stream.write_all(frame.as_bytes()).is_err() {
         return;
+    }
+    if let Some(live_event) = live_event {
+        let frame = format!("data: {live_event}\n\n");
+        if stream.write_all(frame.as_bytes()).is_err() {
+            return;
+        }
     }
     if stream.flush().is_err() {
         return;

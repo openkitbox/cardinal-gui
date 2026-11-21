@@ -1,12 +1,12 @@
-//! Routes page: the live stage IS the route list — caller nodes → hub →
-//! every route's entries stacked as sections in dispatch order, with dashed
-//! wires flowing while a call is in flight. Management happens in manage
-//! mode (tab-row 管理 toggle): inline ▲▼/✕ on entry rows, per-section
-//! 编辑/删除 actions (the modal editor covers deep edits: labels, caps,
-//! windows, context window, adding models). Read/write through the embedded
-//! headless gateway.
+//! Routes page: one card with a live summary, a client → gateway chain on the
+//! left and a timeline of route groups on the right. Management happens in
+//! manage mode (tab-row 管理 toggle): inline ▲▼/暂停/✕ on entry rows,
+//! per-section 编辑/删除 actions (the modal editor covers deep edits: labels,
+//! caps, windows, context window, adding models). Read/write through the
+//! embedded headless gateway.
 
 mod stage;
+mod stats;
 
 use gpui::{
     AnyWindowHandle, App, AppContext as _, Context, Div, ElementId, Entity, Focusable as _,
@@ -522,6 +522,13 @@ pub struct RoutesPage {
     /// The deadline the current prune timer is armed for; re-arming for the
     /// same deadline keeps the existing timer (no one task per feed event).
     prune_armed_until: Option<std::time::Instant>,
+    /// The client card the operator highlighted. Highlight only — routes are
+    /// gateway-level and shared, so this never filters the route groups.
+    focused_client: Option<String>,
+    /// Aliases whose group card is collapsed. View state only.
+    collapsed: Vec<String>,
+    /// Whether the initial all-collapsed state has been applied for this tab session.
+    collapsed_initialized: bool,
 }
 
 /// A client node lingers this long after its last request, then leaves the
@@ -544,6 +551,9 @@ impl RoutesPage {
             clients: Vec::new(),
             clients_gen: 0,
             prune_armed_until: None,
+            focused_client: None,
+            collapsed: Vec::new(),
+            collapsed_initialized: false,
         };
         // The hub node's subtitle: the relay's listen address, resolved once.
         let relay_mode = cx.global::<GatewayRuntime>().relay_mode();
@@ -604,6 +614,10 @@ impl RoutesPage {
             self.clients_gen += 1;
             self.prune_armed_until = None;
             self.anim_armed = false;
+            self.focused_client = None;
+            self.collapsed.clear();
+            self.collapsed_initialized = false;
+            self.collapsed_initialized = false;
         }
     }
 
@@ -682,6 +696,14 @@ impl RoutesPage {
                 }
                 match result {
                     Ok(data) => {
+                        if !page.collapsed_initialized {
+                            page.collapsed = data
+                                .routes
+                                .iter()
+                                .map(|route| route.alias.clone())
+                                .collect();
+                            page.collapsed_initialized = true;
+                        }
                         page.state = LoadState::Loaded(data);
                         if let Some(handle) = handle {
                             notify_success(handle, cx, "刷新成功");
@@ -2087,19 +2109,18 @@ impl RoutesPage {
 
 impl Render for RoutesPage {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        // No header: the tab bar names the view and the actions live in the tab
-        // row, so the content starts immediately.
+        // The tab bar owns the actions; this small subtitle is the only header.
         let frame = page_frame("", "", cx);
         match &self.state {
             LoadState::Loading => frame.child(loading_card(cx)),
             LoadState::Failed(error) => frame.child(error_card(error, cx)),
             LoadState::Loaded(data) => {
                 let frame = frame
-                    // The stage renders even with no requests yet: an empty recent
-                    // list shows the skeleton (client/cardinal nodes, no wires) so the
-                    // layout is inspectable before any traffic has flowed. Its right
-                    // column IS the route list — every route as a section.
-                    .when_some(self.stage_card(data, cx), |this, stage| this.child(stage));
+                    // The card renders even with no requests yet: the client
+                    // chain shows a placeholder and route groups show their
+                    // real entries, so the layout is inspectable before any
+                    // traffic has flowed.
+                    .when_some(self.stage_card(data, cx), |this, card| this.child(card));
                 frame
                     .when_some(self.editor.as_ref(), |this, editor| {
                         this.child(self.route_editor_card(editor, data, cx))

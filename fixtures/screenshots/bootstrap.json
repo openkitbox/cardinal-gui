@@ -128,7 +128,7 @@
   ],
   "routes": [
     {
-      "alias": "gpt-4o-mini",
+      "alias": "deepseek",
       "entries": [
         { "key_id": 10, "model": "gpt-4o-mini" },
         { "key_id": 11, "model": "gpt-4o-mini" }
@@ -139,12 +139,44 @@
       "efforts": ["low", "medium", "high"]
     },
     {
-      "alias": "claude-sonnet-4-5",
+      "alias": "ertong-fabel",
       "entries": [
-        { "key_id": 12, "model": "claude-sonnet-4-5" }
+        { "key_id": 10, "model": "gpt-4o", "weight": 4 },
+        { "key_id": 12, "model": "claude-sonnet-4-5", "weight": 3 },
+        { "key_id": 11, "model": "gpt-4o-mini", "weight": 1 }
       ],
-      "context_window": 200000,
-      "strategy": "ordered"
+      "context_window": 262144,
+      "strategy": "weighted",
+      "note": "按比例 4 : 3 : 1 分发"
+    },
+    {
+      "alias": "k2-256k",
+      "entries": [
+        { "key_id": 10, "model": "gpt-4o" },
+        { "key_id": 12, "model": "claude-sonnet-4-5" },
+        { "key_id": 11, "model": "gpt-4o-mini" },
+        { "key_id": 13, "model": "gpt-4o" },
+        { "key_id": 13, "model": "claude-sonnet-4-5" },
+        { "key_id": 10, "model": "gpt-4o-mini" }
+      ],
+      "context_window": 600000,
+      "strategy": "rotate",
+      "note": "按额度轮询"
+    },
+    {
+      "alias": "k3-256k",
+      "entries": [
+        { "key_id": 12, "model": "claude-sonnet-4-5" },
+        { "key_id": 10, "model": "gpt-4o-mini", "paused": true },
+        { "key_id": 10, "model": "gpt-4o" },
+        { "key_id": 11, "model": "gpt-4o-mini" },
+        { "key_id": 13, "model": "gpt-4o" },
+        { "key_id": 13, "model": "claude-sonnet-4-5" },
+        { "key_id": 13, "model": "gpt-4o-mini" }
+      ],
+      "context_window": 262144,
+      "strategy": "ordered",
+      "note": "按优先级降级"
     }
   ],
   "rests": [

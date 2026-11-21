@@ -1,16 +1,18 @@
-//! The routes page's live stage: caller nodes → the cardinal hub → every
-//! route's entries stacked as sections, with dashed wires that flow while a
-//! call is in flight. Pure visualization — all reads, no writes; route
-//! management (CRUD, editor, manage mode) lives in the parent module.
+//! The routes page's reference-shaped view: a live summary bar, a left chain
+//! (clients → gateway) and a right timeline of route groups. All displayed
+//! numbers are derived from the current snapshot; route management (CRUD, the
+//! editor, manage mode) lives in the parent module, this module owns the view
+//! and its collapse/focus/drag interactions.
 
-use std::rc::Rc;
+use std::collections::HashSet;
+use std::time::Duration;
 
 use jiff::Timestamp;
+use jiff::tz::TimeZone;
 
 use gpui::{
-    App, AppContext as _, Bounds, Context, Div, ElementId, Hsla, InteractiveElement, ParentElement,
-    PathBuilder, StatefulInteractiveElement, Styled, Window, canvas, point,
-    prelude::FluentBuilder as _, px,
+    App, AppContext as _, Context, Div, ElementId, Hsla, InteractiveElement, ParentElement,
+    StatefulInteractiveElement, Styled, prelude::FluentBuilder as _, px,
 };
 use gpui_kit::assets::IconName;
 use gpui_kit::component::button::{Button, ButtonVariants};
@@ -19,11 +21,20 @@ use gpui_kit::component::{ActiveTheme, Disableable, Icon, Sizable};
 
 use gateway::store::{ActiveWindow, ModelSuccessRow, RestRow, RouteRow, RouteStrategy};
 
-use super::{RouteAccount, RoutesData, RoutesPage};
+use super::{RouteAccount, RoutesData, RoutesPage, stats};
 use crate::activity::{client_hue, named_client};
-use crate::pages::{LoadState, card};
+use crate::pages::LoadState;
 
 const CLIENT_LINGER: std::time::Duration = std::time::Duration::from_secs(300);
+/// The single window behind the request-per-minute and average-latency figures.
+const WINDOW: Duration = Duration::from_secs(60);
+/// Left chain width, from the reference layout.
+const CHAIN_W: f32 = 218.;
+/// Entry rows keep a fixed height so the drag insertion line needs no measuring.
+const ENTRY_H: f32 = 40.;
+const ENTRY_GAP: f32 = 7.;
+/// Width of the distribution bar track in the left chain.
+const BAR_W: f32 = 70.;
 
 /// Human-readable window text: 工作日/周…/HH:MM~HH:MM (whole-day with days
 /// shows only the days).
@@ -33,7 +44,7 @@ fn describe_window(window: &ActiveWindow) -> String {
         .as_ref()
         .filter(|days| !days.is_empty())
         .map(|days| {
-            // 1..=5 → "工作日" (the common case), otherwise "周一周四"-style.
+            // 1..=5 → "工作日" (the common case), otherwise "周一"-style.
             if days == &[1, 2, 3, 4, 5] {
                 "工作日".to_string()
             } else {
@@ -58,7 +69,7 @@ fn describe_window(window: &ActiveWindow) -> String {
 /// At most this many client nodes on stage.
 const MAX_CLIENTS: usize = 4;
 
-/// One client node of the stage, derived from a caller key's label.
+/// One client node of the chain, derived from a caller key's label.
 pub(super) struct StageClient {
     /// Display name (label minus the `cardinal-` prefix; 本机 for loopback).
     name: String,
@@ -66,7 +77,7 @@ pub(super) struct StageClient {
     sub: String,
     /// Last request activity — the linger clock. Live clients never expire.
     last_seen: std::time::Instant,
-    /// A call of this client is in flight (its wire flows).
+    /// A call of this client is in flight (its dot pulses).
     live: bool,
 }
 
@@ -121,9 +132,9 @@ impl RoutesPage {
     }
 
     /// Fold the feed's current live-call snapshot into the client registry and
-    /// start the wire animation when anything is in flight. Only the visible
-    /// page calls this (from activity events) plus explicit reloads, which
-    /// restore the snapshot after a hidden tab paused updates.
+    /// start the dot pulse when anything is in flight. Only the visible page
+    /// calls this (from activity events) plus explicit reloads, which restore
+    /// the snapshot after a hidden tab paused updates.
     pub(super) fn sync_live_clients(&mut self, cx: &mut Context<Self>) {
         let live_calls: Vec<(String, String)> = self
             .feed
@@ -146,7 +157,7 @@ impl RoutesPage {
     /// Fold the live-call snapshot into the client registry: live callers
     /// upsert (name derived from the label's `cardinal-` suffix), clients whose
     /// last call just settled start their linger clock, expired ones drop out.
-    /// Any caller appears — routed or direct — every client wires to the hub.
+    /// Any caller appears — routed or direct — on the left chain.
     pub(super) fn sync_clients(&mut self, live: Vec<(String, String)>, cx: &mut Context<Self>) {
         let now = std::time::Instant::now();
         // One entry per client: first-appearance order, latest model as sub.
@@ -249,9 +260,8 @@ impl RoutesPage {
         .detach();
     }
 
-    /// One 66ms beat of the wire-flow animation; re-arms itself (from the
-    /// observer, on the next event) while the feed is non-idle. Advances the
-    /// dash phase at the wire-flow speed (8px per 0.7s).
+    /// One 66ms beat of the serving-dot pulse; re-arms itself while the feed is
+    /// non-idle. The phase also drives the small alpha pulse of a live dot.
     pub(super) fn arm_anim(&mut self, cx: &mut Context<Self>) {
         if self.anim_armed {
             return;
@@ -269,8 +279,6 @@ impl RoutesPage {
                 page.anim_armed = false;
                 page.phase = (page.phase + 0.75) % 8.0;
                 cx.notify();
-                // Any in-flight call flows its caller's wire (routed ones also
-                // light an entry row); idle feed = no repaint for nothing.
                 if !page.feed.read(cx).is_idle() {
                     page.arm_anim(cx);
                 }
@@ -279,45 +287,37 @@ impl RoutesPage {
         })
         .detach();
     }
+
+    /// Focus a client card. Highlight only: routes are gateway-level and every
+    /// client shares them, so this never filters the right-hand groups.
+    fn focus_client(&mut self, name: String, cx: &mut Context<Self>) {
+        self.focused_client = Some(name);
+        cx.notify();
+    }
+
+    /// Expand/collapse one route group. View state only — entries, indices and
+    /// drag targets stay backed by the authoritative route snapshot.
+    fn toggle_group(&mut self, alias: String, cx: &mut Context<Self>) {
+        if let Some(index) = self.collapsed.iter().position(|item| item == &alias) {
+            self.collapsed.remove(index);
+        } else {
+            self.collapsed.push(alias);
+        }
+        cx.notify();
+    }
 }
 
-const STAGE_PAD_Y: f32 = 22.;
-/// Caller column width (grid column 1).
-const SRC_W: f32 = 124.;
-/// Hub column width (grid column 2).
-const HUB_W: f32 = 124.;
-/// Gap between the three columns (`column-gap: 56px`).
-const COL_GAP: f32 = 56.;
-/// Fixed node heights (source and hub share the card geometry).
-const NODE_H: f32 = 64.;
-/// Gap between stacked source nodes (.rt-srcs `gap: 10px`).
-const SRC_GAP: f32 = 10.;
-/// Fixed account row height (.rt-accts li, single line, no bar).
-const ACCT_H: f32 = 40.;
-/// Gap between account rows (.rt-accts `gap: 7px`).
-const ACCT_GAP: f32 = 7.;
-/// Section header height (alias line) in the stacked routes column.
-const SEC_HEAD_H: f32 = 28.;
-/// Gap between route sections.
-const SEC_GAP: f32 = 14.;
-/// Gap between a section header and its first entry row.
-const SEC_INNER_GAP: f32 = 6.;
-
-/// One source node of the stage: a connected client (or the placeholder
-/// skeleton before any traffic ever).
+/// One client card of the left chain.
 struct StageSource {
-    /// Client name (key label minus `cardinal-`; 本机 for loopback).
     name: String,
-    /// The last client-sent model id (node subtitle).
     sub: String,
-    /// A call of this client is in flight right now (wire flows).
     live: bool,
-    /// The client's stable hue; None = placeholder node,
-    /// which draws no wire.
-    hue: Option<Hsla>,
+    hue: Hsla,
+    /// Requests from this client in the shared 60-second window.
+    rate: usize,
 }
 
-/// One row of the stage: a route entry, i.e. one account on one model.
+/// One row of a route group: a route entry, i.e. one account on one model.
 struct StageAccount {
     /// The account's display name (label · provider), or the deleted stub when
     /// the entry dangles.
@@ -328,25 +328,22 @@ struct StageAccount {
     extras: String,
     /// Phase caption while serving (连接中/传输中/接收中); None when idle.
     caption: Option<&'static str>,
-    /// This entry is serving a live call right now (row on, wire flows).
+    /// This entry is serving a live call right now.
     live: bool,
-    /// Cooldown recovery caption (冷却至 10-19 08:00); Some = the entry rests —
-    /// the row renders dimmed with a warning dot.
+    /// Cooldown recovery caption; Some = the entry rests.
     cool_until: Option<String>,
-    /// This entry cannot dispatch: its account was deleted, is disabled or
-    /// archived, its provider is disabled, or its whitelist omits the entry's
-    /// model. The row renders dimmed with a muted filled dot and the reason.
+    /// This entry cannot dispatch: deleted/disabled/archived account, disabled
+    /// provider, or a model the account does not serve.
     stopped: Option<Stopped>,
-    /// Operator pause: the entry is kept in the route but dispatch skips it.
+    /// Operator pause: the entry stays in the route but dispatch skips it.
     paused: bool,
-    /// Latest successful request time for this account on this model — shown in
-    /// the serving-caption slot once the entry goes idle.
+    /// Newest successful request time for this account on this model.
     last_success: Option<Timestamp>,
+    /// Newest recorded total latency for this (account, model) in the ledger.
+    latency_ms: Option<i32>,
 }
 
-/// One in-flight call of this route, as the entry aggregation reads it. The
-/// live feed's attempt type carries display strings and private fields; the
-/// aggregation only needs identity plus the phase caption.
+/// One in-flight call of this route, as the entry aggregation reads it.
 struct LiveCall<'call> {
     /// The account serving the call (None = not yet routed to one).
     key_id: Option<i64>,
@@ -355,7 +352,6 @@ struct LiveCall<'call> {
     /// Phase caption (连接中/传输中/接收中).
     phase: &'static str,
     /// The call has seen its first byte, so it outranks one still connecting.
-    /// Kept apart from the caption: the caption is copy, this is the ordering.
     progressed: bool,
 }
 
@@ -371,14 +367,12 @@ pub(super) enum Stopped {
     /// The account is disabled on the accounts page — a reversible state.
     AccountDisabled,
     /// The account is archived: kept for history. Dispatch skips it while the
-    /// archive stands, whatever its own enabled flag says; 移出归档 on the
-    /// accounts page is what restores it.
+    /// archive stands, whatever its own enabled flag says.
     Archived,
     /// The account is fine but its provider is disabled, so dispatch builds no
     /// candidate from it.
     ProviderDisabled,
-    /// The account is dispatchable but does not serve this entry's model: its
-    /// whitelist omits it, so dispatch would refuse the only candidate.
+    /// The account is dispatchable but does not serve this entry's model.
     NoModel,
 }
 
@@ -398,16 +392,9 @@ impl Stopped {
 }
 
 /// Why this account cannot dispatch. The three conditions are conjunctive on
-/// the wire (dispatch asks for an enabled provider, an enabled account and no
-/// archive), so the order here only decides which one to show: an archived
-/// account cannot be restored by flipping its own flag, so its own state is the
-/// useful answer before its provider's.
-///
-/// The single owner of the account-level half of the rule: [`entry_stopped`]
-/// adds the whitelist, and every surface renders [`Stopped::label`] from these
-/// two instead of re-deriving the conditions. The chip guard asks only about
-/// archiving on purpose — a disabled account stays addable, since flipping the
-/// flag back restores it.
+/// dispatch; the order only decides which one to show: an archived account
+/// cannot be restored by flipping its own flag, so its own state is the useful
+/// answer before its provider's.
 pub(super) fn stopped_of(account: &RouteAccount) -> Option<Stopped> {
     if account.archived {
         Some(Stopped::Archived)
@@ -434,11 +421,8 @@ pub(super) fn entry_stopped(account: Option<&RouteAccount>, model: &str) -> Opti
 }
 
 /// One entry's stage state: the account it names, on the entry's model.
-///
-/// An entry IS one account on one model, so every fact here is that single
-/// account's — serving, the cooldown and the last success are (key, model)
-/// lookups, never a spread over several accounts. Pure: every input is a read
-/// the caller already has.
+/// An entry IS one account on one model, so every fact here belongs to that
+/// single account. Pure: every input is a read the caller already has.
 #[derive(Debug, Default, PartialEq)]
 struct EntryState {
     /// Phase caption of the call serving this entry (None = idle).
@@ -446,25 +430,14 @@ struct EntryState {
     /// The entry cannot dispatch (deleted account, disabled account or
     /// provider, or a model the account does not serve).
     stopped: Option<Stopped>,
-    /// The moment dispatch may use this entry again: set only while the account
-    /// is cooling on this model and the entry is not stopped for another
-    /// reason.
+    /// The moment dispatch may use this entry again, while its cooldown is
+    /// still in force at `now`.
     cool_until: Option<Timestamp>,
     /// Newest success of this account on this model.
     last_success: Option<Timestamp>,
 }
 
-/// Aggregate one entry's stage state over the single account it names.
-///
-/// * serving — the most advanced in-flight call of this route on this account
-///   and this model (compared in the model's clipped wire form), so the caption
-///   shows the phase that actually moved furthest;
-/// * cooling — this account cooling on this model at `now` (a rest with a NULL
-///   model cools the whole account, so it covers every model; a rest whose
-///   `rest_until` is not after `now` is over);
-/// * stopped — the account is gone, cannot dispatch, or does not serve the
-///   entry's model;
-/// * last success — the newest success of this account on this model.
+/// Aggregate one entry's state over the single account it names.
 fn entry_state(
     account: Option<&RouteAccount>,
     model: &str,
@@ -475,7 +448,6 @@ fn entry_state(
 ) -> EntryState {
     let stopped = entry_stopped(account, model);
     let Some(account) = account else {
-        // The entry dangles: no account to aggregate over.
         return EntryState {
             stopped,
             ..EntryState::default()
@@ -487,9 +459,8 @@ fn entry_state(
         ..EntryState::default()
     };
     if state.stopped.is_none() {
-        // Only a cooldown still in force at `now`: the gateway drops expired
-        // rows only when it builds the document, and nothing refreshes the page
-        // when a cooldown ends, so an expired row must not read as resting.
+        // The gateway filters expired rows only when it builds the document,
+        // so an over-the-hill rest must not read as resting here.
         state.cool_until = rests
             .iter()
             .filter(|rest| {
@@ -504,8 +475,7 @@ fn entry_state(
             .max();
     }
     // The entry's calls are this route's, on this account and this model.
-    // Ties keep feed order, so the choice is stable across renders: only a call
-    // that has seen its first byte displaces one that has not.
+    // Ties keep feed order, so the choice is stable across renders.
     let clipped = crate::activity::clipped(model);
     let mut serving: Option<&LiveCall<'_>> = None;
     for call in calls {
@@ -525,18 +495,31 @@ fn entry_state(
     state
 }
 
-/// The 冷却至 marker of a cooling entry: the time alone when `until` falls on
-/// the same day as `now` in the display offset `tz`, otherwise with its date.
-/// `now` is the render's single clock read, the same one the cooldown-expiry
-/// check in [`entry_state`] used, so the two always agree.
+/// The 冷却至 marker of a cooling entry: time only when the recovery falls on
+/// the display day of `now`, otherwise with its date.
 #[must_use]
-fn cool_until_label(until: Timestamp, now: Timestamp, tz: jiff::tz::TimeZone) -> String {
+fn cool_until_label(until: Timestamp, now: Timestamp, tz: &TimeZone) -> String {
     let local = until.to_zoned_datetime(tz.clone());
-    let today = now.to_zoned_datetime(tz).date();
+    let today = now.to_zoned_datetime(tz.clone()).date();
     if local.date() == today {
         format!("冷却至 {}", local.strftime("%H:%M"))
     } else {
         format!("冷却至 {}", local.strftime("%m-%d %H:%M"))
+    }
+}
+
+/// Short activity stamp in the display timezone, shared by group summaries and
+/// entry rows so both name the same moment the same way.
+#[must_use]
+fn short_time(at: Timestamp, now: Timestamp, tz: &TimeZone) -> String {
+    let local = at.to_zoned_datetime(tz.clone());
+    let today = now.to_zoned_datetime(tz.clone()).date();
+    if local.date() == today {
+        local.strftime("%H:%M").to_string()
+    } else if local.date() == today.yesterday().unwrap_or(today) {
+        format!("昨天 {}", local.strftime("%H:%M"))
+    } else {
+        local.strftime("%m-%d %H:%M").to_string()
     }
 }
 
@@ -550,66 +533,80 @@ pub(super) struct StageEntryDrag {
     pub(super) label: String,
 }
 
-/// One route section of the stage: alias header over its entries.
+/// One route group of the timeline.
 struct StageSection {
-    /// Route alias (also the section's identity for manage actions).
-    alias: String,
-    /// Declared context window (header badge; None = undeclared).
     context_window: Option<i64>,
-    /// Entries in dispatch order.
     accounts: Vec<StageAccount>,
 }
 
-/// The resolved stage: sources on the left, every route as a section on the
-/// right, and whether wires connect them at all.
-pub(super) struct StageModel {
+/// Everything the view derives from the snapshot for one render.
+struct StageModel {
     sources: Vec<StageSource>,
     sections: Vec<StageSection>,
-    /// False before any traffic ever: the skeleton shows nodes without wires.
-    wired: bool,
+    /// Requests from all clients in the shared window.
+    rate: usize,
+    /// Mean latency in that window, if any request recorded one.
+    average: Option<f64>,
+    /// Distinct provider names among all accounts in the snapshot.
+    providers: usize,
+    /// The render's single clock read, shared by every time label.
+    now: Timestamp,
 }
 
-/// One bezier wire between two columns, in stage-local coordinates.
-struct Wire {
-    x1: f32,
-    y1: f32,
-    x2: f32,
-    y2: f32,
-    /// Live wires draw as an animated dash flow
-    /// (dasharray 3 5, 0.7s linear infinite); resting wires
-    /// are solid strokes.
-    live: bool,
-    /// Stroke colour: the client's hue on caller wires (dimmed when resting),
-    /// accent/border on hub wires.
-    color: Hsla,
+/// Borrowed view inputs for one route group, packed so `cx` stays the only
+/// other argument to [`RoutesPage::stage_group`].
+struct StageGroupInputs<'a> {
+    route: &'a RouteRow,
+    section: &'a StageSection,
+    manage: bool,
+    pulse: f32,
+    now: Timestamp,
+    tz: &'a TimeZone,
+}
+
+/// Borrowed view inputs for one entry row, packed for the same reason.
+struct StageEntryInputs<'a> {
+    route: &'a RouteRow,
+    index: usize,
+    count: usize,
+    account: &'a StageAccount,
+    share: Option<u16>,
+    pulse: f32,
+    now: Timestamp,
+    tz: &'a TimeZone,
 }
 
 impl RoutesPage {
-    /// Resolve what the stage shows: every route as a section (its entries in
-    /// dispatch order, live ones marked serving), and on the left the callers
-    /// with a routed call in flight (else the most recent caller resting, else
-    /// a placeholder). None when there are no routes (the empty card renders).
-    pub(super) fn stage_model(&self, data: &RoutesData, cx: &App) -> Option<StageModel> {
+    /// Resolve the view: summary metrics, the client chain and one section per
+    /// route with its entries in dispatch order. None when there are no routes
+    /// (the parent renders its empty card).
+    fn stage_model(&self, data: &RoutesData, cx: &App) -> Option<StageModel> {
         if data.routes.is_empty() {
             return None;
         }
-        // One clock read for the whole render: cooldown expiry and the 冷却至
-        // date comparison must agree with each other. The display offset is
-        // read once alongside it for the same reason.
+        // One clock read for cooldown expiry, the 60-second window and every
+        // time label; the display offset is read once alongside it.
         let now = Timestamp::now();
         let tz = crate::ui_tz::display_tz();
         let feed = self.feed.read(cx);
-        // Every routed in-flight attempt. Wire routes are clipped to 64 bytes;
-        // compare aliases in the clipped form so a long alias still matches. Two
-        // aliases sharing a 64-byte prefix would cross-light each other's
-        // sections — a wire-protocol limitation, not resolvable on this page.
+        // Wire routes are clipped to 64 bytes; compare aliases in that form so
+        // a long alias still matches its live calls.
         let live: Vec<&crate::activity::LiveAttempt> = feed
             .live()
             .filter(|attempt| attempt.route.is_some())
             .collect();
-        // Sources: the client registry (live callers + lingering ones), each
-        // with its stable hue; a placeholder node keeps the skeleton inspectable
-        // before any traffic ever, and draws no wire.
+
+        // Derive the 60-second window with the same pure helpers the summary
+        // uses, so the rate, the average and each client's rate cannot drift.
+        let rate = stats::window_count(&data.recent, now, WINDOW);
+        let average = stats::window_average_seconds(&data.recent, now, WINDOW);
+        let providers = data
+            .accounts
+            .iter()
+            .map(|account| account.provider_name.as_str())
+            .collect::<HashSet<&str>>()
+            .len();
+
         let mut sources: Vec<StageSource> = self
             .clients
             .iter()
@@ -617,30 +614,30 @@ impl RoutesPage {
                 name: client.name.clone(),
                 sub: client.sub.clone(),
                 live: client.live,
-                hue: Some(client_hue(&client.name)),
+                hue: client_hue(&client.name),
+                rate: stats::window_requests(&data.recent, now, WINDOW)
+                    .filter(|request| {
+                        named_client(request.agent.as_deref(), request.caller_key.as_deref())
+                            == client.name
+                    })
+                    .count(),
             })
             .collect();
-        let has_clients = !sources.is_empty();
         if sources.is_empty() {
             sources.push(StageSource {
                 name: "客户端".to_string(),
                 sub: "尚无请求".to_string(),
                 live: false,
-                hue: None,
+                hue: client_hue("客户端"),
+                rate: 0,
             });
         }
-        // Wires exist only with at least one real client on the left AND routed
-        // traffic to show on the right (in flight, or in the recent ledger).
-        let wired = has_clients
-            && (!live.is_empty() || data.recent.iter().any(|request| request.alias.is_some()));
 
         let sections = data
             .routes
             .iter()
             .map(|route| {
                 let alias = crate::activity::clipped(&route.alias);
-                // This route's in-flight calls, as the per-entry aggregation
-                // reads them (identity only: key id, clipped model, phase).
                 let calls: Vec<LiveCall<'_>> = live
                     .iter()
                     .filter(|attempt| attempt.route.as_deref() == Some(alias))
@@ -693,7 +690,15 @@ impl RoutesPage {
                         .join(" · ");
                         let cool_until = state
                             .cool_until
-                            .map(|until| cool_until_label(until, now, tz.clone()));
+                            .map(|until| cool_until_label(until, now, &tz));
+                        let latency_ms = data.recent.iter().find_map(|request| {
+                            if request.provider_key_id != Some(entry.key_id) {
+                                return None;
+                            }
+                            let served =
+                                request.served_model.as_deref().or(request.model.as_deref());
+                            (served == Some(entry.model.as_str())).then_some(request.total_ms)?
+                        });
                         StageAccount {
                             head,
                             model: entry.label.clone().unwrap_or_else(|| entry.model.clone()),
@@ -704,268 +709,532 @@ impl RoutesPage {
                             stopped: state.stopped,
                             paused: entry.paused,
                             last_success: state.last_success,
+                            latency_ms,
                         }
                     })
                     .collect();
                 StageSection {
-                    alias: route.alias.clone(),
                     context_window: route.context_window,
                     accounts,
                 }
             })
             .collect();
+
         Some(StageModel {
             sources,
             sections,
-            wired,
+            rate,
+            average,
+            providers,
+            now,
         })
     }
 
-    /// The live stage card: caller nodes — hub — every
-    /// route's entries as stacked sections, wired by beziers that flow
-    /// (animated dashes) while a call is in flight over them. In manage mode
-    /// each section header carries 编辑/删除 and each entry row its ▲▼/✕.
+    /// The single card: summary bar above a 218px left chain and the right
+    /// timeline of route groups. In manage mode section heads carry 编辑/删除
+    /// and each entry row its ▲▼/暂停/✕.
     pub(super) fn stage_card(&self, data: &RoutesData, cx: &mut Context<Self>) -> Option<Div> {
         let model = self.stage_model(data, cx)?;
+        let tz = crate::ui_tz::display_tz();
+        // Copied before the mutable `cx` calls below: the card surface keeps
+        // these two colours while the right column builds its own elements.
+        let card_border = cx.theme().border;
+        let card_bg = cx.theme().popover;
         let theme = cx.theme();
         let manage = self.manage;
-
-        // Column heights (fixed geometry) → wire endpoints, no DOM measurement.
-        // An entry-less route still renders one placeholder row.
-        let section_h = |section: &StageSection| {
-            let rows = section.accounts.len().max(1) as f32;
-            SEC_HEAD_H + SEC_INNER_GAP + rows * ACCT_H + (rows - 1.) * ACCT_GAP
-        };
-        let n_sources = model.sources.len();
-        // sources is never empty (the placeholder node guarantees it), so
-        // sources_h >= NODE_H always holds.
-        let sources_h = n_sources as f32 * NODE_H + (n_sources.saturating_sub(1)) as f32 * SRC_GAP;
-        let accounts_h = model.sections.iter().map(&section_h).sum::<f32>()
-            + (model.sections.len().saturating_sub(1)) as f32 * SEC_GAP;
-        let content_h = sources_h.max(accounts_h);
-        let stage_h = content_h + 2. * STAGE_PAD_Y;
-        let hub_y = STAGE_PAD_Y + content_h / 2.;
-
-        // Wires: caller right edge → hub left edge (one per client, in its hue —
-        // flowing while it has a call in flight, dimmed solid while it lingers),
-        // hub right edge → every entry row's left edge across all sections. The
-        // inner row carries the stage's 2px horizontal padding, so the x offsets
-        // land exactly on the row edges: 126 → 182, 306 → 362.
-        let mut wires = Vec::new();
-        if model.wired {
-            let x_src = 2. + SRC_W;
-            let x_hub = x_src + COL_GAP;
-            for (index, source) in model.sources.iter().enumerate() {
-                let Some(hue) = source.hue else { continue };
-                let y = STAGE_PAD_Y
-                    + (content_h - sources_h) / 2.
-                    + index as f32 * (NODE_H + SRC_GAP)
-                    + NODE_H / 2.;
-                let mut color = hue;
-                if !source.live {
-                    color.a = 0.35;
-                }
-                wires.push(Wire {
-                    x1: x_src,
-                    y1: y,
-                    x2: x_hub,
-                    y2: hub_y,
-                    live: source.live,
-                    color,
-                });
-            }
-            let x_hub_r = x_hub + HUB_W;
-            let x_acct = x_hub_r + COL_GAP;
-            let mut section_y = STAGE_PAD_Y + (content_h - accounts_h) / 2.;
-            for section in &model.sections {
-                let mut row_y = section_y + SEC_HEAD_H + SEC_INNER_GAP;
-                for account in &section.accounts {
-                    wires.push(Wire {
-                        x1: x_hub_r,
-                        y1: hub_y,
-                        x2: x_acct,
-                        y2: row_y + ACCT_H / 2.,
-                        live: account.live,
-                        color: if account.live {
-                            theme.accent
-                        } else {
-                            theme.border
-                        },
-                    });
-                    row_y += ACCT_H + ACCT_GAP;
-                }
-                section_y += section_h(section) + SEC_GAP;
-            }
-        }
-        let wires = Rc::new(wires);
-        let phase = self.phase;
-        let overlay = canvas(
-            move |_bounds, _window, _cx| wires.clone(),
-            move |bounds, wires, window, _cx| paint_wires(bounds, &wires, window, phase),
-        )
-        .absolute()
-        .inset_0()
-        .size_full();
-
-        // The serving-dot pulse shares the flow phase.
         let pulse = (self.phase / 8. * std::f32::consts::TAU).sin() * 0.5 + 0.5;
+        let totals = stats::route_totals(&data.routes);
 
-        let sources_col = gpui::div()
-            .w(px(SRC_W))
-            .h_full()
+        let stat = |label: &'static str, value: String, color: Hsla| {
+            gpui::div()
+                .flex()
+                .items_center()
+                .gap(px(5.))
+                .child(label.to_string())
+                .child(gpui::div().text_color(color).child(value))
+        };
+        let legend = |label: &'static str, color: Hsla| {
+            gpui::div()
+                .flex()
+                .items_center()
+                .gap(px(4.))
+                .child(gpui::div().w(px(7.)).h(px(7.)).rounded(px(2.)).bg(color))
+                .child(label.to_string())
+        };
+        let smart: Hsla = gpui::rgb(0x0969da).into();
+        let weighted: Hsla = gpui::rgb(0x8250df).into();
+        let alternate: Hsla = gpui::rgb(0x0f766e).into();
+        let summary = gpui::div()
+            .flex()
+            .items_center()
+            .gap(px(18.))
+            .px(px(16.))
+            .py(px(10.))
+            .text_size(px(11.5))
+            .text_color(theme.muted_foreground)
+            .child(stat(
+                "客户端",
+                self.clients.len().to_string(),
+                theme.foreground,
+            ))
+            .child(stat("模型组", totals.groups.to_string(), theme.foreground))
+            .child(stat("路由项", totals.entries.to_string(), theme.foreground))
+            .child(stat("已暂停", totals.paused.to_string(), theme.warning))
+            .child("策略：每个模型独立配置主备与权重")
+            .child(gpui::div().flex_1())
+            .child(legend("智能", smart))
+            .child(legend("加权", weighted))
+            .child(legend("交替", alternate));
+
+        // Left chain: client cards → 汇聚到网关 → cardinal → live meta →
+        // distribution. The vertical line/dots are narrow divs, not wire canvas.
+        let client_count = self.clients.len();
+        let hub_online = !self.hub_addr.is_empty();
+        let average = model
+            .average
+            .map_or_else(|| "—".to_string(), |seconds| format!("{seconds:.1}s"));
+        let clients = gpui::div()
+            .relative()
             .flex()
             .flex_col()
-            .justify_center()
-            .gap(px(SRC_GAP))
-            .children(model.sources.iter().map(|source| {
-                // The client's hue marks its node; it pulses while
-                // a call is in flight, the placeholder stays muted.
-                let mut dot_color = source.hue.unwrap_or(theme.muted_foreground);
-                if source.live {
-                    dot_color.a = 0.45 + 0.55 * pulse;
-                }
+            .gap(px(5.))
+            .pl(px(17.))
+            .child(
                 gpui::div()
-                    .w_full()
-                    .h(px(NODE_H))
+                    .absolute()
+                    .left(px(4.))
+                    .top(px(12.))
+                    .bottom(px(1.))
+                    .w(px(1.))
+                    .bg(theme.border),
+            )
+            .children(model.sources.iter().enumerate().map(|(index, source)| {
+                // View-only default: the first rendered client carries the
+                // reference's selected look until the user picks another one.
+                let selected = self.focused_client.as_deref() == Some(source.name.as_str())
+                    || (self.focused_client.is_none() && index == 0);
+                let initial = source
+                    .name
+                    .chars()
+                    .next()
+                    .map_or_else(|| "?".to_string(), |ch| ch.to_string());
+                let card = gpui::div()
+                    .id(ElementId::from(gpui::SharedString::from(format!(
+                        "route-client-{}",
+                        source.name
+                    ))))
+                    .relative()
                     .flex()
-                    .flex_col()
                     .items_center()
-                    .justify_center()
-                    .gap(px(2.))
-                    .bg(theme.popover)
+                    .gap(px(8.))
+                    .px(px(8.))
+                    .py(px(6.))
+                    .rounded(px(7.))
                     .border_1()
-                    .border_color(theme.border)
-                    .rounded(px(12.))
-                    .overflow_hidden()
+                    .border_color(if selected { theme.accent } else { theme.border })
+                    .bg(if selected {
+                        theme.secondary
+                    } else {
+                        theme.popover
+                    })
+                    .cursor_pointer()
                     .child(
                         gpui::div()
+                            .absolute()
+                            .left(px(-16.))
+                            .top(px(14.))
+                            .w(px(7.))
+                            .h(px(7.))
+                            .rounded_full()
+                            .border_1()
+                            .border_color(if selected { theme.accent } else { theme.border })
+                            .bg(if selected {
+                                theme.accent
+                            } else {
+                                let mut hue = source.hue;
+                                if source.live {
+                                    hue.a = 0.45 + 0.55 * pulse;
+                                }
+                                hue
+                            }),
+                    )
+                    .child(
+                        gpui::div()
+                            .w(px(19.))
+                            .h(px(19.))
+                            .flex_shrink_0()
                             .flex()
                             .items_center()
-                            .gap(px(6.))
-                            .child(gpui::div().w(px(7.)).h(px(7.)).rounded_full().bg(dot_color))
+                            .rounded(px(5.))
+                            .bg(source.hue)
+                            .text_size(px(8.))
+                            .text_color(theme.foreground)
+                            .justify_center()
+                            .child(initial),
+                    )
+                    .child(
+                        gpui::div()
+                            .min_w_0()
+                            .flex()
+                            .flex_col()
                             .child(
                                 gpui::div()
-                                    .text_size(px(13.))
-                                    .font_weight(gpui::FontWeight::SEMIBOLD)
+                                    .text_size(px(11.5))
+                                    .text_ellipsis()
                                     .text_color(theme.foreground)
                                     .child(source.name.clone()),
+                            )
+                            .child(
+                                gpui::div()
+                                    .text_size(px(10.))
+                                    .text_ellipsis()
+                                    .text_color(theme.muted_foreground)
+                                    .child(source.sub.clone()),
                             ),
                     )
                     .child(
                         gpui::div()
-                            .text_size(px(11.))
+                            .ml_auto()
+                            .whitespace_nowrap()
+                            .text_size(px(10.))
                             .text_color(theme.muted_foreground)
-                            .child(source.sub.clone()),
-                    )
+                            .child(format!("{}/min", source.rate)),
+                    );
+                let name = source.name.clone();
+                card.on_click(
+                    cx.listener(move |this, _, _, cx| this.focus_client(name.clone(), cx)),
+                )
             }));
 
-        let hub_col = gpui::div()
-            .w(px(HUB_W))
-            .h_full()
+        let max_entries = stats::route_distribution(&data.routes)
+            .iter()
+            .map(|(_, count)| *count)
+            .max()
+            .unwrap_or(0);
+        let distribution = gpui::div().flex().flex_col().gap(px(7.)).children(
+            stats::route_distribution(&data.routes)
+                .into_iter()
+                .map(|(alias, count)| {
+                    let width = if max_entries == 0 {
+                        0.
+                    } else {
+                        BAR_W * count as f32 / max_entries as f32
+                    };
+                    gpui::div()
+                        .flex()
+                        .items_center()
+                        .gap(px(7.))
+                        .child(
+                            gpui::div()
+                                .w(px(76.))
+                                .flex_shrink_0()
+                                .text_ellipsis()
+                                .whitespace_nowrap()
+                                .text_size(px(10.5))
+                                .text_color(theme.muted_foreground)
+                                .child(alias.to_string()),
+                        )
+                        .child(
+                            gpui::div()
+                                .w(px(BAR_W))
+                                .h(px(4.))
+                                .rounded_full()
+                                .bg(theme.border)
+                                .child(
+                                    gpui::div()
+                                        .h_full()
+                                        .w(px(width))
+                                        .rounded_full()
+                                        .bg(client_hue(alias)),
+                                ),
+                        )
+                        .child(
+                            gpui::div()
+                                .text_size(px(10.5))
+                                .text_color(theme.foreground)
+                                .child(count.to_string()),
+                        )
+                }),
+        );
+
+        let left = gpui::div()
+            .w(px(CHAIN_W))
+            .flex_shrink_0()
             .flex()
             .flex_col()
-            .justify_center()
+            .gap(px(10.))
+            .px(px(16.))
+            .py(px(18.))
             .child(
                 gpui::div()
-                    .w_full()
-                    .h(px(NODE_H))
                     .flex()
-                    .flex_col()
                     .items_center()
-                    .justify_center()
-                    .gap(px(2.))
-                    .bg(theme.popover)
-                    .border_1()
-                    .border_color(theme.foreground)
-                    .rounded(px(12.))
-                    .overflow_hidden()
+                    .text_size(px(10.5))
+                    .font_weight(gpui::FontWeight::SEMIBOLD)
+                    .text_color(theme.muted_foreground)
+                    .child("客户端")
                     .child(
                         gpui::div()
-                            .text_size(px(13.))
-                            .font_weight(gpui::FontWeight::SEMIBOLD)
+                            .ml(px(6.))
+                            .px(px(6.))
+                            .rounded(px(10.))
+                            .border_1()
+                            .border_color(theme.border)
+                            .font_family("Menlo")
+                            .text_size(px(10.))
                             .text_color(theme.foreground)
-                            .child("cardinal"),
+                            .child(client_count.to_string()),
+                    ),
+            )
+            .child(clients)
+            .child(
+                gpui::div()
+                    .flex()
+                    .items_center()
+                    .gap(px(7.))
+                    .pl(px(2.))
+                    .text_size(px(10.))
+                    .text_color(theme.muted_foreground)
+                    .child(gpui::div().ml(px(3.)).w(px(1.)).h(px(14.)).bg(theme.border))
+                    .child("↓")
+                    .child("汇聚到网关"),
+            )
+            .child(
+                gpui::div()
+                    .flex()
+                    .items_center()
+                    .gap(px(9.))
+                    .px(px(11.))
+                    .py(px(10.))
+                    .rounded(px(8.))
+                    .border_1()
+                    .border_color(theme.foreground)
+                    .child(
+                        gpui::div()
+                            .w(px(26.))
+                            .h(px(26.))
+                            .flex()
+                            .items_center()
+                            .rounded(px(7.))
+                            .bg(theme.foreground)
+                            .text_color(theme.popover)
+                            .justify_center()
+                            .child("C"),
                     )
                     .child(
                         gpui::div()
-                            .text_size(px(11.))
+                            .min_w_0()
+                            .flex()
+                            .flex_col()
+                            .child(
+                                gpui::div()
+                                    .text_size(px(12.5))
+                                    .text_color(theme.foreground)
+                                    .child("cardinal"),
+                            )
+                            .child(
+                                gpui::div()
+                                    .text_size(px(10.5))
+                                    .text_ellipsis()
+                                    .text_color(theme.muted_foreground)
+                                    .child(if hub_online {
+                                        self.hub_addr.clone()
+                                    } else {
+                                        "—".to_string()
+                                    }),
+                            ),
+                    )
+                    .when(hub_online, |node| {
+                        node.child(
+                            gpui::div()
+                                .ml_auto()
+                                .text_size(px(10.))
+                                .text_color(theme.success)
+                                .child("在线"),
+                        )
+                    }),
+            )
+            .child(
+                gpui::div()
+                    .mt(px(14.))
+                    .pt(px(12.))
+                    .border_t_1()
+                    .border_dashed()
+                    .border_color(theme.border)
+                    .flex()
+                    .flex_col()
+                    .gap(px(2.))
+                    .text_size(px(11.))
+                    .text_color(theme.muted_foreground)
+                    .child(
+                        gpui::div()
+                            .flex()
+                            .items_center()
+                            .gap(px(5.))
+                            .text_color(if hub_online {
+                                theme.success
+                            } else {
+                                theme.muted_foreground
+                            })
+                            .child(gpui::div().w(px(6.)).h(px(6.)).rounded_full().bg(
+                                if hub_online {
+                                    theme.success
+                                } else {
+                                    theme.muted_foreground
+                                },
+                            ))
+                            .child(if hub_online {
+                                "网关已连接"
+                            } else {
+                                "网关未连接"
+                            }),
+                    )
+                    .child(format!("合计 {} 请求/分 · 平均 {}", model.rate, average))
+                    .child(format!("上游 {} 个供应商", model.providers)),
+            )
+            .child(
+                gpui::div()
+                    .mt(px(18.))
+                    .pt(px(14.))
+                    .border_t_1()
+                    .border_dashed()
+                    .border_color(theme.border)
+                    .flex()
+                    .flex_col()
+                    .gap(px(2.))
+                    .child(
+                        gpui::div()
+                            .text_size(px(10.5))
+                            .font_weight(gpui::FontWeight::SEMIBOLD)
                             .text_color(theme.muted_foreground)
-                            .child(self.hub_addr.clone()),
-                    ),
+                            .child("路由分布"),
+                    )
+                    .child(distribution),
             );
 
-        let mut accounts_col = gpui::div()
+        // Right timeline: a thin vertical line with one card per route group.
+        let mut right = gpui::div()
             .flex_1()
             .min_w_0()
-            .h_full()
-            .flex()
-            .flex_col()
-            .justify_center()
-            .gap(px(SEC_GAP));
+            .relative()
+            .py(px(16.))
+            .pl(px(30.))
+            .pr(px(18.))
+            .on_drag_move(
+                cx.listener(|this, _: &gpui::DragMoveEvent<StageEntryDrag>, _, cx| {
+                    // Capture order is outer→inner: clear first, then the row
+                    // under the cursor claims its section's drop site.
+                    if this.stage_drop.take().is_some() {
+                        cx.notify();
+                    }
+                }),
+            )
+            .child(
+                gpui::div()
+                    .absolute()
+                    .left(px(14.))
+                    .top(px(28.))
+                    .bottom(px(32.))
+                    .w(px(1.))
+                    .bg(theme.border),
+            );
         for (route, section) in data.routes.iter().zip(model.sections.iter()) {
-            accounts_col =
-                accounts_col.child(self.stage_section(route, section, manage, pulse, cx));
+            right = right.child(self.stage_group(
+                StageGroupInputs {
+                    route,
+                    section,
+                    manage,
+                    pulse,
+                    now: model.now,
+                    tz: &tz,
+                },
+                cx,
+            ));
         }
 
         Some(
-            card(cx).child(
-                gpui::div()
-                    .relative()
-                    .h(px(stage_h))
-                    // Capture order is outer→inner: clear first, then the row
-                    // under the cursor sets its section's drop site again.
-                    .on_drag_move(cx.listener(
-                        |this, _: &gpui::DragMoveEvent<StageEntryDrag>, _, cx| {
-                            if this.stage_drop.take().is_some() {
-                                cx.notify();
-                            }
-                        },
-                    ))
-                    .child(overlay)
-                    .child(
-                        gpui::div()
-                            .h_full()
-                            .py(px(STAGE_PAD_Y))
-                            .px(px(2.))
-                            .flex()
-                            .child(sources_col)
-                            .child(gpui::div().w(px(COL_GAP)).flex_shrink_0())
-                            .child(hub_col)
-                            .child(gpui::div().w(px(COL_GAP)).flex_shrink_0())
-                            .child(accounts_col),
-                    ),
-            ),
+            gpui::div()
+                .flex()
+                .flex_col()
+                .flex_shrink_0()
+                .rounded_lg()
+                .border_1()
+                .border_color(card_border)
+                .bg(card_bg)
+                .overflow_hidden()
+                .child(summary)
+                .child(gpui::div().flex().child(left).child(right)),
         )
     }
 
-    /// One route section of the stage: the alias header (carrying the route's
-    /// 编辑/删除 actions in manage mode) over its entry rows in dispatch order.
-    fn stage_section(
-        &self,
-        route: &RouteRow,
-        section: &StageSection,
-        manage: bool,
-        pulse: f32,
-        cx: &mut Context<Self>,
-    ) -> Div {
+    /// One route group: a clickable head (chevrons, identity, strategy chip,
+    /// real-data summary) over its entry rows. Manage mode appends 编辑/删除
+    /// next to the head, outside its collapse click target.
+    fn stage_group(&self, inputs: StageGroupInputs<'_>, cx: &mut Context<Self>) -> Div {
+        let StageGroupInputs {
+            route,
+            section,
+            manage,
+            pulse,
+            now,
+            tz,
+        } = inputs;
         let theme = cx.theme();
-        // Copied out of `theme` (Hsla is Copy): the drag insertion line below
-        // reads it after the `&mut cx` stage_entry loop, which must not
-        // overlap `theme`'s borrow.
         let accent = theme.accent;
-        let alias = route.alias.clone();
-        let edit_route = route.clone();
-        let header = gpui::div()
-            .h(px(SEC_HEAD_H))
+        let card_bg = theme.popover;
+        let collapsed = self.collapsed.iter().any(|alias| alias == &route.alias);
+        let shares = stats::weighted_shares(&route.entries);
+        let summary = group_summary(route, section, now, tz);
+        let strategy_color: Hsla = match route.strategy {
+            RouteStrategy::Smart => gpui::rgb(0x0969da).into(),
+            RouteStrategy::Weighted => gpui::rgb(0x8250df).into(),
+            RouteStrategy::Rotate => gpui::rgb(0x0f766e).into(),
+            RouteStrategy::Ordered => theme.muted_foreground,
+        };
+        let strategy_label = match route.strategy {
+            RouteStrategy::Smart => "智能",
+            RouteStrategy::Weighted => "加权",
+            RouteStrategy::Rotate => "交替",
+            RouteStrategy::Ordered => "顺序",
+        };
+        let short: String = route
+            .alias
+            .chars()
+            .take(2)
+            .flat_map(char::to_uppercase)
+            .collect();
+        let alias_click = route.alias.clone();
+        let mut head = gpui::div()
+            .id(ElementId::from(gpui::SharedString::from(format!(
+                "route-group-head-{}",
+                route.alias
+            ))))
             .flex()
             .items_center()
-            .gap_2()
+            .gap(px(8.))
+            .px(px(12.))
+            .py(px(9.))
+            .cursor_pointer()
+            .bg(theme.secondary)
+            .child(if collapsed { "▸" } else { "▾" })
             .child(
                 gpui::div()
-                    .text_size(px(13.))
-                    .font_weight(gpui::FontWeight::SEMIBOLD)
+                    .w(px(20.))
+                    .h(px(20.))
+                    .flex()
+                    .items_center()
+                    .rounded(px(5.))
+                    .bg(client_hue(&route.alias))
+                    .text_size(px(9.))
                     .text_color(theme.foreground)
-                    .child(section.alias.clone()),
+                    .justify_center()
+                    .child(short),
+            )
+            .child(
+                gpui::div()
+                    .text_size(px(12.5))
+                    .text_color(theme.foreground)
+                    .child(route.alias.clone()),
             )
             .child(Tag::secondary().child(format!("{} 项", section.accounts.len())))
             .when_some(section.context_window, |this, window| {
@@ -974,31 +1243,33 @@ impl RoutesPage {
                         .child(format!("上下文 {}", crate::fmt::humanize_count(window))),
                 )
             })
-            // Non-ordered strategy marker: the header says which at a glance.
-            .when(route.strategy != RouteStrategy::Ordered, |this| {
-                let label = match route.strategy {
-                    RouteStrategy::Smart => "智能",
-                    RouteStrategy::Rotate => "交替",
-                    RouteStrategy::Weighted => "加权",
-                    RouteStrategy::Ordered => unreachable!(),
-                };
-                this.child(Tag::secondary().child(label))
-            })
+            .child(
+                gpui::div()
+                    .rounded(px(4.))
+                    .border_1()
+                    .border_color(strategy_color)
+                    .px(px(6.))
+                    .py(px(1.))
+                    .text_size(px(10.))
+                    .text_color(strategy_color)
+                    .child(strategy_label),
+            )
             .child(gpui::div().flex_1())
-            // Route note (备注): dim, right-aligned, truncated — display only.
-            .when_some(route.note.as_deref(), |this, note| {
-                this.child(
-                    gpui::div()
-                        .text_size(px(12.))
-                        .text_color(theme.muted_foreground)
-                        .max_w(px(360.))
-                        .text_ellipsis()
-                        .child(note.to_string()),
-                )
-            })
-            .when(manage, |this| {
-                let busy = self.manage_write_in_flight;
-                this.child(
+            .child(
+                gpui::div()
+                    .text_size(px(10.5))
+                    .text_color(theme.muted_foreground)
+                    .child(summary),
+            )
+            .on_click(
+                cx.listener(move |this, _, _, cx| this.toggle_group(alias_click.clone(), cx)),
+            );
+        if manage {
+            let busy = self.manage_write_in_flight;
+            let alias = route.alias.clone();
+            let edit_route = route.clone();
+            head = head
+                .child(
                     Button::new((ElementId::from("route-edit"), alias.clone()))
                         .icon(Icon::new(IconName::Pencil).small())
                         .label("编辑")
@@ -1019,87 +1290,140 @@ impl RoutesPage {
                         .on_click(cx.listener(move |this, _, window, cx| {
                             this.confirm_delete_route(alias.clone(), window, cx)
                         })),
-                )
-            });
+                );
+        }
 
-        let mut entries_col = gpui::div().flex().flex_col().gap(px(ACCT_GAP));
-        if section.accounts.is_empty() {
-            // A dashed placeholder row for an entry-less route.
-            entries_col = entries_col.child(
-                gpui::div()
-                    .h(px(ACCT_H))
-                    .flex()
-                    .items_center()
-                    .justify_center()
-                    .border_1()
-                    .border_color(theme.border)
-                    .rounded(px(10.))
-                    .text_size(px(12.))
-                    .text_color(theme.muted_foreground)
-                    .child("此路由还没有模型"),
-            );
-        }
-        for (index, account) in section.accounts.iter().enumerate() {
-            entries_col = entries_col.child(self.stage_entry(
-                route,
-                index,
-                section.accounts.len(),
-                account,
-                pulse,
-                cx,
-            ));
-        }
-        let entries_col =
-            entries_col.on_drop(cx.listener(move |this, drag: &StageEntryDrag, _, cx| {
-                this.finish_stage_drag(drag, cx)
-            }));
-        let mut section = gpui::div()
-            .relative()
+        let mut card = gpui::div()
             .flex()
             .flex_col()
-            .gap(px(SEC_INNER_GAP))
-            .child(header)
-            .child(entries_col);
-        if let Some((drop_alias, slot)) = &self.stage_drop
-            && drop_alias == &route.alias
-        {
-            // Overlay line, no layout shift: rows (and the wire endpoints
-            // computed from them) stay exactly where they are.
-            let line_y =
-                SEC_HEAD_H + SEC_INNER_GAP + *slot as f32 * (ACCT_H + ACCT_GAP) - ACCT_GAP / 2.;
-            section = section.child(
+            .rounded(px(8.))
+            .border_1()
+            .border_color(theme.border)
+            .bg(theme.popover)
+            .overflow_hidden()
+            .child(head);
+        if !collapsed {
+            let mut entries = gpui::div()
+                .relative()
+                .flex()
+                .flex_col()
+                .gap(px(ENTRY_GAP))
+                .p(px(6.))
+                .on_drop(cx.listener(move |this, drag: &StageEntryDrag, _, cx| {
+                    this.finish_stage_drag(drag, cx)
+                }));
+            if section.accounts.is_empty() {
+                entries = entries.child(
+                    gpui::div()
+                        .h(px(ENTRY_H))
+                        .flex()
+                        .items_center()
+                        .justify_center()
+                        .border_1()
+                        .border_color(theme.border)
+                        .rounded(px(6.))
+                        .text_size(px(12.))
+                        .text_color(theme.muted_foreground)
+                        .child("此路由还没有模型"),
+                );
+            }
+            for (index, account) in section.accounts.iter().enumerate() {
+                entries = entries.child(self.stage_entry(
+                    StageEntryInputs {
+                        route,
+                        index,
+                        count: section.accounts.len(),
+                        account,
+                        share: shares.get(index).copied(),
+                        pulse,
+                        now,
+                        tz,
+                    },
+                    cx,
+                ));
+            }
+            if let Some((drop_alias, slot)) = &self.stage_drop
+                && drop_alias == &route.alias
+            {
+                // Fixed row height keeps the insertion line exact without
+                // measuring the rows; no layout shift, no wire endpoints.
+                let line_y = 6. + *slot as f32 * (ENTRY_H + ENTRY_GAP) - ENTRY_GAP / 2.;
+                entries = entries.child(
+                    gpui::div()
+                        .absolute()
+                        .left(px(0.))
+                        .right(px(0.))
+                        .top(px(line_y - 1.))
+                        .h(px(2.))
+                        .rounded_full()
+                        .bg(accent),
+                );
+            }
+            card = card.child(entries);
+        }
+
+        gpui::div()
+            .relative()
+            .mb(px(14.))
+            .child(
                 gpui::div()
                     .absolute()
-                    .left(px(0.))
-                    .right(px(0.))
-                    .top(px(line_y - 1.))
-                    .h(px(2.))
+                    .left(px(-20.))
+                    .top(px(18.))
+                    .w(px(9.))
+                    .h(px(9.))
                     .rounded_full()
-                    .bg(accent),
-            );
-        }
-        section
+                    .border_2()
+                    .border_color(accent)
+                    .bg(card_bg),
+            )
+            .child(card)
     }
 
-    /// One entry row of a route section: serving dot, account head, model chip,
-    /// constraints. Manage mode (self.manage) adds ▲▼ on the left and ✕ on the
-    /// right — all inside the fixed row height, so the wire geometry never
-    /// shifts.
-    fn stage_entry(
-        &self,
-        route: &RouteRow,
-        index: usize,
-        count: usize,
-        account: &StageAccount,
-        pulse: f32,
-        cx: &mut Context<Self>,
-    ) -> Div {
+    /// One entry row. Its leading control follows the group's strategy: health
+    /// and recent latency for smart, a relative weight, or an order badge.
+    /// Manage mode keeps the grip, reorder, pause and remove controls plus the
+    /// same drag guard.
+    fn stage_entry(&self, inputs: StageEntryInputs<'_>, cx: &mut Context<Self>) -> Div {
+        let StageEntryInputs {
+            route,
+            index,
+            count,
+            account,
+            share,
+            pulse,
+            now,
+            tz,
+        } = inputs;
         let theme = cx.theme();
         let manage = self.manage;
         let busy = self.manage_write_in_flight;
         let cooling = account.cool_until.is_some();
         let disabled = account.stopped.is_some();
         let paused = account.paused;
+        let smart = route.strategy == RouteStrategy::Smart;
+        let primary = smart && index == 0;
+        let smart_color: Hsla = gpui::rgb(0x0969da).into();
+        // The reference marks the first smart candidate with a radio ring and
+        // a faint blue wash. It is a display hint only; dispatch still ranks
+        // candidates from live state.
+        let radio = gpui::div()
+            .w(px(13.))
+            .h(px(13.))
+            .flex_shrink_0()
+            .flex()
+            .items_center()
+            .rounded_full()
+            .border(px(1.5))
+            .border_color(if primary { smart_color } else { theme.border })
+            .justify_center()
+            .child(
+                gpui::div()
+                    .w(px(5.))
+                    .h(px(5.))
+                    .rounded_full()
+                    .bg(if primary { smart_color } else { theme.popover }),
+            );
         let mut dot_color = if account.live {
             theme.foreground
         } else if cooling {
@@ -1110,18 +1434,122 @@ impl RoutesPage {
         if account.live {
             dot_color.a = 0.45 + 0.55 * pulse;
         }
-        let caption_color = if account.live {
-            theme.foreground
-        } else {
-            theme.muted_foreground
+
+        let latency = account
+            .latency_ms
+            .map_or_else(|| "—".to_string(), |ms| format!("{ms}ms"));
+        let leading = match route.strategy {
+            RouteStrategy::Smart => {
+                let state = if let Some(stopped) = account.stopped {
+                    stopped.label()
+                } else if cooling {
+                    "冷却"
+                } else {
+                    "健康"
+                };
+                let mut color: Hsla = if account.stopped.is_some() {
+                    theme.muted_foreground
+                } else if cooling {
+                    theme.warning
+                } else {
+                    theme.success
+                };
+                if account.live {
+                    color.a = 0.45 + 0.55 * pulse;
+                }
+                gpui::div()
+                    .w(px(104.))
+                    .flex_shrink_0()
+                    .flex()
+                    .items_center()
+                    .gap(px(5.))
+                    .text_size(px(10.5))
+                    .text_color(color)
+                    .child(gpui::div().w(px(6.)).h(px(6.)).rounded_full().bg(color))
+                    .child(format!("{state} · {latency}"))
+            }
+            RouteStrategy::Weighted => {
+                let color: Hsla = gpui::rgb(0x8250df).into();
+                gpui::div()
+                    .w(px(104.))
+                    .flex_shrink_0()
+                    .flex()
+                    .items_center()
+                    .gap(px(5.))
+                    .text_size(px(11.))
+                    .text_color(color)
+                    .child(
+                        gpui::div()
+                            .rounded(px(4.))
+                            .bg(theme.secondary)
+                            .px(px(6.))
+                            .child(format!("{}%", share.unwrap_or(0))),
+                    )
+                    .child("权重")
+            }
+            RouteStrategy::Rotate => {
+                let color: Hsla = gpui::rgb(0x0f766e).into();
+                gpui::div()
+                    .w(px(104.))
+                    .flex_shrink_0()
+                    .flex()
+                    .items_center()
+                    .gap(px(5.))
+                    .text_size(px(10.5))
+                    .text_color(color)
+                    .child(
+                        gpui::div()
+                            .w(px(16.))
+                            .h(px(16.))
+                            .flex()
+                            .items_center()
+                            .rounded_full()
+                            .bg(theme.secondary)
+                            .justify_center()
+                            .child((index + 1).to_string()),
+                    )
+                    .child(if account.live { "当前" } else { "" })
+            }
+            RouteStrategy::Ordered => gpui::div()
+                .w(px(104.))
+                .flex_shrink_0()
+                .flex()
+                .items_center()
+                .gap(px(5.))
+                .text_color(theme.accent)
+                .child(
+                    gpui::div()
+                        .w(px(20.))
+                        .h(px(20.))
+                        .flex()
+                        .items_center()
+                        .rounded(px(5.))
+                        .bg(theme.accent)
+                        .text_color(theme.accent_foreground)
+                        .justify_center()
+                        .child((index + 1).to_string()),
+                )
+                .when(account.live, |this| {
+                    this.child(gpui::div().text_size(px(10.)).child("当前"))
+                }),
         };
-        let row = gpui::div()
-            .h(px(ACCT_H))
+
+        let initial = account
+            .head
+            .chars()
+            .next()
+            .map_or_else(|| "?".to_string(), |ch| ch.to_string());
+        let mut row = gpui::div()
+            .h(px(ENTRY_H))
             .flex()
             .items_center()
-            .gap(px(10.))
-            .px(px(12.))
-            .bg(theme.popover)
+            .gap(px(9.))
+            .px(px(9.))
+            .bg(if primary {
+                theme.accent.alpha(0.08)
+            } else {
+                theme.popover
+            })
             .border_1()
             .border_color(if account.live {
                 theme.foreground
@@ -1130,127 +1558,39 @@ impl RoutesPage {
             } else {
                 theme.border
             })
-            .rounded(px(10.))
-            .overflow_hidden()
-            // A rested, stopped or paused entry is skipped by dispatch — dim
-            // it so the stage reads as "present but out of rotation".
+            .rounded(px(6.))
             .opacity(if (cooling || disabled || paused) && !account.live {
                 0.55
             } else {
                 1.0
-            });
-        let row = if manage {
-            let alias_up = route.alias.clone();
-            let alias_down = route.alias.clone();
-            let drag_alias = route.alias.clone();
-            let move_alias = route.alias.clone();
-            let drag_label = format!("{} · {}", account.head, account.model);
-            let row = row
-                .on_drag_move(cx.listener(
-                    move |this, event: &gpui::DragMoveEvent<StageEntryDrag>, _, cx| {
-                        // Drag-move listeners fire window-wide while a matching
-                        // drag is active (no hit-testing) — only this row's own
-                        // bounds may claim the drop site.
-                        if !event.bounds.contains(&event.event.position) {
-                            return;
-                        }
-                        // Cross-route dragging is out of scope.
-                        if event.drag(cx).alias != move_alias {
-                            return;
-                        }
-                        let after = event.event.position.y > event.bounds.center().y;
-                        // Cloned per qualifying move: the listener is Fn (it
-                        // fires on every mouse move of the drag).
-                        let next = Some((move_alias.clone(), index + usize::from(after)));
-                        if this.stage_drop != next {
-                            this.stage_drop = next;
-                            cx.notify();
-                        }
-                    },
-                ))
-                .when(!busy, |row| {
-                    row.child(
-                        gpui::div()
-                            .id(ElementId::from(gpui::SharedString::from(format!(
-                                "entry-grip-{}-{index}",
-                                route.alias
-                            ))))
-                            .cursor_grab()
-                            .flex_shrink_0()
-                            .text_color(theme.muted_foreground)
-                            .hover(|this| this.text_color(theme.foreground))
-                            .child(Icon::new(IconName::GripVertical).small())
-                            .on_drag(
-                                StageEntryDrag {
-                                    alias: drag_alias,
-                                    from: index,
-                                    label: drag_label,
-                                },
-                                |drag, _, _, cx| {
-                                    cx.new(|_| super::DragGhost {
-                                        text: drag.label.clone(),
-                                    })
-                                },
-                            ),
-                    )
-                });
-            row.child(
-                Button::new(ElementId::from(gpui::SharedString::from(format!(
-                    "entry-up-{}-{index}",
-                    route.alias
-                ))))
-                .icon(Icon::new(IconName::ArrowUp).small())
-                .ghost()
-                .compact()
-                .disabled(busy || index == 0)
-                .on_click(cx.listener(move |this, _, _, cx| {
-                    this.move_entry(alias_up.clone(), index, true, cx)
-                })),
-            )
-            .child(
-                Button::new(ElementId::from(gpui::SharedString::from(format!(
-                    "entry-down-{}-{index}",
-                    route.alias
-                ))))
-                .icon(Icon::new(IconName::ArrowDown).small())
-                .ghost()
-                .compact()
-                .disabled(busy || index + 1 == count)
-                .on_click(cx.listener(move |this, _, _, cx| {
-                    this.move_entry(alias_down.clone(), index, false, cx)
-                })),
-            )
-        } else {
-            row
-        };
-        let row = row
+            })
+            .when(smart, |row| row.child(radio))
+            .child(leading)
             .child(
                 gpui::div()
-                    .w(px(8.))
-                    .h(px(8.))
+                    .w(px(16.))
+                    .h(px(16.))
                     .flex_shrink_0()
-                    .rounded_full()
-                    .border_1()
-                    .border_color(dot_color)
-                    .when(account.live || cooling || disabled || paused, |dot| {
-                        dot.bg(dot_color)
-                    }),
+                    .flex()
+                    .items_center()
+                    .rounded(px(4.))
+                    .bg(client_hue(&account.head))
+                    .text_size(px(8.))
+                    .justify_center()
+                    .child(initial),
             )
             .child(
                 gpui::div()
                     .flex_shrink_0()
-                    .max_w(px(220.))
+                    .max_w(px(200.))
                     .overflow_hidden()
-                    .text_size(px(13.))
+                    .text_ellipsis()
+                    .text_size(px(12.))
                     .text_color(theme.foreground)
                     .child(account.head.clone()),
             )
             .child(
                 gpui::div()
-                    // Sized by the model id itself: the row has slack (the
-                    // flex_1 spacer below eats it), and a capped width would
-                    // wrap a long id onto a second line the fixed row height
-                    // then clips.
                     .flex_shrink_0()
                     .whitespace_nowrap()
                     .font_family("Menlo")
@@ -1297,166 +1637,204 @@ impl RoutesPage {
                         .child("已暂停"),
                 )
             })
-            // Nothing extra here: an entry is one account on one model, so the
-            // row carries no tally — its own marker says why it cannot
-            // dispatch, and the cooling marker says when it can again.
+            .child(
+                gpui::div()
+                    .w(px(8.))
+                    .h(px(8.))
+                    .flex_shrink_0()
+                    .rounded_full()
+                    .border_1()
+                    .border_color(dot_color)
+                    .when(account.live || cooling || disabled || paused, |dot| {
+                        dot.bg(dot_color)
+                    }),
+            )
             .child(gpui::div().flex_1())
             .when_some(account.caption, |row, caption| {
                 row.child(
                     gpui::div()
                         .flex_shrink_0()
                         .text_size(px(12.))
-                        .text_color(caption_color)
+                        .text_color(theme.foreground)
                         .child(caption),
                 )
             })
             .when(account.caption.is_none() && !cooling && !disabled, |row| {
-                // The serving caption's idle counterpart: the latest successful call,
-                // in the same slot (传输中 → lands → the time appears in place).
                 row.when_some(account.last_success, |row, ok| {
-                    let zone = crate::ui_tz::display_tz();
-                    let local = ok.to_zoned_datetime(zone.clone());
-                    let now = Timestamp::now().to_zoned_datetime(zone);
-                    let stamp = if local.date() == now.date() {
-                        local.strftime("%H:%M").to_string()
-                    } else if local.date() == now.date().yesterday().unwrap_or(now.date()) {
-                        format!("昨天 {}", local.strftime("%H:%M"))
-                    } else {
-                        local.strftime("%m-%d %H:%M").to_string()
-                    };
                     row.child(
                         gpui::div()
                             .flex_shrink_0()
                             .text_size(px(11.))
                             .text_color(theme.muted_foreground)
-                            .child(stamp),
+                            .child(short_time(ok, now, tz)),
                     )
                 })
+            })
+            .when(smart && !manage, |row| {
+                row.child(
+                    gpui::div()
+                        .flex_shrink_0()
+                        .rounded(px(4.))
+                        .border_1()
+                        .border_color(theme.border)
+                        .bg(theme.popover)
+                        .px(px(5.))
+                        .py(px(1.))
+                        .text_size(px(10.))
+                        .text_color(theme.muted_foreground)
+                        .child("自动选择"),
+                )
             });
         if manage {
+            let alias_up = route.alias.clone();
+            let alias_down = route.alias.clone();
+            let drag_alias = route.alias.clone();
+            let move_alias = route.alias.clone();
+            let drag_label = format!("{} · {}", account.head, account.model);
+            row = row
+                .on_drag_move(cx.listener(
+                    move |this, event: &gpui::DragMoveEvent<StageEntryDrag>, _, cx| {
+                        // Drag-move listeners fire window-wide while a matching
+                        // drag is active — only this row's own bounds may claim
+                        // the drop site.
+                        if !event.bounds.contains(&event.event.position) {
+                            return;
+                        }
+                        // Cross-route dragging stays out of scope.
+                        if event.drag(cx).alias != move_alias {
+                            return;
+                        }
+                        let after = event.event.position.y > event.bounds.center().y;
+                        let next = Some((move_alias.clone(), index + usize::from(after)));
+                        if this.stage_drop != next {
+                            this.stage_drop = next;
+                            cx.notify();
+                        }
+                    },
+                ))
+                .when(!busy, |row| {
+                    row.child(
+                        gpui::div()
+                            .id(ElementId::from(gpui::SharedString::from(format!(
+                                "entry-grip-{}-{index}",
+                                route.alias
+                            ))))
+                            .cursor_grab()
+                            .flex_shrink_0()
+                            .text_color(theme.muted_foreground)
+                            .hover(|this| this.text_color(theme.foreground))
+                            .child(Icon::new(IconName::GripVertical).small())
+                            .on_drag(
+                                StageEntryDrag {
+                                    alias: drag_alias,
+                                    from: index,
+                                    label: drag_label,
+                                },
+                                |drag, _, _, cx| {
+                                    cx.new(|_| super::DragGhost {
+                                        text: drag.label.clone(),
+                                    })
+                                },
+                            ),
+                    )
+                })
+                .child(
+                    Button::new(ElementId::from(gpui::SharedString::from(format!(
+                        "entry-up-{}-{index}",
+                        route.alias
+                    ))))
+                    .icon(Icon::new(IconName::ArrowUp).small())
+                    .ghost()
+                    .compact()
+                    .disabled(busy || index == 0)
+                    .on_click(cx.listener(move |this, _, _, cx| {
+                        this.move_entry(alias_up.clone(), index, true, cx)
+                    })),
+                )
+                .child(
+                    Button::new(ElementId::from(gpui::SharedString::from(format!(
+                        "entry-down-{}-{index}",
+                        route.alias
+                    ))))
+                    .icon(Icon::new(IconName::ArrowDown).small())
+                    .ghost()
+                    .compact()
+                    .disabled(busy || index + 1 == count)
+                    .on_click(cx.listener(move |this, _, _, cx| {
+                        this.move_entry(alias_down.clone(), index, false, cx)
+                    })),
+                );
             let alias = route.alias.clone();
             let toggle_alias = route.alias.clone();
-            let row = row.child(
-                Button::new(ElementId::from(gpui::SharedString::from(format!(
-                    "entry-pause-{}-{index}",
-                    route.alias
-                ))))
-                .label(if paused { "恢复" } else { "暂停" })
-                .ghost()
-                .compact()
-                .disabled(busy)
-                .on_click(cx.listener(move |this, _, _, cx| {
-                    this.toggle_entry_pause(toggle_alias.clone(), index, cx)
-                })),
-            );
-            row.child(
-                Button::new(ElementId::from(gpui::SharedString::from(format!(
-                    "entry-del-{}-{index}",
-                    route.alias
-                ))))
-                .icon(Icon::new(IconName::Close).small())
-                .ghost()
-                .compact()
-                // The store requires ≥1 entry per route — the last row can only go
-                // away by deleting the route itself (the section-level action).
-                .disabled(busy || count == 1)
-                .on_click(cx.listener(move |this, _, window, cx| {
-                    this.confirm_remove_entry(alias.clone(), index, window, cx)
-                })),
-            )
-        } else {
-            row
+            row = row
+                .child(
+                    Button::new(ElementId::from(gpui::SharedString::from(format!(
+                        "entry-pause-{}-{index}",
+                        route.alias
+                    ))))
+                    .label(if paused { "恢复" } else { "暂停" })
+                    .ghost()
+                    .compact()
+                    .disabled(busy)
+                    .on_click(cx.listener(move |this, _, _, cx| {
+                        this.toggle_entry_pause(toggle_alias.clone(), index, cx)
+                    })),
+                )
+                .child(
+                    Button::new(ElementId::from(gpui::SharedString::from(format!(
+                        "entry-del-{}-{index}",
+                        route.alias
+                    ))))
+                    .icon(Icon::new(IconName::Close).small())
+                    .ghost()
+                    .compact()
+                    // The store requires ≥1 entry per route — the last row can
+                    // only go away by deleting the whole route.
+                    .disabled(busy || count == 1)
+                    .on_click(cx.listener(move |this, _, window, cx| {
+                        this.confirm_remove_entry(alias.clone(), index, window, cx)
+                    })),
+                );
         }
+        row
     }
 }
 
-/// Paint the stage wires: resting wires are solid bezier strokes; live wires
-/// get a full-length faint underlay of the same bezier (the wire reads as a
-/// continuous line — a 3-on/5-off dash alone is 62% empty and the hub's
-/// fan-out turns to mush) with the animated dash flow on top (3 on / 5 off,
-/// offset advancing with `phase`). Each wire
-/// carries its own colour (client hue on caller wires, accent/border on hub
-/// wires).
-fn paint_wires(
-    bounds: Bounds<gpui::Pixels>,
-    wires: &Rc<Vec<Wire>>,
-    window: &mut Window,
-    phase: f32,
-) {
-    for wire in wires.iter() {
-        // Cubic control points: 28px horizontal handles
-        // (`C x1+28 y1, x2-28 y2, x2 y2`).
-        let (x1, y1, x2, y2) = (wire.x1, wire.y1, wire.x2, wire.y2);
-        let (c1x, c1y, c2x, c2y) = (x1 + 28., y1, x2 - 28., y2);
-        let at = |t: f32| {
-            let u = 1. - t;
-            (
-                u * u * u * x1 + 3. * u * u * t * c1x + 3. * u * t * t * c2x + t * t * t * x2,
-                u * u * u * y1 + 3. * u * u * t * c1y + 3. * u * t * t * c2y + t * t * t * y2,
-            )
-        };
-        let origin = bounds.origin;
-        let solid = |window: &mut Window, color: Hsla| {
-            let mut builder = PathBuilder::stroke(px(1.5));
-            let (sx, sy) = at(0.);
-            builder.move_to(point(origin.x + px(sx), origin.y + px(sy)));
-            builder.cubic_bezier_to(
-                point(origin.x + px(x2), origin.y + px(y2)),
-                point(origin.x + px(c1x), origin.y + px(c1y)),
-                point(origin.x + px(c2x), origin.y + px(c2y)),
-            );
-            if let Ok(path) = builder.build() {
-                window.paint_path(path, color);
-            }
-        };
-        if !wire.live {
-            solid(window, wire.color);
-            continue;
-        }
-        // Live: faint continuous underlay, then the flowing dashes on top.
-        let mut underlay = wire.color;
-        underlay.a = 0.3;
-        solid(window, underlay);
-        // Dash walk: sample the bezier, emit one sub-path per "on" run (3px on /
-        // 5px off, the run advancing as `phase` grows → flow toward the target).
-        // Samples scale with the wire's length bound so steep wires (tall stages)
-        // keep ~1px steps and no 3px on-window falls between samples.
-        let samples = (((x2 - x1).abs() + (y2 - y1).abs()) as usize).clamp(32, 512);
-        let points: Vec<(f32, f32)> = (0..=samples)
-            .map(|i| at(i as f32 / samples as f32))
-            .collect();
-        let mut arc = 0.;
-        let mut run: Vec<gpui::Point<gpui::Pixels>> = Vec::new();
-        let on = |s: f32| (s - phase).rem_euclid(8.) < 3.;
-        let flush = |run: &mut Vec<gpui::Point<gpui::Pixels>>, window: &mut Window| {
-            if run.len() >= 2 {
-                let mut builder = PathBuilder::stroke(px(1.5));
-                builder.move_to(run[0]);
-                for p in &run[1..] {
-                    builder.line_to(*p);
-                }
-                if let Ok(path) = builder.build() {
-                    window.paint_path(path, wire.color);
-                }
-            }
-            run.clear();
-        };
-        for (index, &(ax, ay)) in points.iter().take(samples).enumerate() {
-            let (bx, by) = points[index + 1];
-            let seg = ((bx - ax).powi(2) + (by - ay).powi(2)).sqrt();
-            if on(arc) {
-                run.push(point(origin.x + px(ax), origin.y + px(ay)));
+/// Right side of a group head, derived entirely from the current snapshot.
+fn group_summary(
+    route: &RouteRow,
+    section: &StageSection,
+    now: Timestamp,
+    tz: &TimeZone,
+) -> String {
+    match route.strategy {
+        RouteStrategy::Weighted => {
+            let shares = stats::weighted_shares(&route.entries);
+            let ratios = shares
+                .iter()
+                .map(|share| format!("{share}%"))
+                .collect::<Vec<_>>()
+                .join(" · ");
+            if ratios.is_empty() {
+                "权重 —".to_string()
             } else {
-                flush(&mut run, window);
+                format!("权重 {ratios}")
             }
-            arc += seg;
         }
-        // Emit the terminal sample too, or every dash stops one step short of the
-        // node edge (and an on-window covering the tail would vanish).
-        if on(arc) {
-            let (ex, ey) = points[samples];
-            run.push(point(origin.x + px(ex), origin.y + px(ey)));
+        RouteStrategy::Rotate => format!("轮询 · {} 个账号", route.entries.len()),
+        RouteStrategy::Ordered => format!("顺序 · {} 个账号", route.entries.len()),
+        RouteStrategy::Smart => {
+            let latest = section
+                .accounts
+                .iter()
+                .filter_map(|account| account.last_success.map(|at| (at, account.head.as_str())))
+                .max_by_key(|(at, _)| *at);
+            match latest {
+                Some((at, head)) => {
+                    format!("最近成功 {head} · {}", short_time(at, now, tz))
+                }
+                None => "最近成功 —".to_string(),
+            }
         }
-        flush(&mut run, window);
     }
 }

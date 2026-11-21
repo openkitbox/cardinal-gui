@@ -244,6 +244,8 @@ impl Render for StatusPage {
                     .overflow_hidden()
                     .child(
                         gpui::div()
+                            .flex()
+                            .flex_col()
                             .size_full()
                             .opacity(presence.progress)
                             .child(content),

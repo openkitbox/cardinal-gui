@@ -3,13 +3,14 @@
 //! deliberate: a DTO field rename makes the tool fail fast with a serde error
 //! instead of silently rendering empty pages.
 
-use std::{collections::HashMap, path::PathBuf, sync::Arc};
+use std::{collections::HashMap, path::PathBuf};
 
 use gateway::{
     activity::ActivityEvent,
     admin_ops::{Bootstrap, KeyQuotaRow},
-    store::{GroupRow, TrendRow, UsageWindow, UserRow},
+    store::{GroupRow, RequestRow, TrendRow, UsageWindow, UserRow},
 };
+use jiff::{SignedDuration, Timestamp};
 
 use super::mock_server::MockRoutes;
 
@@ -38,8 +39,40 @@ struct Extras {
 
 pub(crate) fn load() -> Result<Fixture, String> {
     let dir = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("fixtures/screenshots");
-    let bootstrap_text = read(&dir.join("bootstrap.json"))?;
+    let bootstrap_file = read(&dir.join("bootstrap.json"))?;
     let extras_text = read(&dir.join("extras.json"))?;
+    let mut raw: serde_json::Value = serde_json::from_str(&bootstrap_file)
+        .map_err(|e| format!("fixtures/bootstrap.json is not JSON: {e}"))?;
+    let now = Timestamp::now();
+
+    // The file keeps stable placeholder timestamps; a screenshot taken days
+    // later still needs a "recent success" in the smart group summary. Patch
+    // the parsed document once, so the REST body and the SSE payload below
+    // carry identical data (apart from the event tag) rather than two
+    // independently generated variants.
+    let successes = [
+        (10_i64, "gpt-4o-mini", 8_i64),
+        (10, "gpt-4o", 24),
+        (11, "gpt-4o-mini", 40),
+        (12, "claude-sonnet-4-5", 15),
+    ];
+    let success_rows: Vec<serde_json::Value> = successes
+        .iter()
+        .map(|(key_id, model, ago)| {
+            serde_json::json!({
+                "key_id": key_id,
+                "served_model": model,
+                "last_ok": now - SignedDuration::from_secs(*ago),
+            })
+        })
+        .collect();
+    let success_array = raw
+        .get_mut("model_success")
+        .and_then(serde_json::Value::as_array_mut)
+        .ok_or("fixtures/bootstrap.json has no model_success array")?;
+    *success_array = success_rows;
+    let bootstrap_text = serde_json::to_string(&raw)
+        .map_err(|e| format!("serialize fixtures/bootstrap.json: {e}"))?;
 
     // Validate against the gateway's own DTOs — this is the whole point of
     // using typed fixtures rather than opaque JSON blobs.
@@ -65,11 +98,44 @@ pub(crate) fn load() -> Result<Fixture, String> {
     };
     let edit_label = edit_key.label.clone();
 
-    let bootstrap_event = serde_json::to_string(&ActivityEvent::Bootstrap(Arc::new(bootstrap)))
-        .map_err(|e| format!("serialize bootstrap SSE event: {e}"))?;
+    // The SSE envelope adds only the internally tagged variant's `t` field;
+    // the bootstrap payload is the same document served by `/api/bootstrap`.
+    let mut event = raw.clone();
+    event
+        .as_object_mut()
+        .ok_or("fixtures/bootstrap.json is not an object")?
+        .insert("t".to_owned(), serde_json::json!("bootstrap"));
+    let bootstrap_event =
+        serde_json::to_string(&event).map_err(|e| format!("serialize bootstrap SSE event: {e}"))?;
+    serde_json::from_str::<ActivityEvent>(&bootstrap_event)
+        .map_err(|e| format!("fixtures bootstrap SSE event does not decode: {e}"))?;
 
-    let raw: serde_json::Value = serde_json::from_str(&bootstrap_text)
-        .map_err(|e| format!("fixtures/bootstrap.json is not JSON: {e}"))?;
+    // One in-flight attempt for the first `k2-256k` rotate entry: it stays
+    // live (no End) so the screenshot exercises the 「当前」 marker. The
+    // caller/agent pair is one already in the recent-ledger client set, so
+    // the feed does not introduce a fifth client card.
+    let live_event = serde_json::to_string(&serde_json::json!({
+        "t": "start",
+        "origin": 1,
+        "seq": 1,
+        "client_model": "k2-256k",
+        "route": "k2-256k",
+        "account": "主用",
+        "served_model": "gpt-4o",
+        "protocol": "openai_chat",
+        "client_protocol": "openai_chat",
+        "effort": "medium",
+        "caller": "cardinal-antb",
+        "caller_key_id": null,
+        "caller_user_id": null,
+        "agent": "antb",
+        "key_id": 10,
+        "stream": true,
+    }))
+    .map_err(|e| format!("serialize live SSE event: {e}"))?;
+    serde_json::from_str::<ActivityEvent>(&live_event)
+        .map_err(|e| format!("fixtures live SSE event does not decode: {e}"))?;
+
     let array = |key: &str| -> Result<serde_json::Value, String> {
         raw.get(key)
             .cloned()
@@ -104,7 +170,7 @@ pub(crate) fn load() -> Result<Fixture, String> {
     );
     bodies.insert(
         "/api/requests".to_owned(),
-        serde_json::to_string(&items(serde_json::json!([]))).map_err(|e| e.to_string())?,
+        serde_json::to_string(&items(request_rows(now))).map_err(|e| e.to_string())?,
     );
     bodies.insert(
         "/api/chat-models".to_owned(),
@@ -164,6 +230,7 @@ pub(crate) fn load() -> Result<Fixture, String> {
         routes: MockRoutes {
             bodies,
             bootstrap_event,
+            live_event: Some(live_event),
         },
         edit_target,
     })
@@ -172,4 +239,60 @@ pub(crate) fn load() -> Result<Fixture, String> {
 fn read(path: &PathBuf) -> Result<String, String> {
     std::fs::read_to_string(path)
         .map_err(|e| format!("read {}: {e} (run from the worktree root)", path.display()))
+}
+
+/// Recent ledger rows for the routes scene: four client identities, both
+/// serving accounts used by the route entries, and non-null latencies so the
+/// smart rows show a measured time. Times are relative to capture time — a
+/// fixed timestamp would fall out of the 60-second rate window.
+fn request_rows(now: Timestamp) -> Vec<RequestRow> {
+    const CLIENTS: [(&str, &str); 4] = [
+        ("cardinal-antb", "antb"),
+        ("cardinal-claude-code", "claude-code"),
+        ("cardinal-openclaw", "openclaw"),
+        ("cardinal-cherry-studio", "cherry-studio"),
+    ];
+
+    (0_i32..30)
+        .map(|index| {
+            // Newest first: reverse the client cycle so the oldest (seeded
+            // first) client is antb, matching the reference's selected card.
+            let (caller, agent) = CLIENTS[(29 - index) as usize % CLIENTS.len()];
+            let (provider_id, key_id, model, key_label, alias) = match index % 4 {
+                0 | 1 => (1, 10, "gpt-4o-mini", "主用", "deepseek"),
+                2 => (2, 12, "claude-sonnet-4-5", "Claude Pro", "k3-256k"),
+                _ => (1, 10, "gpt-4o", "主用", "ertong-fabel"),
+            };
+            RequestRow {
+                id: 9_001 + i64::from(index),
+                ts: now - SignedDuration::from_secs(i64::from(2 + index)),
+                protocol: "openai_chat".to_owned(),
+                client_protocol: Some("openai_chat".to_owned()),
+                effort: Some("medium".to_owned()),
+                alias: Some(alias.to_owned()),
+                provider_id: Some(provider_id),
+                provider_key_id: Some(key_id),
+                model: Some(model.to_owned()),
+                served_model: Some(model.to_owned()),
+                status: 200,
+                input_tokens: Some(1_200 + i64::from(index) * 37),
+                output_tokens: Some(180 + i64::from(index) * 11),
+                cached_input_tokens: Some(0),
+                cache_creation_input_tokens: None,
+                total_ms: Some(240 + (index * 23) % 620),
+                ttft_ms: Some(90 + i64::from(index * 7 % 200)),
+                cost_usd: Some(0.0012 + f64::from(index) * 0.0003),
+                error: None,
+                caller_key: Some(caller.to_owned()),
+                agent: Some(agent.to_owned()),
+                request_id: Some(format!("req_fixture_{}", 9_001 + index)),
+                key_label: Some(key_label.to_owned()),
+                user_id: Some(1),
+                login: Some("owner".to_owned()),
+                gateway_key_id: Some(100),
+                charged_microus: Some(1_200 + i64::from(index) * 13),
+                rate_bp: Some(10_000),
+            }
+        })
+        .collect()
 }
