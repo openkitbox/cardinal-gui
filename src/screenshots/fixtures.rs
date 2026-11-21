@@ -148,6 +148,48 @@ pub(crate) fn load() -> Result<Fixture, String> {
     let mut bodies = HashMap::new();
     bodies.insert("/health".to_owned(), "ok".to_owned());
     bodies.insert("/api/bootstrap".to_owned(), bootstrap_text.clone());
+    // Portal settings are part of the settings-page visual fixtures as well as
+    // the route/provider scenes. Keep the values representative but fake: the
+    // screenshot server never serves real credentials.
+    bodies.insert(
+        "/api/portal/settings".to_owned(),
+        serde_json::json!({
+            "mail_transport": "http",
+            "mail_url": "https://mail.example.test/send",
+            "mail_token": "********",
+            "mail_from": "Cardinal <noreply@example.test>",
+            "mail_origin": "https://portal.example.test",
+            "smtp_host": "smtp.example.test",
+            "smtp_port": 587,
+            "smtp_username": "cardinal",
+            "smtp_password": "********",
+            "smtp_tls": "starttls",
+            "smtp_from": "Cardinal <noreply@example.test>"
+        })
+        .to_string(),
+    );
+    bodies.insert(
+        "/api/portal/providers".to_owned(),
+        serde_json::json!([
+            {
+                "provider": "google",
+                "client_id": "google-client-fixture",
+                "client_secret": "********",
+                "redirect_uri": "https://portal.example.test/auth/google/callback",
+                "enabled": true,
+                "extra": {}
+            },
+            {
+                "provider": "github",
+                "client_id": "github-client-fixture",
+                "client_secret": "********",
+                "redirect_uri": "https://portal.example.test/auth/github/callback",
+                "enabled": false,
+                "extra": {}
+            }
+        ])
+        .to_string(),
+    );
     bodies.insert(
         "/api/providers".to_owned(),
         serde_json::to_string(&raw.get("providers")).map_err(|e| e.to_string())?,

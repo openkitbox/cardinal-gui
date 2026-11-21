@@ -37,6 +37,7 @@ enum SceneAction {
     None,
     NewKeyForm,
     EditKeyForm,
+    SettingsPage(usize),
 }
 
 struct Scene {
@@ -77,6 +78,26 @@ const SCENES: &[Scene] = &[
         name: "users",
         tab: StatusTab::Users,
         action: SceneAction::None,
+    },
+    Scene {
+        name: "settings-general",
+        tab: StatusTab::Settings,
+        action: SceneAction::SettingsPage(0),
+    },
+    Scene {
+        name: "settings-mail",
+        tab: StatusTab::Settings,
+        action: SceneAction::SettingsPage(1),
+    },
+    Scene {
+        name: "settings-providers",
+        tab: StatusTab::Settings,
+        action: SceneAction::SettingsPage(2),
+    },
+    Scene {
+        name: "settings-payment",
+        tab: StatusTab::Settings,
+        action: SceneAction::SettingsPage(3),
     },
 ];
 
@@ -200,14 +221,15 @@ pub(crate) fn run() -> Result<(), String> {
                 requests_before = server.seen_paths().len();
                 cx.update_window(any_window, |_, window, app_cx| {
                     let (_, status_page) = app.read(app_cx).screenshot_handles();
-                    let providers = status_page.read(app_cx).providers_entity();
                     match scene.action {
                         SceneAction::NewKeyForm => {
+                            let providers = status_page.read(app_cx).providers_entity();
                             providers.update(app_cx, |page, cx| {
                                 page.open_key_form_for_screenshot(window, cx)
                             });
                         }
                         SceneAction::EditKeyForm => {
+                            let providers = status_page.read(app_cx).providers_entity();
                             providers.update(app_cx, |page, cx| {
                                 page.open_key_editor_for_screenshot(
                                     edit_target.provider_id,
@@ -215,6 +237,12 @@ pub(crate) fn run() -> Result<(), String> {
                                     window,
                                     cx,
                                 )
+                            });
+                        }
+                        SceneAction::SettingsPage(page_ix) => {
+                            let settings = status_page.read(app_cx).settings_entity();
+                            settings.update(app_cx, |page, cx| {
+                                page.set_screenshot_page(page_ix, cx);
                             });
                         }
                         SceneAction::None => {}
@@ -336,7 +364,7 @@ fn form_open(
         let providers = status_page.read(app_cx).providers_entity();
         let page = providers.read(app_cx);
         match action {
-            SceneAction::None => true,
+            SceneAction::None | SceneAction::SettingsPage(_) => true,
             SceneAction::NewKeyForm => page.has_key_form_for_screenshot(),
             // The reveal response must have landed, not just been requested:
             // the form shows the placeholder until `api_key` is filled in.

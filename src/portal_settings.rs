@@ -129,15 +129,6 @@ pub(crate) fn secret_status(raw: &str) -> &'static str {
     }
 }
 
-/// Labels that mark the two cards as DB-backed rather than local TOML.
-#[must_use]
-pub(crate) const fn card_labels() -> [&'static str; 2] {
-    [
-        "邮件发送（Gateway 数据库，保存后立即生效；非本地 TOML）",
-        "第三方登录（Gateway 数据库，保存后立即生效；非本地 TOML）",
-    ]
-}
-
 /// Build the mail body, validating every enum and the selected transport's
 /// required fields. Returns a display-ready message on any bad input.
 pub(crate) fn mail_body(draft: &MailDraft) -> Result<PortalSettingsBody, String> {

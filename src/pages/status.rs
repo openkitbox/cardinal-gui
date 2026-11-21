@@ -45,6 +45,12 @@ impl StatusPage {
         self.providers.clone()
     }
 
+    #[cfg(feature = "screenshot-test")]
+    #[doc(hidden)]
+    pub(crate) fn settings_entity(&self) -> Entity<SettingsPage> {
+        self.settings.clone()
+    }
+
     /// Screenshot-only readiness check for the active scene's page. The
     /// headless tool gates the form action on the owning page's load state so
     /// it never clicks into a still-loading page.

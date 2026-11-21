@@ -16,10 +16,10 @@ use gpui_kit::component::input::{Input, InputState};
 use gpui_kit::component::switch::Switch;
 use gpui_kit::component::tag::Tag;
 
-use crate::pages::{card, notify_error, notify_success, page_frame};
+use crate::pages::{notify_error, notify_success};
 use crate::payment_status::PaymentStatusView;
 use crate::portal_settings::{
-    AuthProviderView, MailDraft, PortalSettingsView, ProviderDraft, card_labels, mail_body, notice,
+    AuthProviderView, MailDraft, PortalSettingsView, ProviderDraft, mail_body, notice,
     provider_body, safe_secret_display, secret_status,
 };
 use crate::runtime::GatewayRuntime;
@@ -47,6 +47,7 @@ struct MailFields {
 }
 
 /// One provider row: the Gateway's masked view plus its editable inputs.
+#[derive(Clone)]
 struct ProviderFields {
     view: AuthProviderView,
     enabled: bool,
@@ -74,6 +75,8 @@ pub struct SettingsPage {
     /// Gateway DB provider card.
     providers: Vec<ProviderFields>,
     provider_error: Option<String>,
+    #[cfg(feature = "screenshot-test")]
+    screenshot_page: usize,
 }
 
 impl SettingsPage {
@@ -120,9 +123,17 @@ impl SettingsPage {
             mail_error: None,
             providers: Vec::new(),
             provider_error: None,
+            #[cfg(feature = "screenshot-test")]
+            screenshot_page: 0,
         };
         page.load_portal(window.window_handle(), cx);
         page
+    }
+
+    #[cfg(feature = "screenshot-test")]
+    pub(crate) fn set_screenshot_page(&mut self, page: usize, cx: &mut Context<Self>) {
+        self.screenshot_page = page;
+        cx.notify();
     }
 
     /// Load both DB-backed cards from the Gateway. The returned views carry
@@ -506,348 +517,411 @@ impl SettingsPage {
     }
 }
 
-impl Render for SettingsPage {
-    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        let gateway_addr = cx.global::<GatewayRuntime>().base_url().to_string();
+fn general_page(page: Entity<SettingsPage>) -> gpui_kit::component::setting::SettingPage {
+    use gpui_kit::component::setting::{SettingGroup, SettingItem, SettingPage};
 
-        page_frame("", "", cx)
-            .child(
-                card(cx)
-                    .child(
-                        gpui::div()
-                            .font_weight(gpui::FontWeight::MEDIUM)
-                            .text_color(cx.theme().foreground)
-                            .child("Runtime"),
-                    )
-                    .child(field_row(
-                        "运行模式",
-                        "HTTP 客户端（gateway 独立进程：cardinal-gateway）",
-                        cx,
-                    ))
-                    .child(field_row("网关", &gateway_addr, cx))
-                    .child(
-                        gpui::div()
-                            .flex()
-                            .items_center()
-                            .justify_between()
-                            .gap_4()
-                            .child(gpui::div().text_color(cx.theme().foreground).child("状态"))
-                            .child(match &self.status {
-                                RuntimeStatus::Starting => gpui::div()
-                                    .text_color(cx.theme().muted_foreground)
-                                    .child("连接中…")
-                                    .into_any_element(),
-                                RuntimeStatus::Connected => {
-                                    Tag::success().child("已连接").into_any_element()
-                                }
-                                RuntimeStatus::Failed(error) => gpui::div()
-                                    .flex()
-                                    .flex_col()
-                                    .items_end()
-                                    .gap_1()
-                                    .child(Tag::danger().child("未连接"))
-                                    .child(
-                                        gpui::div()
-                                            .text_size(px(12.))
-                                            .text_color(cx.theme().muted_foreground)
-                                            .child(error.clone()),
-                                    )
-                                    .into_any_element(),
-                            }),
-                    ),
-            )
-            .child(
-                card(cx)
-                    .child(
-                        gpui::div()
-                            .font_weight(gpui::FontWeight::MEDIUM)
-                            .text_color(cx.theme().foreground)
-                            .child("显示"),
-                    )
-                    .child(
+    SettingPage::new("常规")
+        .description("运行状态、显示和业务偏好")
+        .groups([
+            SettingGroup::new()
+                .title("运行状态")
+                .description("当前 GUI 与独立 Gateway 的连接信息")
+                .variant(gpui_kit::component::group_box::GroupBoxVariant::Outline)
+                .item(SettingItem::render({
+                    let page = page.clone();
+                    move |_, _, cx| {
+                        let page = page.read(cx);
+                        let gateway_addr = cx.global::<GatewayRuntime>().base_url().to_string();
+                        let status = match &page.status {
+                            RuntimeStatus::Starting => gpui::div()
+                                .text_color(cx.theme().muted_foreground)
+                                .child("连接中…")
+                                .into_any_element(),
+                            RuntimeStatus::Connected => {
+                                Tag::success().child("已连接").into_any_element()
+                            }
+                            RuntimeStatus::Failed(error) => gpui::div()
+                                .flex()
+                                .flex_col()
+                                .items_end()
+                                .gap_1()
+                                .child(Tag::danger().child("未连接"))
+                                .child(
+                                    gpui::div()
+                                        .text_size(px(12.))
+                                        .text_color(cx.theme().muted_foreground)
+                                        .child(error.clone()),
+                                )
+                                .into_any_element(),
+                        };
                         gpui::div()
                             .flex()
-                            .items_center()
-                            .justify_between()
-                            .gap_4()
-                            .child(
-                                gpui::div()
-                                    .text_color(cx.theme().foreground)
-                                    .child("显示时区"),
-                            )
+                            .flex_col()
+                            .gap_3()
+                            .child(field_row(
+                                "运行模式",
+                                "HTTP 客户端（gateway 独立进程：cardinal-gateway）",
+                                cx,
+                            ))
+                            .child(field_row("网关", &gateway_addr, cx))
                             .child(
                                 gpui::div()
                                     .flex()
                                     .items_center()
-                                    .gap_2()
-                                    .child(Input::new(&self.timezone).w(px(240.)))
-                                    .child(Button::new("settings-tz-save").label("保存").on_click(
-                                        cx.listener(|this, _, window, cx| {
-                                            this.save_timezone(window.window_handle(), cx);
-                                        }),
-                                    )),
-                            ),
-                    )
-                    .when_some(self.save_error.as_ref(), |this, error| {
-                        this.child(
-                            gpui::div()
-                                .text_size(px(12.))
-                                .text_color(cx.theme().danger)
-                                .child(error.clone()),
-                        )
-                    }),
-            )
-            .child(
-                card(cx)
-                    .child(
-                        gpui::div()
-                            .font_weight(gpui::FontWeight::MEDIUM)
-                            .text_color(cx.theme().foreground)
-                            .child("业务"),
-                    )
-                    .child(
-                        gpui::div()
-                            .flex()
-                            .items_center()
-                            .justify_between()
-                            .gap_4()
-                            .child(
-                                gpui::div()
-                                    .flex()
-                                    .flex_col()
-                                    .gap_0p5()
+                                    .justify_between()
+                                    .gap_4()
                                     .child(
-                                        gpui::div()
-                                            .text_color(cx.theme().foreground)
-                                            .child("销售模式"),
+                                        gpui::div().text_color(cx.theme().foreground).child("状态"),
                                     )
-                                    .child(
-                                        gpui::div()
-                                            .text_size(px(12.))
-                                            .text_color(cx.theme().muted_foreground)
-                                            .child("关闭后概览页不显示营收"),
-                                    ),
+                                    .child(status),
                             )
-                            .child(
-                                Switch::new("settings-sales-mode")
-                                    .checked(crate::sales_mode::enabled())
-                                    .on_change(cx.listener(|this, on: &bool, window, cx| {
-                                        this.set_sales_mode(*on, window.window_handle(), cx);
-                                    })),
-                            ),
-                    )
-                    .when_some(self.sales_error.as_ref(), |this, error| {
-                        this.child(
-                            gpui::div()
-                                .text_size(px(12.))
-                                .text_color(cx.theme().danger)
-                                .child(error.clone()),
-                        )
-                    }),
-            )
-            .child(
-                card(cx)
-                    .child(
-                        gpui::div()
-                            .font_weight(gpui::FontWeight::MEDIUM)
-                            .text_color(cx.theme().foreground)
-                            .child(card_labels()[0]),
-                    )
-                    .child(
-                        gpui::div()
-                            .text_size(px(12.))
-                            .text_color(cx.theme().muted_foreground)
-                            .child("写入 Gateway 的 PostgreSQL，保存后立即生效；与上面的本地 TOML 设置无关。"),
-                    )
-                    .child(
+                    }
+                })),
+            SettingGroup::new()
+                .title("显示")
+                .variant(gpui_kit::component::group_box::GroupBoxVariant::Outline)
+                .item(SettingItem::render({
+                    let page = page.clone();
+                    move |_, _, cx| {
+                        let timezone = page.read(cx).timezone.clone();
+                        let save_error = page.read(cx).save_error.clone();
+                        let page_for_save = page.clone();
                         gpui::div()
                             .flex()
-                            .items_center()
-                            .justify_between()
-                            .gap_4()
-                            .child(gpui::div().text_color(cx.theme().foreground).child("传输方式"))
-                            .child(
-                                gpui::div()
-                                    .flex()
-                                    .items_center()
-                                    .gap_2()
-                                    .child(
-                                        gpui::div()
-                                            .text_color(if self.mail_smtp {
-                                                cx.theme().muted_foreground
-                                            } else {
-                                                cx.theme().primary
-                                            })
-                                            .child("HTTP"),
-                                    )
-                                    .child(
-                                        Switch::new("settings-mail-transport")
-                                            .checked(self.mail_smtp)
-                                            .on_change(cx.listener(|this, on: &bool, _, cx| {
-                                                this.mail_smtp = *on;
-                                                cx.notify();
-                                            })),
-                                    )
-                                    .child(
-                                        gpui::div()
-                                            .text_color(if self.mail_smtp {
-                                                cx.theme().primary
-                                            } else {
-                                                cx.theme().muted_foreground
-                                            })
-                                            .child("SMTP"),
-                                    ),
-                            ),
-                    )
-                    .when(!self.mail_smtp, |this| {
-                        this.child(input_row("HTTP URL", &self.mail.mail_url, cx))
-                            .child(input_row("HTTP Token（掩码=保持）", &self.mail.mail_token, cx))
-                            .child(input_row("发件人", &self.mail.mail_from, cx))
-                            .child(input_row("站点 Origin", &self.mail.mail_origin, cx))
-                    })
-                    .when(self.mail_smtp, |this| {
-                        this.child(input_row("SMTP 服务器", &self.mail.smtp_host, cx))
-                            .child(input_row("SMTP 端口", &self.mail.smtp_port, cx))
-                            .child(input_row("SMTP 用户名", &self.mail.smtp_username, cx))
-                            .child(input_row("SMTP 密码（掩码=保持）", &self.mail.smtp_password, cx))
-                            .child(input_row("SMTP 加密", &self.mail.smtp_tls, cx))
-                            .child(input_row("SMTP 发件人", &self.mail.smtp_from, cx))
-                    })
-                    .child(field_row(
-                        "密钥状态",
-                        &format!(
-                            "HTTP {} · SMTP {}",
-                            secret_status(self.mail.mail_token.read(cx).value().as_str()),
-                            secret_status(self.mail.smtp_password.read(cx).value().as_str())
-                        ),
-                        cx,
-                    ))
-                    .child(
-                        gpui::div()
-                            .flex()
-                            .justify_end()
+                            .flex_col()
                             .gap_2()
                             .child(
-                                Button::new("settings-portal-refresh")
-                                    .label("重新读取")
-                                    .outline()
-                                    .compact()
-                                    .on_click(cx.listener(|this, _, window, cx| {
-                                        this.load_portal(window.window_handle(), cx);
-                                    })),
+                                gpui::div()
+                                    .flex()
+                                    .items_center()
+                                    .justify_between()
+                                    .gap_4()
+                                    .child(
+                                        gpui::div()
+                                            .flex()
+                                            .flex_col()
+                                            .gap_0p5()
+                                            .child(
+                                                gpui::div()
+                                                    .text_color(cx.theme().foreground)
+                                                    .child("显示时区"),
+                                            )
+                                            .child(
+                                                gpui::div()
+                                                    .text_size(px(12.))
+                                                    .text_color(cx.theme().muted_foreground)
+                                                    .child("空值表示跟随系统"),
+                                            ),
+                                    )
+                                    .child(
+                                        gpui::div()
+                                            .flex()
+                                            .items_center()
+                                            .gap_2()
+                                            .child(Input::new(&timezone).w(px(240.)))
+                                            .child(
+                                                Button::new("settings-tz-save")
+                                                    .label("保存")
+                                                    .on_click(move |_, window, cx| {
+                                                        page_for_save.update(cx, |page, cx| {
+                                                            page.save_timezone(
+                                                                window.window_handle(),
+                                                                cx,
+                                                            )
+                                                        });
+                                                    }),
+                                            ),
+                                    ),
                             )
+                            .when_some(save_error, |this, error| {
+                                this.child(
+                                    gpui::div()
+                                        .text_size(px(12.))
+                                        .text_color(cx.theme().danger)
+                                        .child(error),
+                                )
+                            })
+                    }
+                })),
+            SettingGroup::new()
+                .title("业务")
+                .variant(gpui_kit::component::group_box::GroupBoxVariant::Outline)
+                .item(SettingItem::render({
+                    let page = page.clone();
+                    move |_, _, cx| {
+                        let sales_error = page.read(cx).sales_error.clone();
+                        let page_for_toggle = page.clone();
+                        gpui::div()
+                            .flex()
+                            .flex_col()
+                            .gap_2()
                             .child(
-                                Button::new("settings-mail-save")
-                                    .label("保存邮件设置")
-                                    .on_click(cx.listener(|this, _, window, cx| {
-                                        this.save_mail(window.window_handle(), cx);
-                                    })),
-                            ),
-                    )
-                    .when_some(self.mail_error.as_ref(), |this, error| {
-                        this.child(
-                            gpui::div()
-                                .text_size(px(12.))
-                                .text_color(cx.theme().danger)
-                                .child(error.clone()),
-                        )
-                    }),
-            )
-            .child({
-                let mut provider_card = card(cx)
-                    .child(
-                        gpui::div()
-                            .font_weight(gpui::FontWeight::MEDIUM)
-                            .text_color(cx.theme().foreground)
-                            .child(card_labels()[1]),
-                    )
-                    .child(
-                        gpui::div()
-                            .text_size(px(12.))
-                            .text_color(cx.theme().muted_foreground)
-                            .child("写入 Gateway 的 PostgreSQL，保存/删除后立即生效；client_secret 不回显，掩码表示保持原值，留空表示清空。"),
+                                gpui::div()
+                                    .flex()
+                                    .items_center()
+                                    .justify_between()
+                                    .gap_4()
+                                    .child(
+                                        gpui::div()
+                                            .flex()
+                                            .flex_col()
+                                            .gap_0p5()
+                                            .child(
+                                                gpui::div()
+                                                    .text_color(cx.theme().foreground)
+                                                    .child("销售模式"),
+                                            )
+                                            .child(
+                                                gpui::div()
+                                                    .text_size(px(12.))
+                                                    .text_color(cx.theme().muted_foreground)
+                                                    .child("关闭后概览页不显示营收"),
+                                            ),
+                                    )
+                                    .child(
+                                        Switch::new("settings-sales-mode")
+                                            .checked(crate::sales_mode::enabled())
+                                            .on_change(move |on: &bool, window, cx| {
+                                                page_for_toggle.update(cx, |page, cx| {
+                                                    page.set_sales_mode(
+                                                        *on,
+                                                        window.window_handle(),
+                                                        cx,
+                                                    )
+                                                });
+                                            }),
+                                    ),
+                            )
+                            .when_some(sales_error, |this, error| {
+                                this.child(
+                                    gpui::div()
+                                        .text_size(px(12.))
+                                        .text_color(cx.theme().danger)
+                                        .child(error),
+                                )
+                            })
+                    }
+                })),
+        ])
+}
+
+fn mail_page(page: Entity<SettingsPage>) -> gpui_kit::component::setting::SettingPage {
+    use gpui_kit::component::setting::{SettingGroup, SettingItem, SettingPage};
+
+    SettingPage::new("邮件发送")
+        .description("配置 Gateway 的邮件发送方式")
+        .group(
+            SettingGroup::new()
+                .title("邮件服务")
+                .description("写入 Gateway 的 PostgreSQL，保存后立即生效")
+                .variant(gpui_kit::component::group_box::GroupBoxVariant::Outline)
+                .item(SettingItem::render(move |_, _, cx| {
+                    let page_state = page.read(cx);
+                    let mail_smtp = page_state.mail_smtp;
+                    let mail_url = page_state.mail.mail_url.clone();
+                    let mail_token = page_state.mail.mail_token.clone();
+                    let mail_from = page_state.mail.mail_from.clone();
+                    let mail_origin = page_state.mail.mail_origin.clone();
+                    let smtp_host = page_state.mail.smtp_host.clone();
+                    let smtp_port = page_state.mail.smtp_port.clone();
+                    let smtp_username = page_state.mail.smtp_username.clone();
+                    let smtp_password = page_state.mail.smtp_password.clone();
+                    let smtp_tls = page_state.mail.smtp_tls.clone();
+                    let smtp_from = page_state.mail.smtp_from.clone();
+                    let mail_error = page_state.mail_error.clone();
+                    let _ = page_state;
+                    let page_for_transport = page.clone();
+                    let page_for_refresh = page.clone();
+                    let page_for_save = page.clone();
+                    let secret_summary = format!(
+                        "HTTP {} · SMTP {}",
+                        secret_status(mail_token.read(cx).value().as_str()),
+                        secret_status(smtp_password.read(cx).value().as_str())
                     );
-                for (index, row) in self.providers.iter().enumerate() {
-                    provider_card = provider_card.child(provider_row(index, row, cx));
-                }
-                provider_card
-                    .when(self.providers.is_empty(), |this| {
-                        this.child(
+                    gpui::div()
+                        .flex()
+                        .flex_col()
+                        .gap_3()
+                        .child(
                             gpui::div()
-                                .text_size(px(12.))
-                                .text_color(cx.theme().muted_foreground)
-                                .child("Gateway 数据库中没有已配置的第三方登录 provider。"),
+                                .flex()
+                                .items_center()
+                                .justify_between()
+                                .gap_4()
+                                .child(
+                                    gpui::div()
+                                        .text_color(cx.theme().foreground)
+                                        .child("传输方式"),
+                                )
+                                .child(
+                                    gpui::div()
+                                        .flex()
+                                        .items_center()
+                                        .gap_2()
+                                        .child(
+                                            gpui::div()
+                                                .text_color(if mail_smtp {
+                                                    cx.theme().muted_foreground
+                                                } else {
+                                                    cx.theme().primary
+                                                })
+                                                .child("HTTP"),
+                                        )
+                                        .child(
+                                            Switch::new("settings-mail-transport")
+                                                .checked(mail_smtp)
+                                                .on_change(move |on: &bool, _, cx| {
+                                                    page_for_transport.update(cx, |page, cx| {
+                                                        page.mail_smtp = *on;
+                                                        cx.notify();
+                                                    });
+                                                }),
+                                        )
+                                        .child(
+                                            gpui::div()
+                                                .text_color(if mail_smtp {
+                                                    cx.theme().primary
+                                                } else {
+                                                    cx.theme().muted_foreground
+                                                })
+                                                .child("SMTP"),
+                                        ),
+                                ),
                         )
-                    })
-                    .when_some(self.provider_error.as_ref(), |this, error| {
-                        this.child(
+                        .when(!mail_smtp, |this| {
+                            this.child(input_row("HTTP URL", &mail_url, cx))
+                                .child(input_row("HTTP Token（掩码=保持）", &mail_token, cx))
+                                .child(input_row("发件人", &mail_from, cx))
+                                .child(input_row("站点 Origin", &mail_origin, cx))
+                        })
+                        .when(mail_smtp, |this| {
+                            this.child(input_row("SMTP 服务器", &smtp_host, cx))
+                                .child(input_row("SMTP 端口", &smtp_port, cx))
+                                .child(input_row("SMTP 用户名", &smtp_username, cx))
+                                .child(input_row("SMTP 密码（掩码=保持）", &smtp_password, cx))
+                                .child(input_row("SMTP 加密", &smtp_tls, cx))
+                                .child(input_row("SMTP 发件人", &smtp_from, cx))
+                        })
+                        .child(field_row("密钥状态", &secret_summary, cx))
+                        .child(
                             gpui::div()
-                                .text_size(px(12.))
-                                .text_color(cx.theme().danger)
-                                .child(error.clone()),
+                                .flex()
+                                .justify_end()
+                                .gap_2()
+                                .child(
+                                    Button::new("settings-portal-refresh")
+                                        .label("重新读取")
+                                        .outline()
+                                        .compact()
+                                        .on_click(move |_, window, cx| {
+                                            page_for_refresh.update(cx, |page, cx| {
+                                                page.load_portal(window.window_handle(), cx)
+                                            });
+                                        }),
+                                )
+                                .child(
+                                    Button::new("settings-mail-save")
+                                        .label("保存邮件设置")
+                                        .on_click(move |_, window, cx| {
+                                            page_for_save.update(cx, |page, cx| {
+                                                page.save_mail(window.window_handle(), cx)
+                                            });
+                                        }),
+                                ),
                         )
-                    })
-            })
-            .child({
-                let mut payment_card = card(cx)
-                    .child(
-                        gpui::div()
-                            .font_weight(gpui::FontWeight::MEDIUM)
-                            .text_color(cx.theme().foreground)
-                            .child("在线支付（只读）"),
-                    )
-                    .child(
-                        gpui::div()
-                            .text_size(px(12.))
-                            .text_color(cx.theme().muted_foreground)
-                            .child("仅展示本地 Gateway 配置的公开字段；RSA 私钥由 Gateway 环境变量注入，GUI 不保存也不显示。本地检测不代表 Gateway 实际可用性。"),
-                    );
-                for (label, value) in crate::payment_status::card_rows(&self.payment) {
-                    payment_card = payment_card.child(field_row(label, &value, cx));
-                }
-                payment_card
-            })
-    }
+                        .when_some(mail_error, |this, error| {
+                            this.child(
+                                gpui::div()
+                                    .text_size(px(12.))
+                                    .text_color(cx.theme().danger)
+                                    .child(error),
+                            )
+                        })
+                })),
+        )
 }
 
-/// One labeled input row.
-fn input_row(label: &'static str, input: &Entity<InputState>, cx: &gpui::App) -> gpui::Div {
-    gpui::div()
-        .flex()
-        .items_center()
-        .justify_between()
-        .gap_4()
-        .child(gpui::div().text_color(cx.theme().foreground).child(label))
-        .child(Input::new(input).w(px(320.)))
+fn providers_page(page: Entity<SettingsPage>) -> gpui_kit::component::setting::SettingPage {
+    use gpui_kit::component::setting::{SettingGroup, SettingItem, SettingPage};
+
+    SettingPage::new("第三方登录")
+        .description("管理 Gateway 中保存的 OAuth provider")
+        .group(
+            SettingGroup::new()
+                .title("登录 provider")
+                .description("client_secret 不回显，掩码表示保持原值，留空表示清空")
+                .variant(gpui_kit::component::group_box::GroupBoxVariant::Outline)
+                .item(SettingItem::render(move |_, _, cx| {
+                    let (provider_rows, empty, error) = {
+                        let page_state = page.read(cx);
+                        (
+                            page_state.providers.clone(),
+                            page_state.providers.is_empty(),
+                            page_state.provider_error.clone(),
+                        )
+                    };
+                    let rows = provider_rows
+                        .iter()
+                        .enumerate()
+                        .map(|(index, row)| provider_row(index, row, page.clone(), cx))
+                        .collect::<Vec<_>>();
+                    let mut content = gpui::div().flex().flex_col().gap_3();
+                    for row in rows {
+                        content = content.child(row);
+                    }
+                    content
+                        .when(empty, |this| {
+                            this.child(
+                                gpui::div()
+                                    .text_size(px(12.))
+                                    .text_color(cx.theme().muted_foreground)
+                                    .child("Gateway 数据库中没有已配置的第三方登录 provider。"),
+                            )
+                        })
+                        .when_some(error, |this, error| {
+                            this.child(
+                                gpui::div()
+                                    .text_size(px(12.))
+                                    .text_color(cx.theme().danger)
+                                    .child(error),
+                            )
+                        })
+                })),
+        )
 }
 
-fn text_field(
-    window: &mut Window,
+fn payment_page(page: Entity<SettingsPage>) -> gpui_kit::component::setting::SettingPage {
+    use gpui_kit::component::setting::{SettingGroup, SettingItem, SettingPage};
+
+    SettingPage::new("在线支付")
+        .description("只读展示本地 Gateway 配置的公开字段")
+        .group(
+            SettingGroup::new()
+                .title("支付配置")
+                .description("RSA 私钥由 Gateway 环境变量注入，GUI 不保存也不显示")
+                .variant(gpui_kit::component::group_box::GroupBoxVariant::Outline)
+                .item(SettingItem::render(move |_, _, cx| {
+                    let rows = crate::payment_status::card_rows(&page.read(cx).payment);
+                    let mut content = gpui::div().flex().flex_col().gap_3();
+                    for (label, value) in rows {
+                        content = content.child(field_row(label, &value, cx));
+                    }
+                    content
+                })),
+        )
+}
+
+fn provider_row(
+    index: usize,
+    row: &ProviderFields,
+    page: Entity<SettingsPage>,
     cx: &mut gpui::App,
-    placeholder: &'static str,
-) -> Entity<InputState> {
-    cx.new(|cx| InputState::new(window, cx).placeholder(placeholder))
-}
-
-fn text_field_value(
-    window: &mut Window,
-    cx: &mut gpui::App,
-    placeholder: &'static str,
-    value: &str,
-) -> Entity<InputState> {
-    cx.new(|cx| {
-        InputState::new(window, cx)
-            .placeholder(placeholder)
-            .default_value(value)
-    })
-}
-
-/// One provider's editable row. The switch only changes the pending value;
-/// only 保存 writes it to the Gateway, and a failed write reverts it.
-fn provider_row(index: usize, row: &ProviderFields, cx: &mut Context<SettingsPage>) -> gpui::Div {
+) -> gpui::Div {
     let provider = row.view.provider.clone();
     let provider_for_save = provider.clone();
     let provider_for_delete = provider.clone();
+    let provider_for_toggle = provider.clone();
+    let page_for_toggle = page.clone();
     gpui::div()
         .flex()
         .flex_col()
@@ -885,16 +959,19 @@ fn provider_row(index: usize, row: &ProviderFields, cx: &mut Context<SettingsPag
                         .child(
                             Switch::new(format!("settings-provider-enabled-{index}"))
                                 .checked(row.enabled)
-                                .on_change(cx.listener(move |this, on: &bool, _, cx| {
-                                    if let Some(row) = this
-                                        .providers
-                                        .iter_mut()
-                                        .find(|row| row.view.provider == provider)
-                                    {
-                                        row.enabled = *on;
-                                    }
-                                    cx.notify();
-                                })),
+                                .on_change(move |on: &bool, _, cx| {
+                                    let provider = provider_for_toggle.clone();
+                                    page_for_toggle.update(cx, |page, cx| {
+                                        if let Some(row) = page
+                                            .providers
+                                            .iter_mut()
+                                            .find(|row| row.view.provider == provider)
+                                        {
+                                            row.enabled = *on;
+                                        }
+                                        cx.notify();
+                                    });
+                                }),
                         ),
                 ),
         )
@@ -909,27 +986,106 @@ fn provider_row(index: usize, row: &ProviderFields, cx: &mut Context<SettingsPag
                 .child(
                     Button::new(format!("settings-provider-save-{index}"))
                         .label("保存")
-                        .on_click(cx.listener(move |this, _, window, cx| {
-                            this.save_provider(
-                                provider_for_save.clone(),
-                                window.window_handle(),
-                                cx,
-                            );
-                        })),
+                        .on_click({
+                            let page = page.clone();
+                            move |_, window, cx| {
+                                page.update(cx, |page, cx| {
+                                    page.save_provider(
+                                        provider_for_save.clone(),
+                                        window.window_handle(),
+                                        cx,
+                                    )
+                                });
+                            }
+                        }),
                 )
                 .child(
                     Button::new(format!("settings-provider-delete-{index}"))
                         .label("删除")
                         .danger()
-                        .on_click(cx.listener(move |this, _, window, cx| {
-                            this.delete_provider(
-                                provider_for_delete.clone(),
-                                window.window_handle(),
-                                cx,
-                            );
-                        })),
+                        .on_click(move |_, window, cx| {
+                            page.update(cx, |page, cx| {
+                                page.delete_provider(
+                                    provider_for_delete.clone(),
+                                    window.window_handle(),
+                                    cx,
+                                )
+                            });
+                        }),
                 ),
         )
+}
+
+impl Render for SettingsPage {
+    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let page = cx.entity();
+        gpui::div().size_full().min_w_0().child(
+            gpui_kit::component::setting::Settings::new(format!("settings-page-{}", {
+                #[cfg(feature = "screenshot-test")]
+                {
+                    self.screenshot_page
+                }
+                #[cfg(not(feature = "screenshot-test"))]
+                {
+                    0
+                }
+            },))
+            .sidebar_width(px(220.))
+            .sidebar_size_range(px(180.)..px(320.))
+            .with_group_variant(gpui_kit::component::group_box::GroupBoxVariant::Outline)
+            .default_selected_index(gpui_kit::component::setting::SelectIndex {
+                page_ix: {
+                    #[cfg(feature = "screenshot-test")]
+                    {
+                        self.screenshot_page
+                    }
+                    #[cfg(not(feature = "screenshot-test"))]
+                    {
+                        0
+                    }
+                },
+                group_ix: None,
+            })
+            .pages([
+                general_page(page.clone()),
+                mail_page(page.clone()),
+                providers_page(page.clone()),
+                payment_page(page),
+            ]),
+        )
+    }
+}
+
+/// One labeled input row.
+fn input_row(label: &'static str, input: &Entity<InputState>, cx: &gpui::App) -> gpui::Div {
+    gpui::div()
+        .flex()
+        .items_center()
+        .justify_between()
+        .gap_4()
+        .child(gpui::div().text_color(cx.theme().foreground).child(label))
+        .child(Input::new(input).w(px(320.)))
+}
+
+fn text_field(
+    window: &mut Window,
+    cx: &mut gpui::App,
+    placeholder: &'static str,
+) -> Entity<InputState> {
+    cx.new(|cx| InputState::new(window, cx).placeholder(placeholder))
+}
+
+fn text_field_value(
+    window: &mut Window,
+    cx: &mut gpui::App,
+    placeholder: &'static str,
+    value: &str,
+) -> Entity<InputState> {
+    cx.new(|cx| {
+        InputState::new(window, cx)
+            .placeholder(placeholder)
+            .default_value(value)
+    })
 }
 
 /// One labeled read-only row: label on the left, value on the right.
