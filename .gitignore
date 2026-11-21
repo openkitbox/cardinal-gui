@@ -5,3 +5,4 @@ config.toml
 
 # design/plan docs (local-only, family convention)
 docs/superpowers/
+.alma-snapshots
