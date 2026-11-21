@@ -15,6 +15,7 @@ mod assets;
 mod fmt;
 pub mod load;
 mod pages;
+mod payment_status;
 mod portal_settings;
 mod runtime;
 mod sales_mode;

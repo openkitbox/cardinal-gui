@@ -1,7 +1,8 @@
 //! Settings page: a read-only Runtime card, the GUI-local settings written to
-//! the open config file's `[gui]` section (timezone, 销售模式), and two cards
-//! backed by the Gateway's PostgreSQL: 邮件发送 and 第三方登录. The latter call
-//! the admin API and take effect immediately; the former keep their local-TOML
+//! the open config file's `[gui]` section (timezone, 销售模式), two cards
+//! backed by the Gateway's PostgreSQL (邮件发送 and 第三方登录), and a read-only
+//! 在线支付 card derived from the local Gateway config. The DB cards call the
+//! admin API and take effect immediately; the others keep their local-TOML
 //! behavior.
 
 use gpui::prelude::FluentBuilder as _;
@@ -16,6 +17,7 @@ use gpui_kit::component::switch::Switch;
 use gpui_kit::component::tag::Tag;
 
 use crate::pages::{card, notify_error, notify_success, page_frame};
+use crate::payment_status::PaymentStatusView;
 use crate::portal_settings::{
     AuthProviderView, MailDraft, PortalSettingsView, ProviderDraft, card_labels, mail_body, notice,
     provider_body, safe_secret_display, secret_status,
@@ -56,6 +58,8 @@ struct ProviderFields {
 /// Application settings.
 pub struct SettingsPage {
     status: RuntimeStatus,
+    /// Read-only public Xiaodou fields from the local Gateway config.
+    payment: PaymentStatusView,
     /// The 显示 timezone input (`±HH:MM`; empty = follow the system).
     timezone: Entity<InputState>,
     /// Write-back failure of the last save; shown under the 显示 card.
@@ -96,6 +100,7 @@ impl SettingsPage {
         });
         let mut page = Self {
             status: RuntimeStatus::Starting,
+            payment: crate::payment_status::load_local(),
             timezone,
             save_error: None,
             sales_error: None,
@@ -782,6 +787,25 @@ impl Render for SettingsPage {
                                 .child(error.clone()),
                         )
                     })
+            })
+            .child({
+                let mut payment_card = card(cx)
+                    .child(
+                        gpui::div()
+                            .font_weight(gpui::FontWeight::MEDIUM)
+                            .text_color(cx.theme().foreground)
+                            .child("在线支付（只读）"),
+                    )
+                    .child(
+                        gpui::div()
+                            .text_size(px(12.))
+                            .text_color(cx.theme().muted_foreground)
+                            .child("仅展示本地 Gateway 配置的公开字段；RSA 私钥由 Gateway 环境变量注入，GUI 不保存也不显示。本地检测不代表 Gateway 实际可用性。"),
+                    );
+                for (label, value) in crate::payment_status::card_rows(&self.payment) {
+                    payment_card = payment_card.child(field_row(label, &value, cx));
+                }
+                payment_card
             })
     }
 }

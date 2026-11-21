@@ -10,7 +10,7 @@ Cardinal GUI is the companion client for the server repository. The Cardinal gat
 - **Providers** — Manage provider accounts, API keys, quota display, and model whitelists
 - **Routes** — Configure routing strategies (ordered/smart), availability rules, and view live request dispatch
 - **Requests** — Full request ledger with filtering, token counts, timing, cost, and error details
-- **Settings** — Gateway connection, local display preferences, and DB-backed mail/OAuth settings
+- **Settings** — Gateway connection, local display preferences, DB-backed mail/OAuth settings, and a read-only online-payment status card
 
 ## Quick Start
 
@@ -61,6 +61,10 @@ The settings page mixes two kinds of settings:
 - 「邮件发送」 and 「第三方登录」 (OAuth providers) are written through the Gateway admin API into Gateway PostgreSQL, via `/api/portal/settings` and `/api/portal/providers`. They take effect immediately and are shared with other portal clients; there are no corresponding TOML keys for them in this repository.
 
 Secrets are write-only from the GUI: the API returns `********` for a configured secret and empty for none. On save, leave `********` to keep the stored value or clear the field to remove it; `mail_token`, SMTP password, and provider `client_secret` are never shown in plaintext. OAuth BFF and state secrets (including `bff_secret`) are Cloudflare Worker bindings and never appear in GUI config. The GUI's own tests cover validation and masking only; they do not run against a live Gateway/PostgreSQL deployment.
+
+### Online payment status card (read-only)
+
+The card is derived from the **local** config file (`[gateway.payments.xiaodou]`): whether public fields are configured/incomplete/missing/unreadable, plus `channel`, `notify_url` and platform-key `kid`/fingerprint pairs. It is deliberately only a local public-field check: there is no Gateway admin endpoint for this status, so the GUI cannot verify the `CARDINAL_XIAODOU_PRIVATE_KEY` injected into the Gateway process, live Gateway enablement, or whether the merchant portal/app/channel is actually active. "Configured" means the local public fields parse — not that payments work. Platform PEM and all private-key material are never read, stored or rendered by the GUI; event payloads and secrets are never echoed in logs.
 
 ## License
 
